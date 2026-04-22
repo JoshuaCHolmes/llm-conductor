@@ -6,23 +6,48 @@ authors = ["Joshua Holmes"]
 license = "MIT"
 
 [dependencies]
+# Async runtime
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+bytes = "1"
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
+
+# CLI
 clap = { version = "4", features = ["derive"] }
 rustyline = { version = "14", default-features = false }
 colored = "2"
 indicatif = "0.17"
 dialoguer = { version = "0.11", default-features = false }
-toml = "0.8"
-dirs = "5"
+
+# Error handling
 anyhow = "1"
 thiserror = "1"
+
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
-bytes = "1"
-futures = "0.3"
+
+# Utilities
+dirs = "5"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+parking_lot = "0.12"
+
+# Testing infrastructure (optional features)
+tempfile = { version = "3", optional = true }
+async-trait = "0.1"
+
+[features]
+default = []
+testing = ["tempfile"]
 
 [profile.release]
 lto = true

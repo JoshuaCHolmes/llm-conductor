@@ -1,35 +1,29 @@
 //! LLM Conductor - Intelligent LLM orchestration
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use tracing_subscriber;
 
-mod agent;
-mod conductor;
-mod context;
-mod providers;
-mod router;
-mod safety;
-mod ui;
-
-#[derive(Parser)]
-#[command(name = "conductor", version, about = "Intelligent LLM orchestration")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Chat,
-    Providers,
-}
+use llm_conductor::cli::Repl;
+use llm_conductor::providers::OllamaProvider;
+use llm_conductor::router::Router;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
-        Commands::Chat => println!("🎭 Chat - Coming soon!"),
-        Commands::Providers => {
-            println!("📡 Providers:\n  ✓ Ollama\n  ✓ NVIDIA NIM\n  ○ TAMU AI\n  ○ GitHub Copilot");
-        }
-    }
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_level(false)
+        .init();
+    
+    // Create router
+    let mut router = Router::new();
+    
+    // Add Ollama provider
+    let ollama = OllamaProvider::new(None);
+    router.add_provider(Box::new(ollama));
+    
+    // Create and run REPL
+    let mut repl = Repl::new(router);
+    repl.run().await?;
+    
     Ok(())
 }
