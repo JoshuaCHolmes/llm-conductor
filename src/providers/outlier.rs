@@ -162,7 +162,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::ClaudeOpus45,
                 name: "Claude Opus 4.6".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 200_000,
                 supports_vision: false,
@@ -172,7 +172,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::ClaudeSonnet45,
                 name: "Claude Sonnet 4.6".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 200_000,
                 supports_vision: false,
@@ -183,7 +183,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::Gpt4o,
                 name: "GPT-5.2".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 128_000,
                 supports_vision: false,
@@ -193,7 +193,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::Custom("gpt-5.1-chat-latest".to_string()),
                 name: "GPT-5.1".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 128_000,
                 supports_vision: false,
@@ -203,7 +203,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::Custom("o3".to_string()),
                 name: "o3".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 128_000,
                 supports_vision: false,
@@ -214,7 +214,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::Custom("gemini-3.1-pro-preview".to_string()),
                 name: "Gemini 3.1 Pro".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 1_000_000,
                 supports_vision: false,
@@ -225,7 +225,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::Custom("grok-3".to_string()),
                 name: "Grok 3".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 128_000,
                 supports_vision: false,
@@ -236,7 +236,7 @@ impl Provider for OutlierProvider {
             ModelInfo {
                 id: ModelId::Custom("deepseek-v3p2".to_string()),
                 name: "DeepSeek v3.2".to_string(),
-                provider: ProviderId::Custom("outlier".to_string()),
+                provider: ProviderId::Outlier,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 64_000,
                 supports_vision: false,

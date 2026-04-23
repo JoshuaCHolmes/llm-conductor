@@ -8,6 +8,8 @@ use llm_conductor::config::{CredentialManager, ProviderConfigManager, UserInfoMa
 use llm_conductor::providers::OllamaProvider;
 use llm_conductor::router::Router;
 use llm_conductor::setup::{FirstRunSetup, InstallStatus, OllamaInstaller};
+use llm_conductor::usage_tracking::{UsageTracker, ProviderUsage, ResetPeriod};
+use llm_conductor::types::ProviderId;
 
 #[derive(Parser)]
 #[command(name = "llm-conductor", version, about = "Intelligent LLM orchestration")]
@@ -201,6 +203,12 @@ async fn run_chat() -> Result<()> {
     // Refresh available models
     router.refresh_models().await?;
     
+    // Initialize usage tracker (will set defaults automatically)
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+        .join("llm-conductor");
+    let _usage_tracker = UsageTracker::new(&config_dir)?;
+    
     // Create and run REPL
     let mut repl = Repl::new(router);
     repl.run().await?;
@@ -211,6 +219,14 @@ async fn run_chat() -> Result<()> {
 async fn list_providers() -> Result<()> {
     use colored::*;
     
+    // Get config directory
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+        .join("llm-conductor");
+    
+    // Initialize usage tracker
+    let mut usage_tracker = UsageTracker::new(&config_dir)?;
+    
     println!("{}", "=== Available Providers ===".bright_cyan().bold());
     println!();
     
@@ -218,7 +234,13 @@ async fn list_providers() -> Result<()> {
     print!("{} ", "Ollama".bright_white().bold());
     match OllamaInstaller::check_installation().await {
         InstallStatus::InstalledAndRunning => {
-            println!("{}", "✓ Running".bright_green());
+            print!("{}", "✓ Running".bright_green());
+            if let Some(usage) = usage_tracker.get_usage(&ProviderId::Ollama) {
+                let remaining = usage.remaining_capacity();
+                println!(" ({})", format!("Unlimited").dimmed());
+            } else {
+                println!(" ({})", "No usage data".dimmed());
+            }
         }
         InstallStatus::InstalledNotRunning => {
             println!("{}", "! Installed but not running".bright_yellow());
@@ -234,16 +256,74 @@ async fn list_providers() -> Result<()> {
     
     // Define all possible providers with their display names
     let all_providers = vec![
-        ("NVIDIA NIM", "NVIDIA_NIM_KEY"),
-        ("GitHub Copilot", "GITHUB_TOKEN"),
-        ("TAMU AI", "TAMU_API_KEY"),
-        ("Outlier Playground", "OUTLIER_COOKIE"), // Also checks OUTLIER_CSRF
+        ("NVIDIA NIM", "NVIDIA_NIM_KEY", ProviderId::NvidiaNim),
+        ("GitHub Copilot", "GITHUB_TOKEN", ProviderId::GitHubCopilot),
+        ("TAMU AI", "TAMU_API_KEY", ProviderId::Tamu),
+        ("Outlier Playground", "OUTLIER_COOKIE", ProviderId::Outlier),
     ];
     
-    for (display_name, _key) in all_providers {
+    for (display_name, _key, provider_id) in all_providers {
         print!("{} ", display_name.bright_white().bold());
         if configured_providers.contains(&display_name.to_string()) {
-            println!("{}", "✓ Configured".bright_green());
+            print!("{}", "✓ Configured".bright_green());
+            
+            // Show usage info if available
+            if let Some(usage) = usage_tracker.get_usage(&provider_id) {
+                use llm_conductor::usage_tracking::LimitType;
+                match &usage.limit_type {
+                    LimitType::Unlimited => {
+                        println!(" ({})", "Unlimited".dimmed());
+                    }
+                    LimitType::RequestBased { max_requests, current_requests, reset_period, next_reset } => {
+                        let remaining = max_requests - current_requests;
+                        let formatted_remaining = if remaining == 0 {
+                            remaining.to_string().bright_red()
+                        } else if (remaining as f64 / *max_requests as f64) < 0.2 {
+                            remaining.to_string().bright_yellow()
+                        } else {
+                            remaining.to_string().bright_green()
+                        };
+                        println!(" ({}/{} requests, resets {:?})",
+                            formatted_remaining,
+                            max_requests,
+                            reset_period
+                        );
+                    }
+                    LimitType::TokenBased { max_tokens, current_tokens, reset_period, .. } => {
+                        let remaining = max_tokens - current_tokens;
+                        let pct = (remaining as f64 / *max_tokens as f64) * 100.0;
+                        let formatted_pct = if pct < 10.0 {
+                            format!("{:.1}%", pct).bright_red()
+                        } else if pct < 30.0 {
+                            format!("{:.1}%", pct).bright_yellow()
+                        } else {
+                            format!("{:.1}%", pct).bright_green()
+                        };
+                        println!(" ({} tokens remaining, resets {:?})",
+                            formatted_pct,
+                            reset_period
+                        );
+                    }
+                    LimitType::CostBased { max_cost, current_cost, reset_period, .. } => {
+                        let remaining = max_cost - current_cost;
+                        let pct = (remaining / max_cost) * 100.0;
+                        let formatted_remaining = if pct < 10.0 {
+                            format!("${:.2}", remaining).bright_red()
+                        } else if pct < 30.0 {
+                            format!("${:.2}", remaining).bright_yellow()
+                        } else {
+                            format!("${:.2}", remaining).bright_green()
+                        };
+                        println!(" ({}/{:.2}, resets {:?})",
+                            formatted_remaining,
+                            max_cost,
+                            reset_period
+                        );
+                    }
+                }
+            } else {
+                println!(" ({})", "No usage data".dimmed());
+            }
         } else {
             println!("{}", "○ Not configured".dimmed());
         }

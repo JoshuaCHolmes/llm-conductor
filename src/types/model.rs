@@ -62,6 +62,7 @@ pub enum ProviderId {
     NvidiaNim,
     GitHubCopilot,
     Tamu,
+    Outlier,
     Custom(String),
 }
 
@@ -72,6 +73,7 @@ impl fmt::Display for ProviderId {
             ProviderId::NvidiaNim => write!(f, "nvidia-nim"),
             ProviderId::GitHubCopilot => write!(f, "github-copilot"),
             ProviderId::Tamu => write!(f, "tamu"),
+            ProviderId::Outlier => write!(f, "outlier"),
             ProviderId::Custom(name) => write!(f, "{}", name),
         }
     }

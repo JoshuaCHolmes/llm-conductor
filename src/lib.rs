@@ -5,5 +5,6 @@ pub mod resources;
 pub mod cli;
 pub mod config;
 pub mod setup;
+pub mod usage_tracking;
 
 pub use types::*;

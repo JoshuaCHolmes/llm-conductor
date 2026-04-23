@@ -134,10 +134,11 @@ impl Repl {
         let model = self.router.select_model(&task)
             .ok_or_else(|| anyhow::anyhow!("No suitable model available"))?;
         
-        println!("{} {} {}", 
+        println!("{} {} {} {}", 
             "Using".dimmed(),
             model.name.bright_white(),
-            "...".dimmed()
+            "from".dimmed(),
+            format!("{:?}", model.provider).bright_cyan()
         );
         println!();
         
