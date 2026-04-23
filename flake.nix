@@ -23,20 +23,25 @@
             options.services.llm-conductor = {
               enable = mkEnableOption "LLM Conductor";
               
+              enableOllama = mkOption {
+                type = types.bool;
+                default = false;
+                description = "Install Ollama and optionally auto-start service (for local model support)";
+              };
+              
               autoStartOllama = mkOption {
                 type = types.bool;
                 default = true;
-                description = "Automatically start Ollama service";
+                description = "Automatically start Ollama service (requires enableOllama = true)";
               };
             };
             
             config = mkIf cfg.enable {
               environment.systemPackages = [
                 self.packages.${pkgs.system}.default
-                pkgs.ollama
-              ];
+              ] ++ optional cfg.enableOllama pkgs.ollama;
               
-              services.ollama = mkIf cfg.autoStartOllama {
+              services.ollama = mkIf (cfg.enableOllama && cfg.autoStartOllama) {
                 enable = true;
               };
             };
@@ -78,10 +83,8 @@
           extensions = [ "rust-src" ];
         };
         
-        # Runtime dependencies that will be available in PATH
-        runtimeDeps = with pkgs; [
-          ollama  # Ollama will be automatically available
-        ];
+        # Note: Ollama is now optional and installed via NixOS module if enableOllama = true
+        # The binary will detect and use Ollama if available in PATH
         
         llm-conductor = pkgs.rustPlatform.buildRustPackage {
           pname = "llm-conductor";
@@ -96,7 +99,6 @@
           nativeBuildInputs = with pkgs; [
             rustToolchain
             pkg-config
-            makeWrapper  # For wrapping the binary
           ];
           
           buildInputs = with pkgs; [
@@ -105,12 +107,6 @@
             darwin.apple_sdk.frameworks.Security
             darwin.apple_sdk.frameworks.SystemConfiguration
           ];
-          
-          # Wrap the binary to include ollama in PATH
-          postInstall = ''
-            wrapProgram $out/bin/llm-conductor \
-              --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps}
-          '';
           
           meta = with pkgs.lib; {
             description = "Multi-model AI orchestration CLI with intelligent routing";
