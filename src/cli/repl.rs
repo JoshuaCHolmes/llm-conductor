@@ -146,7 +146,7 @@ impl Repl {
         messages.extend(self.history.clone());
         
         // Get provider for this model
-        let provider = &self.router.providers[0];  // TODO: Match provider to model
+        let provider = &self.router.providers()[0];  // TODO: Match provider to model
         
         // Stream response
         print!("{} ", "❯".bright_green().bold());

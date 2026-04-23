@@ -21,6 +21,10 @@ impl Router {
         self.providers.push(provider);
     }
     
+    pub fn providers(&self) -> &[Box<dyn Provider>] {
+        &self.providers
+    }
+    
     pub async fn refresh_models(&mut self) -> Result<()> {
         self.available_models.clear();
         
@@ -38,7 +42,7 @@ impl Router {
     }
     
     /// Select best model for a task
-    pub fn select_model(&self, task: &Task) -> Option<&ModelInfo> {
+    pub fn select_model(&self, _task: &Task) -> Option<&ModelInfo> {
         // For now, just return the first available model
         // TODO: Implement complexity-based selection
         self.available_models.first()

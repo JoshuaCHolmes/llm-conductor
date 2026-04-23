@@ -51,8 +51,11 @@ impl Task {
 /// Metadata about a task
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskMetadata {
+    #[serde(skip)]
     pub created_at: Option<Instant>,
+    #[serde(skip)]
     pub started_at: Option<Instant>,
+    #[serde(skip)]
     pub completed_at: Option<Instant>,
     pub assigned_to: Option<ModelId>,
     pub attempts: usize,
@@ -67,6 +70,7 @@ pub struct TaskResult {
     pub output: String,
     pub model: ModelId,
     pub tokens_used: Option<usize>,
+    #[serde(skip)]
     pub duration: std::time::Duration,
     pub warnings: Vec<String>,
 }

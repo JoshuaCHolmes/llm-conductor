@@ -1,10 +1,65 @@
 //! LLM Conductor - Intelligent LLM orchestration
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 use tracing_subscriber;
 
 use llm_conductor::cli::Repl;
+use llm_conductor::config::{CredentialManager, UserInfoManager};
 use llm_conductor::providers::OllamaProvider;
 use llm_conductor::router::Router;
+use llm_conductor::setup::{FirstRunSetup, InstallStatus, OllamaInstaller};
+
+#[derive(Parser)]
+#[command(name = "llm-conductor", version, about = "Intelligent LLM orchestration")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start interactive chat (default)
+    Chat,
+    
+    /// Run first-time setup
+    Setup,
+    
+    /// Show system status
+    Status,
+    
+    /// List available providers
+    Providers,
+    
+    /// Configuration management
+    #[command(subcommand)]
+    Config(ConfigCommands),
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Show current configuration
+    Show,
+    
+    /// Add API key
+    AddKey {
+        /// Provider name (nvidia, github, tamu)
+        provider: String,
+        /// API key value
+        key: String,
+    },
+    
+    /// Setup API keys interactively
+    SetupKeys,
+    
+    /// Configure user information
+    User,
+    
+    /// Add additional context
+    AddContext {
+        /// Context to add
+        context: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,16 +69,177 @@ async fn main() -> Result<()> {
         .with_level(false)
         .init();
     
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Some(Commands::Setup) => {
+            // Force setup
+            let mut setup = FirstRunSetup::new()?;
+            setup.run().await?;
+            setup.mark_complete()?;
+        }
+        
+        Some(Commands::Status) => {
+            FirstRunSetup::status().await?;
+        }
+        
+        Some(Commands::Providers) => {
+            list_providers().await?;
+        }
+        
+        Some(Commands::Config(config_cmd)) => {
+            handle_config_command(config_cmd).await?;
+        }
+        
+        Some(Commands::Chat) | None => {
+            // Default: Start chat
+            run_chat().await?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn run_chat() -> Result<()> {
+    // Check if first run
+    if !FirstRunSetup::is_setup_complete() {
+        let mut setup = FirstRunSetup::new()?;
+        setup.run().await?;
+        setup.mark_complete()?;
+    }
+    
+    // Ensure Ollama is running
+    match OllamaInstaller::check_installation().await {
+        InstallStatus::InstalledNotRunning => {
+            use colored::*;
+            println!("{}", "Starting Ollama server...".yellow());
+            OllamaInstaller::start_server().await?;
+        }
+        InstallStatus::NotInstalled => {
+            use colored::*;
+            eprintln!("{}", "Ollama not found!".bright_red());
+            eprintln!("Please run: {}", "llm-conductor setup".bright_white());
+            return Err(anyhow::anyhow!("Ollama not installed"));
+        }
+        _ => {}
+    }
+    
     // Create router
     let mut router = Router::new();
     
     // Add Ollama provider
-    let ollama = OllamaProvider::new(None);
-    router.add_provider(Box::new(ollama));
+    router.add_provider(Box::new(OllamaProvider::new(None)));
+    
+    // TODO: Load credentials and add cloud providers if configured
     
     // Create and run REPL
     let mut repl = Repl::new(router);
     repl.run().await?;
+    
+    Ok(())
+}
+
+async fn list_providers() -> Result<()> {
+    use colored::*;
+    
+    println!("{}", "=== Available Providers ===".bright_cyan().bold());
+    println!();
+    
+    // Check Ollama
+    print!("{} ", "Ollama".bright_white().bold());
+    match OllamaInstaller::check_installation().await {
+        InstallStatus::InstalledAndRunning => {
+            println!("{}", "✓ Running".bright_green());
+        }
+        InstallStatus::InstalledNotRunning => {
+            println!("{}", "! Installed but not running".bright_yellow());
+        }
+        InstallStatus::NotInstalled => {
+            println!("{}", "✗ Not installed".bright_red());
+        }
+    }
+    
+    // Check configured API keys
+    let cred_manager = CredentialManager::new()?;
+    let providers = cred_manager.list_configured()?;
+    
+    for provider in &["NVIDIA NIM", "GitHub Copilot", "TAMU AI"] {
+        print!("{} ", provider.bright_white().bold());
+        if providers.contains(&provider.to_string()) {
+            println!("{}", "✓ Configured".bright_green());
+        } else {
+            println!("{}", "○ Not configured".dimmed());
+        }
+    }
+    
+    println!();
+    
+    Ok(())
+}
+
+async fn handle_config_command(cmd: ConfigCommands) -> Result<()> {
+    use colored::*;
+    
+    match cmd {
+        ConfigCommands::Show => {
+            println!("{}", "=== Configuration ===".bright_cyan().bold());
+            println!();
+            
+            // User info
+            let user_manager = UserInfoManager::new()?;
+            if let Some(info) = user_manager.load_user_info()? {
+                println!("{}", "User Information:".bright_white());
+                println!("  Name: {}", info.name);
+                if let Some(inst) = info.institution {
+                    println!("  Institution: {}", inst);
+                }
+                if let Some(role) = info.role {
+                    println!("  Role: {}", role);
+                }
+                if !info.additional_context.is_empty() {
+                    println!("  Additional context:");
+                    for ctx in &info.additional_context {
+                        println!("    - {}", ctx);
+                    }
+                }
+                println!();
+            }
+            
+            // Credentials
+            let cred_manager = CredentialManager::new()?;
+            let providers = cred_manager.list_configured()?;
+            
+            println!("{}", "API Keys:".bright_white());
+            if providers.is_empty() {
+                println!("  {}", "None configured".dimmed());
+            } else {
+                for provider in providers {
+                    println!("  ✓ {}", provider);
+                }
+            }
+            println!();
+        }
+        
+        ConfigCommands::AddKey { provider, key } => {
+            let cred_manager = CredentialManager::new()?;
+            cred_manager.add_credential(&provider, &key)?;
+        }
+        
+        ConfigCommands::SetupKeys => {
+            let cred_manager = CredentialManager::new()?;
+            cred_manager.interactive_setup().await?;
+        }
+        
+        ConfigCommands::User => {
+            let user_manager = UserInfoManager::new()?;
+            user_manager.interactive_setup()?;
+        }
+        
+        ConfigCommands::AddContext { context } => {
+            let user_manager = UserInfoManager::new()?;
+            user_manager.add_context(context)?;
+        }
+    }
     
     Ok(())
 }
