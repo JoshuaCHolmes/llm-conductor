@@ -130,7 +130,26 @@ async fn run_chat() -> Result<()> {
     // Add Ollama provider
     router.add_provider(Box::new(OllamaProvider::new(None)));
     
-    // TODO: Load credentials and add cloud providers if configured
+    // Load credentials and add cloud providers if configured
+    let cred_manager = CredentialManager::new()?;
+    
+    if let Ok(Some(github_key)) = cred_manager.get_credential("github") {
+        use llm_conductor::providers::GitHubProvider;
+        router.add_provider(Box::new(GitHubProvider::new(github_key)));
+    }
+    
+    if let Ok(Some(tamu_key)) = cred_manager.get_credential("tamu") {
+        use llm_conductor::providers::TamuProvider;
+        router.add_provider(Box::new(TamuProvider::new(tamu_key)));
+    }
+    
+    if let Ok(Some(nvidia_key)) = cred_manager.get_credential("nvidia") {
+        use llm_conductor::providers::NvidiaProvider;
+        router.add_provider(Box::new(NvidiaProvider::new(Some(nvidia_key))));
+    }
+    
+    // Refresh available models
+    router.refresh_models().await?;
     
     // Create and run REPL
     let mut repl = Repl::new(router);

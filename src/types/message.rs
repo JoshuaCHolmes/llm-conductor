@@ -15,6 +15,16 @@ pub enum Role {
     System,
 }
 
+impl Role {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        }
+    }
+}
+
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self {

@@ -4,8 +4,14 @@ use anyhow::Result;
 use crate::types::{Message, ModelInfo, TaskResult};
 
 pub mod ollama;
+pub mod github;
+pub mod tamu;
+pub mod nvidia;
 
 pub use ollama::OllamaProvider;
+pub use github::GitHubProvider;
+pub use tamu::TamuProvider;
+pub use nvidia::NvidiaProvider;
 
 /// Trait that all providers must implement
 #[async_trait]
