@@ -47,6 +47,13 @@ impl OllamaInstaller {
     pub async fn install() -> Result<()> {
         use colored::*;
         
+        // Skip installation if wrapped by Nix flake
+        if Self::is_nix_wrapped() {
+            println!("{}", "✓ Ollama is provided by Nix package wrapper".bright_green());
+            println!("{}", "  No manual installation needed.".cyan());
+            return Ok(());
+        }
+        
         println!("{}", "Installing Ollama...".bright_yellow());
         
         #[cfg(target_os = "linux")]
@@ -67,6 +74,17 @@ impl OllamaInstaller {
         println!("{}", "✓ Ollama installed successfully".bright_green());
         
         Ok(())
+    }
+    
+    /// Check if running from Nix-wrapped binary
+    fn is_nix_wrapped() -> bool {
+        // Check if PATH contains /nix/store and ollama is from there
+        if let Ok(ollama_path) = which::which("ollama") {
+            if let Some(path_str) = ollama_path.to_str() {
+                return path_str.contains("/nix/store");
+            }
+        }
+        false
     }
     
     #[cfg(target_os = "linux")]
@@ -165,13 +183,51 @@ impl OllamaInstaller {
     
     #[cfg(target_os = "windows")]
     async fn install_windows() -> Result<()> {
-        println!("Automatic installation not available for Windows.");
-        println!();
-        println!("Please install Ollama manually:");
-        println!("  1. Download from: https://ollama.com/download");
-        println!("  2. Or use WSL: wsl --install");
+        use colored::*;
         
-        Err(anyhow!("Manual installation required"))
+        println!("{}", "Installing Ollama on Windows...".bright_yellow());
+        
+        // Check if running in WSL
+        if Self::is_wsl() {
+            println!("{}", "Detected WSL - using Linux installation method".bright_cyan());
+            return Self::install_linux().await;
+        }
+        
+        // Download the Windows installer
+        let installer_url = "https://ollama.com/download/OllamaSetup.exe";
+        let temp_path = std::env::temp_dir().join("OllamaSetup.exe");
+        
+        println!("Downloading Ollama installer...");
+        let response = reqwest::get(installer_url).await?;
+        let bytes = response.bytes().await?;
+        tokio::fs::write(&temp_path, bytes).await?;
+        
+        println!("Running installer...");
+        let output = Command::new(&temp_path)
+            .arg("/SILENT")  // Silent installation
+            .output()
+            .map_err(|e| anyhow!("Failed to run installer: {}", e))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("Installation failed: {}", stderr));
+        }
+        
+        // Clean up
+        let _ = std::fs::remove_file(temp_path);
+        
+        println!("{}", "✓ Ollama installed successfully".bright_green());
+        println!("{}", "Note: You may need to restart your terminal.".yellow());
+        
+        Ok(())
+    }
+    
+    /// Check if running in WSL
+    #[cfg(target_os = "windows")]
+    fn is_wsl() -> bool {
+        std::fs::read_to_string("/proc/version")
+            .map(|content| content.to_lowercase().contains("microsoft"))
+            .unwrap_or(false)
     }
     
     /// Start Ollama server in background
