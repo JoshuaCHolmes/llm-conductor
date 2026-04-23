@@ -38,7 +38,6 @@
               
               services.ollama = mkIf cfg.autoStartOllama {
                 enable = true;
-                acceleration = "auto";
               };
             };
           };
