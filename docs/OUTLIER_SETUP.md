@@ -16,10 +16,22 @@ The easiest and most reliable way:
 
 1. Open Vivaldi and go to https://playground.outlier.ai (make sure you're logged in)
 2. Press **F12** to open Developer Tools
-3. Go to **Application** tab → **Cookies** → `https://playground.outlier.ai`
-4. You need two things:
-   - **Cookie string**: Right-click any cookie → **Copy** → **Copy all as cURL** (look for the Cookie: header)
-   - **CSRF token**: Find the `_csrf` cookie and copy its Value
+3. Go to **Application** tab → **Cookies**
+4. You need **three specific cookies** (they may be under different domains):
+
+   Look under `playground.outlier.ai`:
+   - `_session` - Copy the Value
+   - `_csrf` - Copy the Value
+   
+   Look under `s-api.outlier.ai` or `.outlier.ai`:
+   - `_jwt` - Copy the Value (this might be under a different outlier domain)
+
+5. **Format the cookie string** as:
+   ```
+   _jwt=<JWT_VALUE>; _session=<SESSION_VALUE>; _csrf=<CSRF_VALUE>
+   ```
+
+6. **CSRF token** is just the standalone value of `_csrf`
 
 ### Step 2: Add to llm-conductor
 
@@ -50,15 +62,17 @@ llm-conductor
 
 ## Cookie Format Example
 
-**Cookie string** (all one line):
+**Cookie string** (all one line, three required cookies):
 ```
-_session=eyJhbG...; _csrf=abc123xyz; _jwt=eyJhbG...; _t=MTY5OT...; analytics_session_id=...
+_jwt=eyJhbGciOiJIUzI1NiIs...; _session=eyJhbGciOiJIUzI1NiIs...; _csrf=abc123xyz
 ```
 
-**CSRF token** (standalone value):
+**CSRF token** (standalone value, same as in cookie string):
 ```
 abc123xyz
 ```
+
+**Note:** The `_jwt` cookie might be stored under `s-api.outlier.ai` or `.outlier.ai` instead of `playground.outlier.ai` - check all Outlier domains in Developer Tools.
 
 ## Troubleshooting
 
