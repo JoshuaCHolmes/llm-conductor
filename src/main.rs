@@ -137,8 +137,10 @@ async fn run_chat() -> Result<()> {
     // Create router
     let mut router = Router::new();
     
-    // Add Ollama provider
-    router.add_provider(Box::new(OllamaProvider::new(None)));
+    // Add Ollama provider (unless explicitly disabled)
+    if std::env::var("OLLAMA_DISABLED").unwrap_or_default() != "true" {
+        router.add_provider(Box::new(OllamaProvider::new(None)));
+    }
     
     // Load credentials and add cloud providers if configured
     let cred_manager = CredentialManager::new()?;
