@@ -202,11 +202,19 @@ async fn list_providers() -> Result<()> {
     
     // Check configured API keys
     let cred_manager = CredentialManager::new()?;
-    let providers = cred_manager.list_configured()?;
+    let configured_providers = cred_manager.list_configured()?;
     
-    for provider in &["NVIDIA NIM", "GitHub Copilot", "TAMU AI"] {
-        print!("{} ", provider.bright_white().bold());
-        if providers.contains(&provider.to_string()) {
+    // Define all possible providers with their display names
+    let all_providers = vec![
+        ("NVIDIA NIM", "NVIDIA_NIM_KEY"),
+        ("GitHub Copilot", "GITHUB_TOKEN"),
+        ("TAMU AI", "TAMU_API_KEY"),
+        ("Outlier Playground", "OUTLIER_COOKIE"), // Also checks OUTLIER_CSRF
+    ];
+    
+    for (display_name, _key) in all_providers {
+        print!("{} ", display_name.bright_white().bold());
+        if configured_providers.contains(&display_name.to_string()) {
             println!("{}", "✓ Configured".bright_green());
         } else {
             println!("{}", "○ Not configured".dimmed());
