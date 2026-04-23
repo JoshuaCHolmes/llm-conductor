@@ -71,7 +71,12 @@ impl OllamaInstaller {
     
     #[cfg(target_os = "linux")]
     async fn install_linux() -> Result<()> {
-        // Download and run official install script
+        // Check if running on NixOS
+        if Self::is_nixos() {
+            return Self::install_nixos().await;
+        }
+        
+        // Download and run official install script for generic Linux
         let script = reqwest::get("https://ollama.com/install.sh")
             .await?
             .text()
@@ -92,6 +97,45 @@ impl OllamaInstaller {
         
         // Clean up
         let _ = std::fs::remove_file(temp_script);
+        
+        Ok(())
+    }
+    
+    /// Check if running on NixOS
+    #[cfg(target_os = "linux")]
+    fn is_nixos() -> bool {
+        std::fs::read_to_string("/etc/os-release")
+            .map(|content| content.to_lowercase().contains("nixos"))
+            .unwrap_or(false)
+    }
+    
+    /// Install Ollama on NixOS using nix-env
+    #[cfg(target_os = "linux")]
+    async fn install_nixos() -> Result<()> {
+        use colored::*;
+        
+        println!("{}", "Detected NixOS - installing via nix-env...".bright_cyan());
+        println!("{}", "Note: For persistent installation, add 'ollama' to your system packages.".yellow());
+        
+        // Install ollama to user profile
+        let output = Command::new("nix-env")
+            .args(&["-iA", "nixpkgs.ollama"])
+            .output()
+            .map_err(|e| anyhow!("Failed to run nix-env: {}", e))?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "NixOS Ollama installation failed: {}\n\n\
+                Alternative installation methods:\n\
+                  1. Add to system packages: environment.systemPackages = [ pkgs.ollama ];\n\
+                  2. Use nix-shell: nix-shell -p ollama\n\
+                  3. Add to home-manager: home.packages = [ pkgs.ollama ];",
+                stderr
+            ));
+        }
+        
+        println!("{}", "✓ Ollama installed via Nix".bright_green());
         
         Ok(())
     }
