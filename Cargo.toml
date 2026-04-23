@@ -53,3 +53,6 @@ testing = ["tempfile"]
 [profile.release]
 lto = true
 strip = true
+
+[dev-dependencies]
+tempfile = "3"
