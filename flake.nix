@@ -58,7 +58,7 @@
           
           meta = with pkgs.lib; {
             description = "Multi-model AI orchestration CLI with intelligent routing";
-            homepage = "https://github.com/yourusername/llm-conductor";
+            homepage = "https://github.com/JoshuaCHolmes/llm-conductor";
             license = licenses.mit;
             maintainers = [ ];
             platforms = platforms.unix;
