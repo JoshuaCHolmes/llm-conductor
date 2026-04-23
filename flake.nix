@@ -11,7 +11,64 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+    let
+      # Modules that don't depend on system
+      modules = {
+        nixosModules.default = { config, lib, pkgs, ... }:
+          with lib;
+          let
+            cfg = config.services.llm-conductor;
+          in
+          {
+            options.services.llm-conductor = {
+              enable = mkEnableOption "LLM Conductor";
+              
+              autoStartOllama = mkOption {
+                type = types.bool;
+                default = true;
+                description = "Automatically start Ollama service";
+              };
+            };
+            
+            config = mkIf cfg.enable {
+              environment.systemPackages = [
+                self.packages.${pkgs.system}.default
+                pkgs.ollama
+              ];
+              
+              services.ollama = mkIf cfg.autoStartOllama {
+                enable = true;
+                acceleration = "auto";
+              };
+            };
+          };
+        
+        homeManagerModules.default = { config, lib, pkgs, ... }:
+          with lib;
+          let
+            cfg = config.programs.llm-conductor;
+          in
+          {
+            options.programs.llm-conductor = {
+              enable = mkEnableOption "LLM Conductor";
+              
+              package = mkOption {
+                type = types.package;
+                default = self.packages.${pkgs.system}.default;
+                description = "The llm-conductor package to use";
+              };
+            };
+            
+            config = mkIf cfg.enable {
+              home.packages = [
+                cfg.package
+                pkgs.ollama
+              ];
+            };
+          };
+      };
+    in
+    modules // flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
@@ -94,62 +151,6 @@
             echo "  ollama serve &      - Start Ollama server"
           '';
         };
-        
-        # NixOS module for system-wide installation
-        nixosModules.default = { config, lib, pkgs, ... }:
-          with lib;
-          let
-            cfg = config.services.llm-conductor;
-          in
-          {
-            options.services.llm-conductor = {
-              enable = mkEnableOption "LLM Conductor";
-              
-              autoStartOllama = mkOption {
-                type = types.bool;
-                default = true;
-                description = "Automatically start Ollama service";
-              };
-            };
-            
-            config = mkIf cfg.enable {
-              environment.systemPackages = [
-                llm-conductor
-                pkgs.ollama  # Ensure ollama is installed
-              ];
-              
-              # Optionally enable Ollama service
-              services.ollama = mkIf cfg.autoStartOllama {
-                enable = true;
-                acceleration = "auto";  # Use GPU if available
-              };
-            };
-          };
-        
-        # Home Manager module for user installation
-        homeManagerModules.default = { config, lib, pkgs, ... }:
-          with lib;
-          let
-            cfg = config.programs.llm-conductor;
-          in
-          {
-            options.programs.llm-conductor = {
-              enable = mkEnableOption "LLM Conductor";
-              
-              package = mkOption {
-                type = types.package;
-                default = llm-conductor;
-                description = "The llm-conductor package to use";
-              };
-            };
-            
-            config = mkIf cfg.enable {
-              home.packages = [
-                cfg.package
-                pkgs.ollama  # Ensure ollama is available
-              ];
-            };
-          };
       }
     );
 }
