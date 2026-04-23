@@ -143,25 +143,25 @@ async fn run_chat() -> Result<()> {
     // Load credentials and add cloud providers if configured
     let cred_manager = CredentialManager::new()?;
     
-    if let Ok(Some(github_key)) = cred_manager.get_credential("github") {
+    if let Ok(Some(github_key)) = cred_manager.get_credential("GITHUB_TOKEN") {
         use llm_conductor::providers::GitHubProvider;
         router.add_provider(Box::new(GitHubProvider::new(github_key)));
     }
     
-    if let Ok(Some(tamu_key)) = cred_manager.get_credential("tamu") {
+    if let Ok(Some(tamu_key)) = cred_manager.get_credential("TAMU_API_KEY") {
         use llm_conductor::providers::TamuProvider;
         router.add_provider(Box::new(TamuProvider::new(tamu_key)));
     }
     
-    if let Ok(Some(nvidia_key)) = cred_manager.get_credential("nvidia") {
+    if let Ok(Some(nvidia_key)) = cred_manager.get_credential("NVIDIA_NIM_KEY") {
         use llm_conductor::providers::NvidiaProvider;
         router.add_provider(Box::new(NvidiaProvider::new(Some(nvidia_key))));
     }
     
     // Add Outlier provider if credentials are present (cookie and csrf_token)
     if let (Ok(Some(cookie)), Ok(Some(csrf_token))) = (
-        cred_manager.get_credential("outlier_cookie"),
-        cred_manager.get_credential("outlier_csrf"),
+        cred_manager.get_credential("OUTLIER_COOKIE"),
+        cred_manager.get_credential("OUTLIER_CSRF"),
     ) {
         use llm_conductor::providers::OutlierProvider;
         match OutlierProvider::new(cookie, csrf_token) {
@@ -269,6 +269,22 @@ async fn handle_config_command(cmd: ConfigCommands) -> Result<()> {
         ConfigCommands::SetupKeys => {
             let cred_manager = CredentialManager::new()?;
             cred_manager.interactive_setup().await?;
+        }
+        
+        ConfigCommands::AddOutlier { browser, profile } => {
+            use colored::*;
+            println!("{}", "⚠ Automated Outlier cookie extraction not yet implemented".yellow());
+            println!();
+            println!("Please extract cookies manually:");
+            println!("1. Open {} in {}", "https://playground.outlier.ai".cyan(), browser);
+            println!("2. Press F12 → Application → Cookies");
+            println!("3. Find: _jwt, _session, _csrf");
+            println!();
+            println!("Then run:");
+            println!("  llm-conductor config add-key outlier_cookie '_jwt=...; _session=...; _csrf=...'");
+            println!("  llm-conductor config add-key outlier_csrf 'YOUR_CSRF_VALUE'");
+            println!();
+            println!("See: docs/OUTLIER_SETUP.md");
         }
         
         ConfigCommands::User => {

@@ -107,6 +107,8 @@ impl CredentialManager {
             "nvidia" | "nim" => "NVIDIA_NIM_KEY",
             "github" | "copilot" => "GITHUB_TOKEN",
             "tamu" => "TAMU_API_KEY",
+            "outlier" | "outlier_cookie" => "OUTLIER_COOKIE",
+            "outlier_csrf" => "OUTLIER_CSRF",
             _ => return Err(anyhow!("Unknown provider: {}", provider)),
         };
         
@@ -160,6 +162,9 @@ impl CredentialManager {
         }
         if creds.contains_key("TAMU_API_KEY") {
             providers.push("TAMU AI".to_string());
+        }
+        if creds.contains_key("OUTLIER_COOKIE") && creds.contains_key("OUTLIER_CSRF") {
+            providers.push("Outlier Playground".to_string());
         }
         
         Ok(providers)
