@@ -89,12 +89,34 @@ impl OllamaInstaller {
     
     #[cfg(target_os = "linux")]
     async fn install_linux() -> Result<()> {
+        use colored::*;
+        
         // Check if running on NixOS
         if Self::is_nixos() {
             return Self::install_nixos().await;
         }
         
-        // Download and run official install script for generic Linux
+        println!("{}", "Installing Ollama on Linux...".bright_yellow());
+        
+        // Try official install script first
+        match Self::install_linux_via_script().await {
+            Ok(_) => {
+                println!("{}", "✓ Installed via official script".bright_green());
+                return Ok(());
+            }
+            Err(e) => {
+                println!("{}", format!("⚠ Official script failed: {}", e).yellow());
+                println!("{}", "Trying direct binary download...".cyan());
+            }
+        }
+        
+        // Fallback: Direct binary download
+        Self::install_linux_binary().await
+    }
+    
+    #[cfg(target_os = "linux")]
+    async fn install_linux_via_script() -> Result<()> {
+        // Download and run official install script
         let script = reqwest::get("https://ollama.com/install.sh")
             .await?
             .text()
@@ -108,13 +130,64 @@ impl OllamaInstaller {
             .output()
             .map_err(|e| anyhow!("Failed to execute install script: {}", e))?;
         
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Ollama installation failed: {}", stderr));
-        }
-        
         // Clean up
         let _ = std::fs::remove_file(temp_script);
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("{}", stderr));
+        }
+        
+        Ok(())
+    }
+    
+    #[cfg(target_os = "linux")]
+    async fn install_linux_binary() -> Result<()> {
+        use colored::*;
+        
+        // Detect architecture
+        let arch = std::env::consts::ARCH;
+        let binary_url = match arch {
+            "x86_64" => "https://ollama.com/download/ollama-linux-amd64",
+            "aarch64" => "https://ollama.com/download/ollama-linux-arm64",
+            _ => return Err(anyhow!("Unsupported architecture: {}", arch)),
+        };
+        
+        println!("Downloading Ollama binary for {}...", arch);
+        let response = reqwest::get(binary_url).await?;
+        let bytes = response.bytes().await?;
+        
+        // Try to install to /usr/local/bin (may need sudo)
+        let install_path = "/usr/local/bin/ollama";
+        
+        match tokio::fs::write(install_path, &bytes).await {
+            Ok(_) => {
+                // Set executable permissions
+                let _ = Command::new("chmod")
+                    .arg("+x")
+                    .arg(install_path)
+                    .output();
+                
+                println!("{}", "✓ Installed to /usr/local/bin/ollama".bright_green());
+            }
+            Err(_) => {
+                // Fallback to user home directory
+                let home = std::env::var("HOME")?;
+                let user_bin = format!("{}/.local/bin", home);
+                std::fs::create_dir_all(&user_bin)?;
+                
+                let user_path = format!("{}/ollama", user_bin);
+                tokio::fs::write(&user_path, &bytes).await?;
+                
+                let _ = Command::new("chmod")
+                    .arg("+x")
+                    .arg(&user_path)
+                    .output();
+                
+                println!("{}", format!("✓ Installed to {}", user_path).bright_green());
+                println!("{}", format!("Add to PATH: export PATH=\"{}:$PATH\"", user_bin).yellow());
+            }
+        }
         
         Ok(())
     }
@@ -160,7 +233,11 @@ impl OllamaInstaller {
     
     #[cfg(target_os = "macos")]
     async fn install_macos() -> Result<()> {
-        // Try homebrew first
+        use colored::*;
+        
+        println!("{}", "Installing Ollama on macOS...".bright_yellow());
+        
+        // Try homebrew first (fastest)
         if which::which("brew").is_ok() {
             println!("Installing via Homebrew...");
             
@@ -169,16 +246,67 @@ impl OllamaInstaller {
                 .output()?;
             
             if output.status.success() {
+                println!("{}", "✓ Installed via Homebrew".bright_green());
                 return Ok(());
             }
         }
         
-        // Fall back to manual download
-        println!("Homebrew not available or installation failed.");
-        println!("Please download Ollama from: https://ollama.com/download");
-        println!("Or install Homebrew and try again.");
+        // Fall back to direct download and installation
+        println!("{}", "Homebrew not available, downloading installer...".yellow());
         
-        Err(anyhow!("Manual installation required"))
+        let dmg_url = "https://ollama.com/download/Ollama-darwin.zip";
+        let temp_dir = std::env::temp_dir();
+        let zip_path = temp_dir.join("Ollama.zip");
+        let app_path = temp_dir.join("Ollama.app");
+        
+        // Download the zip
+        println!("Downloading Ollama...");
+        let response = reqwest::get(dmg_url).await?;
+        let bytes = response.bytes().await?;
+        tokio::fs::write(&zip_path, bytes).await?;
+        
+        // Unzip
+        println!("Extracting...");
+        let output = Command::new("unzip")
+            .arg("-q")
+            .arg(&zip_path)
+            .arg("-d")
+            .arg(&temp_dir)
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow!("Failed to extract Ollama"));
+        }
+        
+        // Move to Applications
+        println!("Installing to /Applications...");
+        let output = Command::new("mv")
+            .arg(&app_path)
+            .arg("/Applications/Ollama.app")
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow!("Failed to move to Applications. You may need sudo."));
+        }
+        
+        // Add CLI to PATH by symlinking
+        let cli_source = "/Applications/Ollama.app/Contents/Resources/ollama";
+        let cli_target = "/usr/local/bin/ollama";
+        
+        println!("Creating CLI symlink...");
+        let _ = Command::new("ln")
+            .arg("-sf")
+            .arg(cli_source)
+            .arg(cli_target)
+            .output();
+        
+        // Clean up
+        let _ = std::fs::remove_file(zip_path);
+        
+        println!("{}", "✓ Ollama installed successfully".bright_green());
+        println!("{}", "Note: You may need to start Ollama from Applications.".yellow());
+        
+        Ok(())
     }
     
     #[cfg(target_os = "windows")]

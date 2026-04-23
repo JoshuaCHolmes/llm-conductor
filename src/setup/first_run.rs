@@ -67,11 +67,20 @@ impl FirstRunSetup {
                     .default(true)
                     .interact()?
                 {
-                    OllamaInstaller::install().await?;
-                    OllamaInstaller::start_server().await?;
+                    match OllamaInstaller::install().await {
+                        Ok(_) => {
+                            OllamaInstaller::start_server().await?;
+                        }
+                        Err(e) => {
+                            println!("{}", format!("✗ Installation failed: {}", e).bright_red());
+                            println!();
+                            Self::show_manual_install_options();
+                            return Err(anyhow!("Ollama installation failed"));
+                        }
+                    }
                 } else {
-                    println!("{}", "⚠ Ollama is required for local models.".yellow());
-                    println!("Install manually from: {}", "https://ollama.com".bright_cyan());
+                    println!();
+                    Self::show_manual_install_options();
                     return Err(anyhow!("Ollama installation declined"));
                 }
             }
@@ -123,6 +132,26 @@ impl FirstRunSetup {
         println!();
         
         Ok(())
+    }
+    
+    /// Show manual installation options as fallback
+    fn show_manual_install_options() {
+        use colored::*;
+        
+        println!("{}", "═══ Alternative Installation Methods ═══".bright_yellow());
+        println!();
+        println!("{}", "Option 1: Docker (Works on all platforms)".bright_cyan());
+        println!("  docker run -d -p 11434:11434 --name ollama ollama/ollama");
+        println!();
+        println!("{}", "Option 2: Manual Download".bright_cyan());
+        println!("  Website: {}", "https://ollama.com/download".bright_white());
+        println!();
+        println!("{}", "Option 3: Package Manager".bright_cyan());
+        println!("  macOS:   brew install ollama");
+        println!("  Linux:   curl -fsSL https://ollama.com/install.sh | sh");
+        println!("  Windows: Download installer from website");
+        println!();
+        println!("{}", "After installation, run: llm-conductor setup".bright_green());
     }
     
     /// Check if setup has been completed
