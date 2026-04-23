@@ -7,11 +7,13 @@ pub mod ollama;
 pub mod github;
 pub mod tamu;
 pub mod nvidia;
+pub mod outlier;
 
 pub use ollama::OllamaProvider;
 pub use github::GitHubProvider;
 pub use tamu::TamuProvider;
 pub use nvidia::NvidiaProvider;
+pub use outlier::OutlierProvider;
 
 /// Trait that all providers must implement
 #[async_trait]

@@ -42,7 +42,7 @@ enum ConfigCommands {
     
     /// Add API key
     AddKey {
-        /// Provider name (nvidia, github, tamu)
+        /// Provider name (nvidia, github, tamu, outlier_cookie, outlier_csrf)
         provider: String,
         /// API key value
         key: String,
@@ -50,6 +50,16 @@ enum ConfigCommands {
     
     /// Setup API keys interactively
     SetupKeys,
+    
+    /// Auto-extract Outlier credentials from browser
+    AddOutlier {
+        /// Browser to extract from (vivaldi, chrome, edge)
+        #[arg(long, default_value = "vivaldi")]
+        browser: String,
+        /// Browser profile name
+        #[arg(long, default_value = "Default")]
+        profile: String,
+    },
     
     /// Configure user information
     User,
@@ -146,6 +156,18 @@ async fn run_chat() -> Result<()> {
     if let Ok(Some(nvidia_key)) = cred_manager.get_credential("nvidia") {
         use llm_conductor::providers::NvidiaProvider;
         router.add_provider(Box::new(NvidiaProvider::new(Some(nvidia_key))));
+    }
+    
+    // Add Outlier provider if credentials are present (cookie and csrf_token)
+    if let (Ok(Some(cookie)), Ok(Some(csrf_token))) = (
+        cred_manager.get_credential("outlier_cookie"),
+        cred_manager.get_credential("outlier_csrf"),
+    ) {
+        use llm_conductor::providers::OutlierProvider;
+        match OutlierProvider::new(cookie, csrf_token) {
+            Ok(provider) => router.add_provider(Box::new(provider)),
+            Err(e) => eprintln!("⚠ Failed to initialize Outlier provider: {}", e),
+        }
     }
     
     // Refresh available models
