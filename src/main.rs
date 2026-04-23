@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber;
 
 use llm_conductor::cli::Repl;
-use llm_conductor::config::{CredentialManager, UserInfoManager};
+use llm_conductor::config::{CredentialManager, ProviderConfigManager, UserInfoManager};
 use llm_conductor::providers::OllamaProvider;
 use llm_conductor::router::Router;
 use llm_conductor::setup::{FirstRunSetup, InstallStatus, OllamaInstaller};
@@ -59,6 +59,21 @@ enum ConfigCommands {
         /// Browser profile name
         #[arg(long, default_value = "Default")]
         profile: String,
+    },
+    
+    /// Enable or disable a provider
+    SetProvider {
+        /// Provider name (ollama, github, tamu, nvidia, outlier)
+        provider: String,
+        /// Enable the provider
+        #[arg(long)]
+        enable: Option<bool>,
+        /// Disable the provider
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        /// Set priority (0-100, higher = preferred)
+        #[arg(long)]
+        priority: Option<u8>,
     },
     
     /// Configure user information
@@ -137,38 +152,49 @@ async fn run_chat() -> Result<()> {
     // Create router
     let mut router = Router::new();
     
-    // Add Ollama provider (unless explicitly disabled)
-    if std::env::var("OLLAMA_DISABLED").unwrap_or_default() != "true" {
+    // Load provider configuration
+    let provider_config_manager = ProviderConfigManager::new()?;
+    
+    // Add Ollama provider if enabled
+    if provider_config_manager.is_enabled("ollama") {
         router.add_provider(Box::new(OllamaProvider::new(None)));
     }
     
-    // Load credentials and add cloud providers if configured
+    // Load credentials and add cloud providers if configured AND enabled
     let cred_manager = CredentialManager::new()?;
     
     if let Ok(Some(github_key)) = cred_manager.get_credential("GITHUB_TOKEN") {
-        use llm_conductor::providers::GitHubProvider;
-        router.add_provider(Box::new(GitHubProvider::new(github_key)));
+        if provider_config_manager.is_enabled("github") {
+            use llm_conductor::providers::GitHubProvider;
+            router.add_provider(Box::new(GitHubProvider::new(github_key)));
+        }
     }
     
     if let Ok(Some(tamu_key)) = cred_manager.get_credential("TAMU_API_KEY") {
-        use llm_conductor::providers::TamuProvider;
-        router.add_provider(Box::new(TamuProvider::new(tamu_key)));
+        if provider_config_manager.is_enabled("tamu") {
+            use llm_conductor::providers::TamuProvider;
+            router.add_provider(Box::new(TamuProvider::new(tamu_key)));
+        }
     }
     
     if let Ok(Some(nvidia_key)) = cred_manager.get_credential("NVIDIA_NIM_KEY") {
-        use llm_conductor::providers::NvidiaProvider;
-        router.add_provider(Box::new(NvidiaProvider::new(Some(nvidia_key))));
+        if provider_config_manager.is_enabled("nvidia") {
+            use llm_conductor::providers::NvidiaProvider;
+            router.add_provider(Box::new(NvidiaProvider::new(Some(nvidia_key))));
+        }
     }
     
-    // Add Outlier provider if credentials are present (cookie and csrf_token)
-    if let (Ok(Some(cookie)), Ok(Some(csrf_token))) = (
-        cred_manager.get_credential("OUTLIER_COOKIE"),
-        cred_manager.get_credential("OUTLIER_CSRF"),
-    ) {
-        use llm_conductor::providers::OutlierProvider;
-        match OutlierProvider::new(cookie, csrf_token) {
-            Ok(provider) => router.add_provider(Box::new(provider)),
-            Err(e) => eprintln!("⚠ Failed to initialize Outlier provider: {}", e),
+    // Add Outlier provider if credentials are present AND enabled
+    if provider_config_manager.is_enabled("outlier") {
+        if let (Ok(Some(cookie)), Ok(Some(csrf_token))) = (
+            cred_manager.get_credential("OUTLIER_COOKIE"),
+            cred_manager.get_credential("OUTLIER_CSRF"),
+        ) {
+            use llm_conductor::providers::OutlierProvider;
+            match OutlierProvider::new(cookie, csrf_token) {
+                Ok(provider) => router.add_provider(Box::new(provider)),
+                Err(e) => eprintln!("⚠ Failed to initialize Outlier provider: {}", e),
+            }
         }
     }
     
@@ -295,6 +321,34 @@ async fn handle_config_command(cmd: ConfigCommands) -> Result<()> {
             println!("  llm-conductor config add-key outlier_csrf 'YOUR_CSRF_VALUE'");
             println!();
             println!("See: docs/OUTLIER_SETUP.md");
+        }
+        
+        ConfigCommands::SetProvider { provider, enable, disable, priority } => {
+            use colored::*;
+            let provider_manager = ProviderConfigManager::new()?;
+            
+            // Determine enabled state
+            let enabled = if disable {
+                false
+            } else if let Some(e) = enable {
+                e
+            } else {
+                true // Default to enable if neither flag specified
+            };
+            
+            provider_manager.set_enabled(&provider, enabled)?;
+            
+            if let Some(prio) = priority {
+                provider_manager.set_priority(&provider, prio)?;
+            }
+            
+            println!();
+            println!("{}", "Provider configuration updated!".bright_green());
+            println!();
+            println!("Current enabled providers:");
+            for (name, prio) in provider_manager.get_enabled_providers() {
+                println!("  {} (priority: {})", name.bright_white(), prio);
+            }
         }
         
         ConfigCommands::User => {
