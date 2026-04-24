@@ -104,6 +104,15 @@ impl Router {
         self.available_models.iter().find(|m| m.name == name)
     }
     
+    /// Clear any cached state in providers (like Outlier conversations)
+    pub async fn clear_provider_state(&self) {
+        for provider in &self.providers {
+            // Check if this is an OutlierProvider - we need downcasting
+            // For now, we'll just handle this via a trait method
+            // TODO: Add clear_state() to Provider trait
+        }
+    }
+    
     /// Find provider for a model using the provider map
     pub fn find_provider_for_model(&self, model: &ModelInfo) -> Option<&Box<dyn Provider>> {
         self.provider_map.get(&model.provider)

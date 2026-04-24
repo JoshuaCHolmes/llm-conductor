@@ -150,6 +150,12 @@ impl Repl {
                 }
                 Ok(true)
             }
+            Some("/new") => {
+                self.history.clear();
+                println!("{}", "✓ Started new conversation (history cleared)".green());
+                println!("{}", "Note: Outlier reuses last conversation - refresh Outlier Playground to see new one".dimmed());
+                Ok(true)
+            }
             Some("/providers") => {
                 self.list_providers().await?;
                 Ok(true)
@@ -308,6 +314,7 @@ impl Repl {
         println!("      /model outlier frontier       - Use Outlier frontier models");
         println!("  {} - Reset to automatic model selection", "/model reset".bright_white());
         println!("  {} - List available providers", "/providers".bright_white());
+        println!("  {} - Start a new conversation", "/new".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();

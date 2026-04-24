@@ -70,6 +70,12 @@ impl OutlierProvider {
             conversation_id: Arc::new(Mutex::new(None)),
         })
     }
+    
+    /// Clear cached conversation ID to force using a different conversation next time
+    pub async fn clear_conversation(&self) {
+        let mut conv_id = self.conversation_id.lock().await;
+        *conv_id = None;
+    }
 
     fn get_api_model_name<'a>(&self, model_id: &'a ModelId) -> &'a str {
         match model_id {

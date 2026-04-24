@@ -58,14 +58,14 @@ impl TamuProvider {
     }
 
     fn get_api_model_name(&self, model_id: &ModelId) -> String {
-        let base_name = match model_id {
-            ModelId::ClaudeOpus45 => "claude-opus-4.5",
-            ModelId::ClaudeSonnet45 => "claude-sonnet-4.5",
+        let name = match model_id {
+            ModelId::ClaudeOpus45 => "Claude Opus 4.5",
+            ModelId::ClaudeSonnet45 => "Claude Sonnet 4.5",
             ModelId::Gpt4o => "gpt-4o",
             ModelId::Custom(name) => name.as_str(),
             _ => "gpt-4o",
         };
-        format!("protected.{}", base_name)
+        format!("protected.{}", name)
     }
 }
 
