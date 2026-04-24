@@ -35,8 +35,12 @@ impl ThinkStreamState {
                     self.in_think = false;
                     self.pending = self.pending[pos + "</think>".len()..].to_string();
                 } else {
-                    // Keep last 8 chars buffered in case </think> spans chunks
+                    // Keep last 8 chars buffered in case </think> spans chunks.
+                    // safe_len is a byte offset; walk back to a valid char boundary.
                     let safe_len = self.pending.len().saturating_sub(8);
+                    let safe_len = (0..=safe_len).rev()
+                        .find(|&i| self.pending.is_char_boundary(i))
+                        .unwrap_or(0);
                     if safe_len > 0 {
                         let to_print = self.pending[..safe_len].to_string();
                         print!("{}", to_print.dimmed());
@@ -60,8 +64,12 @@ impl ThinkStreamState {
                     self.in_think = true;
                     self.pending = self.pending[pos + "<think>".len()..].to_string();
                 } else {
-                    // Keep last 7 chars buffered in case <think> spans chunks
+                    // Keep last 7 chars buffered in case <think> spans chunks.
+                    // safe_len is a byte offset; walk back to a valid char boundary.
                     let safe_len = self.pending.len().saturating_sub(7);
+                    let safe_len = (0..=safe_len).rev()
+                        .find(|&i| self.pending.is_char_boundary(i))
+                        .unwrap_or(0);
                     if safe_len > 0 {
                         let to_print = self.pending[..safe_len].to_string();
                         print!("{}", to_print);
