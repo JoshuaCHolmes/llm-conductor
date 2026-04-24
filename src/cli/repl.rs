@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::cli::session::SessionStore;
 use crate::providers::Provider;
 use crate::router::Router;
 use crate::types::{Context, CoreContext, Message, Task, ProviderId};
@@ -102,7 +103,12 @@ pub struct Repl {
     context: Context,
     history: Vec<Message>,
     usage_tracker: UsageTracker,
-    model_filter: ModelFilter, // User-specified filter
+    model_filter: ModelFilter,
+    session_store: SessionStore,
+    /// Current session ID (set after first message)
+    session_id: Option<String>,
+    /// Current page for /sessions pagination
+    sessions_page: usize,
 }
 
 impl Repl {
@@ -115,6 +121,7 @@ impl Repl {
         };
         
         let usage_tracker = UsageTracker::new(&config_dir)?;
+        let session_store = SessionStore::new(&config_dir)?;
         
         Ok(Self {
             router,
@@ -122,7 +129,22 @@ impl Repl {
             history: Vec::new(),
             usage_tracker,
             model_filter: ModelFilter::new(),
+            session_store,
+            session_id: None,
+            sessions_page: 0,
         })
+    }
+
+    /// Load an existing session by ID, restoring conversation history.
+    pub fn load_session(&mut self, session_id: &str) -> Result<()> {
+        let session = self.session_store.load(session_id)?;
+        self.history = session.messages;
+        self.session_id = Some(session_id.to_string());
+        println!("{} Resumed session with {} messages",
+            "✓".bright_green(),
+            self.history.len()
+        );
+        Ok(())
     }
     
     pub async fn run(&mut self) -> Result<()> {
@@ -240,8 +262,41 @@ impl Repl {
             }
             Some("/new") => {
                 self.history.clear();
-                println!("{}", "✓ Started new conversation (history cleared)".green());
-                println!("{}", "Note: Outlier reuses last conversation - refresh Outlier Playground to see new one".dimmed());
+                self.session_id = None;
+                println!("{}", "✓ Started new conversation".green());
+                Ok(true)
+            }
+            Some("/sessions") => {
+                let arg = parts.get(1).map(|s| *s);
+                match arg {
+                    Some(">") => {
+                        let total = self.session_store.list()?.len();
+                        let max_page = total.div_ceil(10).saturating_sub(1);
+                        if self.sessions_page < max_page {
+                            self.sessions_page += 1;
+                        }
+                    }
+                    Some("<") => {
+                        self.sessions_page = self.sessions_page.saturating_sub(1);
+                    }
+                    _ => {
+                        self.sessions_page = 0;
+                    }
+                }
+                self.session_store.print_page(self.sessions_page)?;
+                println!("{}", "Use /load N to resume a session.".dimmed());
+                Ok(true)
+            }
+            Some("/load") => {
+                match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
+                    Some(n) => {
+                        let meta = self.session_store.get_by_number(n)?;
+                        self.load_session(&meta.id)?;
+                    }
+                    None => {
+                        eprintln!("{}", "Usage: /load N  (use /sessions to see numbers)".yellow());
+                    }
+                }
                 Ok(true)
             }
             Some("/providers") => {
@@ -328,6 +383,12 @@ impl Repl {
         
         // Add assistant response to history (without think blocks)
         self.history.push(Message::assistant(clean_response));
+
+        // Auto-save session after every turn
+        match self.session_store.save(self.session_id.as_deref(), &self.history) {
+            Ok(id) => { self.session_id = Some(id); }
+            Err(e) => eprintln!("{} Failed to auto-save session: {}", "⚠".yellow(), e),
+        }
         
         Ok(())
     }
@@ -443,11 +504,14 @@ impl Repl {
         println!("      /model claude-opus tamu       - Use Opus from TAMU");
         println!("      /model outlier frontier       - Use Outlier frontier models");
         println!("  {} - Reset to automatic model selection", "/model reset".bright_white());
-        println!("  {} - List available providers", "/providers".bright_white());
+        println!("  {} - List saved sessions (> / < to page)", "/sessions".bright_white());
+        println!("  {} - Resume a saved session by number", "/load N".bright_white());
         println!("  {} - Start a new conversation", "/new".bright_white());
+        println!("  {} - List available providers", "/providers".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();
+        println!("{}", "Tip: start with --resume to pick a previous session".dimmed());
         println!("{}", "Just type a message to chat!".dimmed());
     }
 }

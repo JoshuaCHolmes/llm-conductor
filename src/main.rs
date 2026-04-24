@@ -1,6 +1,7 @@
 //! LLM Conductor - Intelligent LLM orchestration
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use tracing_subscriber;
 
 use llm_conductor::cli::Repl;
@@ -14,6 +15,10 @@ use llm_conductor::types::ProviderId;
 #[derive(Parser)]
 #[command(name = "llm-conductor", version, about = "Intelligent LLM orchestration")]
 struct Cli {
+    /// Resume a previous session (shows session picker)
+    #[arg(long, short = 'r')]
+    resume: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -120,14 +125,14 @@ async fn main() -> Result<()> {
         
         Some(Commands::Chat) | None => {
             // Default: Start chat
-            run_chat().await?;
+            run_chat(cli.resume).await?;
         }
     }
     
     Ok(())
 }
 
-async fn run_chat() -> Result<()> {
+async fn run_chat(resume: bool) -> Result<()> {
     // Check if first run
     if !FirstRunSetup::is_setup_complete() {
         let mut setup = FirstRunSetup::new()?;
@@ -208,6 +213,37 @@ async fn run_chat() -> Result<()> {
     
     // Create and run REPL
     let mut repl = Repl::new(router, config_dir)?;
+
+    // Handle --resume: show session picker before entering REPL
+    if resume {
+        use llm_conductor::cli::SessionStore;
+        let session_store = SessionStore::new(
+            &dirs::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+                .join("llm-conductor")
+        )?;
+
+        let total = session_store.print_page(0)?;
+        if total > 0 {
+            println!();
+            print!("{} ", "Select session number (or press Enter to start fresh):".bright_cyan());
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let mut input = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut input)?;
+            let input = input.trim();
+            if let Ok(n) = input.parse::<usize>() {
+                if let Ok(meta) = session_store.get_by_number(n) {
+                    repl.load_session(&meta.id)?;
+                } else {
+                    eprintln!("{}", "Invalid session number, starting fresh.".yellow());
+                }
+            } else if !input.is_empty() {
+                eprintln!("{}", "Invalid input, starting fresh.".yellow());
+            }
+            println!();
+        }
+    }
+
     repl.run().await?;
     
     Ok(())
