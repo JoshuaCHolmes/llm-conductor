@@ -117,7 +117,7 @@ impl Provider for TamuProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
-                supports_tool_calling: true,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::ClaudeSonnet45,
@@ -128,7 +128,7 @@ impl Provider for TamuProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
-                supports_tool_calling: true,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Gpt4o,
@@ -139,7 +139,7 @@ impl Provider for TamuProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
-                supports_tool_calling: true,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("gemini-2.5-pro".to_string()),
@@ -150,7 +150,7 @@ impl Provider for TamuProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
-                supports_tool_calling: true,
+                supports_tool_calling: false,
             },
         ])
     }
@@ -163,7 +163,7 @@ impl Provider for TamuProvider {
         let payload = json!({
             "model": model_name,
             "messages": tamu_messages,
-            "max_tokens": 4096,
+            "max_tokens": 16000,
         });
 
         let response = self
@@ -205,7 +205,7 @@ impl Provider for TamuProvider {
             "model": model_name,
             "messages": tamu_messages,
             "stream": true,
-            "max_tokens": 4096,
+            "max_tokens": 16000,
             "stream_options": { "include_usage": true },
         });
 

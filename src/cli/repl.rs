@@ -13,21 +13,50 @@ use crate::types::{Message, Task};
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
 
-/// State machine for streaming responses that may contain <think>...</think> blocks.
-/// Think blocks are printed dimmed; clean_text accumulates the response without them.
+/// State machine for streaming responses that handles `<think>` and ` ```bash ` blocks.
+///
+/// - `<think>...</think>` sections are printed dimmed and excluded from `clean_text`.
+/// - ` ```bash...``` ` sections are silently captured into `bash_blocks` and excluded
+///   from both display and `clean_text`. This prevents raw markdown from cluttering
+///   the output; the REPL executes them via `format_shell_display` instead.
 #[derive(Default)]
-struct ThinkStreamState {
+struct ReplyStreamState {
     in_think: bool,
-    pending: String,
-    clean_text: String,
+    in_bash: bool,
     showed_thinking: bool,
+    pending: String,
+    bash_block_buf: String,
+    pub bash_blocks: Vec<String>,
+    pub clean_text: String,
 }
 
-impl ThinkStreamState {
+impl ReplyStreamState {
     fn process_chunk(&mut self, chunk: &str) {
         self.pending.push_str(chunk);
         loop {
-            if self.in_think {
+            if self.in_bash {
+                // Scan for closing ```
+                if let Some(pos) = self.pending.find("```") {
+                    self.bash_block_buf.push_str(&self.pending[..pos]);
+                    let trimmed = self.bash_block_buf.trim().to_string();
+                    if !trimmed.is_empty() {
+                        self.bash_blocks.push(trimmed);
+                    }
+                    self.bash_block_buf.clear();
+                    self.in_bash = false;
+                    self.pending = self.pending[pos + 3..].to_string();
+                } else {
+                    let safe_len = self.pending.len().saturating_sub(3);
+                    let safe_len = (0..=safe_len).rev()
+                        .find(|&i| self.pending.is_char_boundary(i))
+                        .unwrap_or(0);
+                    if safe_len > 0 {
+                        self.bash_block_buf.push_str(&self.pending[..safe_len]);
+                        self.pending = self.pending[safe_len..].to_string();
+                    }
+                    break;
+                }
+            } else if self.in_think {
                 if let Some(pos) = self.pending.find("</think>") {
                     let before = &self.pending[..pos];
                     if !before.is_empty() {
@@ -37,8 +66,6 @@ impl ThinkStreamState {
                     self.in_think = false;
                     self.pending = self.pending[pos + "</think>".len()..].to_string();
                 } else {
-                    // Keep last 8 chars buffered in case </think> spans chunks.
-                    // safe_len is a byte offset; walk back to a valid char boundary.
                     let safe_len = self.pending.len().saturating_sub(8);
                     let safe_len = (0..=safe_len).rev()
                         .find(|&i| self.pending.is_char_boundary(i))
@@ -52,34 +79,59 @@ impl ThinkStreamState {
                     break;
                 }
             } else {
-                if let Some(pos) = self.pending.find("<think>") {
-                    let before = &self.pending[..pos];
-                    if !before.is_empty() {
-                        print!("{}", before);
-                        std::io::stdout().flush().unwrap();
-                        self.clean_text.push_str(before);
+                // Normal mode: find whichever special token comes first.
+                let think_pos = self.pending.find("<think>");
+                let bash_pos = self.pending.find("```bash");
+                let first = match (think_pos, bash_pos) {
+                    (Some(t), Some(b)) => Some(if t < b { ('t', t) } else { ('b', b) }),
+                    (Some(t), None) => Some(('t', t)),
+                    (None, Some(b)) => Some(('b', b)),
+                    (None, None) => None,
+                };
+                match first {
+                    Some(('t', pos)) => {
+                        let before = &self.pending[..pos];
+                        if !before.is_empty() {
+                            print!("{}", before);
+                            std::io::stdout().flush().unwrap();
+                            self.clean_text.push_str(before);
+                        }
+                        if !self.showed_thinking {
+                            println!("{}", "💭 Thinking...".dimmed().italic());
+                            self.showed_thinking = true;
+                        }
+                        self.in_think = true;
+                        self.pending = self.pending[pos + "<think>".len()..].to_string();
                     }
-                    if !self.showed_thinking {
-                        println!("{}", "💭 Thinking...".dimmed().italic());
-                        self.showed_thinking = true;
+                    Some(('b', pos)) => {
+                        let before = &self.pending[..pos];
+                        if !before.is_empty() {
+                            print!("{}", before);
+                            std::io::stdout().flush().unwrap();
+                            self.clean_text.push_str(before);
+                        }
+                        self.in_bash = true;
+                        // Skip "```bash" and optional leading newline
+                        let after = &self.pending[pos + 7..];
+                        let after = after.strip_prefix('\n').unwrap_or(after);
+                        self.pending = after.to_string();
                     }
-                    self.in_think = true;
-                    self.pending = self.pending[pos + "<think>".len()..].to_string();
-                } else {
-                    // Keep last 7 chars buffered in case <think> spans chunks.
-                    // safe_len is a byte offset; walk back to a valid char boundary.
-                    let safe_len = self.pending.len().saturating_sub(7);
-                    let safe_len = (0..=safe_len).rev()
-                        .find(|&i| self.pending.is_char_boundary(i))
-                        .unwrap_or(0);
-                    if safe_len > 0 {
-                        let to_print = self.pending[..safe_len].to_string();
-                        print!("{}", to_print);
-                        std::io::stdout().flush().unwrap();
-                        self.clean_text.push_str(&to_print);
-                        self.pending = self.pending[safe_len..].to_string();
+                    _ => {
+                        // No special tokens found; buffer with lookahead for partial matches.
+                        // Longest opener is 7 chars ("```bash" or "<think>").
+                        let safe_len = self.pending.len().saturating_sub(7);
+                        let safe_len = (0..=safe_len).rev()
+                            .find(|&i| self.pending.is_char_boundary(i))
+                            .unwrap_or(0);
+                        if safe_len > 0 {
+                            let to_print = self.pending[..safe_len].to_string();
+                            print!("{}", to_print);
+                            std::io::stdout().flush().unwrap();
+                            self.clean_text.push_str(&to_print);
+                            self.pending = self.pending[safe_len..].to_string();
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
@@ -87,15 +139,22 @@ impl ThinkStreamState {
 
     fn flush(&mut self) {
         if !self.pending.is_empty() {
-            if self.in_think {
+            if self.in_bash {
+                // Unclosed bash block — treat as plain text
+                self.clean_text.push_str(&self.pending);
+                self.pending.clear();
+            } else if self.in_think {
                 print!("{}", self.pending.dimmed());
+                std::io::stdout().flush().unwrap();
+                self.pending.clear();
             } else {
                 print!("{}", self.pending);
                 self.clean_text.push_str(&self.pending);
+                std::io::stdout().flush().unwrap();
+                self.pending.clear();
             }
-            std::io::stdout().flush().unwrap();
-            self.pending.clear();
         }
+        self.bash_block_buf.clear();
     }
 }
 
@@ -132,13 +191,13 @@ impl Repl {
 
     /// Build a capability-aware system prompt.
     /// - Tool-calling models: told they have a bash tool available.
-    /// - Code-block models: instructed to wrap commands in ```bash blocks.
+    /// - Code-block models: instructed to use ```bash blocks; multiple allowed per response.
     fn build_system_prompt(supports_tool_calling: bool) -> Message {
         let base = "You are a helpful AI assistant.";
         let instructions = if supports_tool_calling {
             format!("{}\n\nYou have access to a `bash` tool. Use it to run shell commands when needed to help the user. Prefer running commands over asking the user to do so themselves.", base)
         } else {
-            format!("{}\n\nYou can run shell commands by wrapping them in ```bash\n...\n``` code blocks. Include only one command per block. The system will execute it and show you the output. Only run commands that are safe and directly relevant to the user's request.", base)
+            format!("{}\n\nYou have access to a bash shell. When you need to run commands, include them in ```bash code blocks. You may include multiple blocks — each will be executed and the combined output sent back to you so you can continue. When you have all the information you need, give your final answer with no bash blocks.", base)
         };
         Message::system(instructions)
     }
@@ -479,34 +538,42 @@ impl Repl {
                     break;
                 }
             } else {
-                // ── Streaming code-block path (Outlier / Ollama) ─────────────────
+                // ── Streaming code-block path (Outlier / Ollama / TAMU) ──────────────
                 print!("{} ", "❯".bright_green().bold());
 
-                let think_state = Arc::new(Mutex::new(ThinkStreamState::default()));
-                let think_state_cb = think_state.clone();
+                let state = Arc::new(Mutex::new(ReplyStreamState::default()));
+                let state_cb = state.clone();
                 let callback = move |chunk: String| {
-                    think_state_cb.lock().unwrap().process_chunk(&chunk);
+                    state_cb.lock().unwrap().process_chunk(&chunk);
                 };
 
-                let (_raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
-                think_state.lock().unwrap().flush();
-                let clean_response = think_state.lock().unwrap().clean_text.clone();
+                let (raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
+                {
+                    let mut s = state.lock().unwrap();
+                    s.flush();
+                }
                 println!("\n");
+
+                let (clean_response, bash_blocks) = {
+                    let s = state.lock().unwrap();
+                    (s.clean_text.clone(), s.bash_blocks.clone())
+                };
 
                 // Record usage
                 let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
                 self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
 
-                // Add assistant response to history
-                self.history.push(Message::assistant(clean_response.clone()));
+                // Store full raw response (including bash blocks) for cross-provider context
+                self.history.push(Message::assistant(raw_response.clone()));
 
-                // Extract bash blocks and execute (up to MAX_TOOL_ROUNDS)
-                let bash_blocks = executor::extract_bash_blocks(&clean_response);
                 if bash_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
+                    if tool_rounds >= MAX_TOOL_ROUNDS && !bash_blocks.is_empty() {
+                        eprintln!("{} Shell round limit reached", "⚠".yellow());
+                    }
                     break;
                 }
 
-                // Process each bash block
+                // Execute each bash block and collect results
                 let mut shell_results = Vec::new();
                 for cmd in &bash_blocks {
                     let kind = executor::classify(cmd);
