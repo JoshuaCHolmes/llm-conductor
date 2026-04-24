@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 
 use crate::types::{ModelInfo, Task, ProviderId};
 use crate::providers::Provider;
@@ -9,6 +10,7 @@ use crate::model_filter::ModelFilter;
 pub struct Router {
     providers: Vec<Box<dyn Provider>>,
     available_models: Vec<ModelInfo>,
+    provider_map: HashMap<ProviderId, usize>, // Maps ProviderId to index in providers vec
 }
 
 impl Router {
@@ -16,6 +18,7 @@ impl Router {
         Self {
             providers: Vec::new(),
             available_models: Vec::new(),
+            provider_map: HashMap::new(),
         }
     }
     
@@ -29,9 +32,14 @@ impl Router {
     
     pub async fn refresh_models(&mut self) -> Result<()> {
         self.available_models.clear();
+        self.provider_map.clear();
         
-        for provider in &self.providers {
+        for (idx, provider) in self.providers.iter().enumerate() {
             if let Ok(models) = provider.available_models().await {
+                if let Some(first_model) = models.first() {
+                    // Store the mapping from ProviderId to provider index
+                    self.provider_map.insert(first_model.provider.clone(), idx);
+                }
                 self.available_models.extend(models);
             }
         }
@@ -96,15 +104,9 @@ impl Router {
         self.available_models.iter().find(|m| m.name == name)
     }
     
-    /// Find provider for a model by checking which provider offers it
+    /// Find provider for a model using the provider map
     pub fn find_provider_for_model(&self, model: &ModelInfo) -> Option<&Box<dyn Provider>> {
-        for provider in &self.providers {
-            // Try to get models from provider and see if any match
-            // This is sync code but providers use async - we'll need to trust the ProviderId
-            // For now, just iterate and trust the first match
-            // TODO: Better provider matching
-        }
-        // Fallback: return first provider (temporary workaround)
-        self.providers.first()
+        self.provider_map.get(&model.provider)
+            .and_then(|&idx| self.providers.get(idx))
     }
 }

@@ -202,9 +202,8 @@ impl Repl {
         messages.extend(self.history.clone());
         
         // Find provider for this model
-        // We need to match the provider - for now use first provider
-        // TODO: Properly match provider to model
-        let provider = &self.router.providers()[0];
+        let provider = self.router.find_provider_for_model(model)
+            .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
         
         // Stream response
         print!("{} ", "❯".bright_green().bold());

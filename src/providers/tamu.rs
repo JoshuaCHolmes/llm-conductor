@@ -96,7 +96,7 @@ impl Provider for TamuProvider {
             },
             ModelInfo {
                 id: ModelId::Gpt4o,
-                name: "GPT-4o".to_string(),
+                name: "gpt-4o".to_string(),
                 provider: ProviderId::Tamu,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 128_000,
