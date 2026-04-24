@@ -32,8 +32,6 @@ impl ThinkStreamState {
                         print!("{}", before.dimmed());
                         std::io::stdout().flush().unwrap();
                     }
-                    // End think block with a visual separator
-                    println!("{}", "\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔".dimmed());
                     self.in_think = false;
                     self.pending = self.pending[pos + "</think>".len()..].to_string();
                 } else {
@@ -268,20 +266,23 @@ impl Repl {
             content,
         );
         
-        // Select model using filter
+        // Select model using filter and clone to release router borrow
         let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
-            .ok_or_else(|| anyhow::anyhow!("No suitable model available with current filters"))?;
+            .ok_or_else(|| anyhow::anyhow!("No suitable model available with current filters"))?
+            .clone();
         
-        // Clone model info for later use
         let model_name = model.name.clone();
         let provider_id = model.provider.clone();
         let provider_display = model.provider.to_string();
         
-        println!("{} {} {} {}", 
+        // Show "Using X from Y" with current (pre-turn) usage state
+        let usage_suffix = self.format_usage_suffix(&provider_id);
+        println!("{} {} {} {}{}",
             "Using".dimmed(),
             model_name.bright_white(),
             "from".dimmed(),
-            provider_display.bright_cyan()
+            provider_display.bright_cyan(),
+            usage_suffix
         );
         println!();
         
@@ -290,7 +291,7 @@ impl Repl {
         messages.extend(self.history.clone());
         
         // Find provider for this model
-        let provider = self.router.find_provider_for_model(model)
+        let provider = self.router.find_provider_for_model(&model)
             .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
         
         // Stream response with think-tag formatting
@@ -303,7 +304,7 @@ impl Repl {
             think_state_cb.lock().unwrap().process_chunk(&chunk);
         };
         
-        let _response = provider.chat_stream(model, &messages, Box::new(callback)).await?;
+        let (_raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
         
         // Flush any remaining buffered content
         think_state.lock().unwrap().flush();
@@ -313,37 +314,37 @@ impl Repl {
         
         println!("\n");
         
-        // Record usage (1 request, estimate tokens from response length)
-        let estimated_tokens = (clean_response.len() / 4) as u64;
-        self.usage_tracker.record_usage(provider_id.clone(), 1, estimated_tokens, 0.0);
-        
-        // Show usage info
-        if let Some(usage) = self.usage_tracker.get_usage(&provider_id) {
-            use crate::usage_tracking::LimitType;
-            match &usage.limit_type {
-                LimitType::Unlimited => {
-                    // Don't show anything for unlimited
-                }
-                LimitType::RequestBased { max_requests, current_requests, .. } => {
-                    let remaining = max_requests - current_requests;
-                    println!("{} {} requests remaining", "└─".dimmed(), remaining.to_string().bright_yellow());
-                }
-                LimitType::TokenBased { max_tokens, current_tokens, .. } => {
-                    let remaining_pct = ((max_tokens - current_tokens) as f64 / *max_tokens as f64) * 100.0;
-                    println!("{} {:.1}% tokens remaining", "└─".dimmed(), remaining_pct.to_string().bright_yellow());
-                }
-                LimitType::CostBased { max_cost, current_cost, .. } => {
-                    let remaining = max_cost - current_cost;
-                    println!("{} ${:.2} remaining", "└─".dimmed(), remaining.to_string().bright_yellow());
-                }
-            }
-        }
-        println!();
+        // Record usage: use real token count if available, else estimate from response length
+        let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
+        self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
         
         // Add assistant response to history (without think blocks)
         self.history.push(Message::assistant(clean_response));
         
         Ok(())
+    }
+
+    fn format_usage_suffix(&mut self, provider_id: &crate::types::ProviderId) -> String {
+        use crate::usage_tracking::LimitType;
+        if let Some(usage) = self.usage_tracker.get_usage(provider_id) {
+            match &usage.limit_type {
+                LimitType::Unlimited => String::new(),
+                LimitType::RequestBased { max_requests, current_requests, .. } => {
+                    let remaining = max_requests.saturating_sub(*current_requests);
+                    format!(" {} {} requests remaining", "·".dimmed(), remaining.to_string().bright_yellow())
+                }
+                LimitType::TokenBased { max_tokens, current_tokens, .. } => {
+                    let remaining_pct = ((*max_tokens).saturating_sub(*current_tokens) as f64 / *max_tokens as f64) * 100.0;
+                    format!(" {} {}% tokens remaining", "·".dimmed(), format!("{:.1}", remaining_pct).bright_yellow())
+                }
+                LimitType::CostBased { max_cost, current_cost, .. } => {
+                    let remaining = max_cost - current_cost;
+                    format!(" {} ${:.2} remaining", "·".dimmed(), remaining.to_string().bright_yellow())
+                }
+            }
+        } else {
+            String::new()
+        }
     }
     
     async fn list_providers(&self) -> Result<()> {
@@ -362,7 +363,7 @@ impl Repl {
         Ok(())
     }
     
-    fn list_models(&self) {
+    fn list_models(&mut self) {
         println!("Active filter: {}", self.model_filter.description());
         println!();
         
@@ -386,6 +387,39 @@ impl Repl {
         
         if shown == 0 {
             println!("  {}", "No models match current filter".yellow());
+        }
+
+        // Show usage summary for all tracked providers
+        use crate::usage_tracking::LimitType;
+        let mut printed_header = false;
+        for provider_id in [
+            crate::types::ProviderId::Tamu,
+            crate::types::ProviderId::GitHubCopilot,
+            crate::types::ProviderId::Outlier,
+        ] {
+            if let Some(usage) = self.usage_tracker.get_usage(&provider_id) {
+                let line = match &usage.limit_type {
+                    LimitType::Unlimited => continue,
+                    LimitType::RequestBased { max_requests, current_requests, .. } => {
+                        let remaining = max_requests.saturating_sub(*current_requests);
+                        format!("{}: {} requests remaining", provider_id.to_string().bright_cyan(), remaining.to_string().bright_yellow())
+                    }
+                    LimitType::TokenBased { max_tokens, current_tokens, .. } => {
+                        let remaining_pct = ((*max_tokens).saturating_sub(*current_tokens) as f64 / *max_tokens as f64) * 100.0;
+                        format!("{}: {}% tokens remaining", provider_id.to_string().bright_cyan(), format!("{:.1}", remaining_pct).bright_yellow())
+                    }
+                    LimitType::CostBased { max_cost, current_cost, .. } => {
+                        let remaining = max_cost - current_cost;
+                        format!("{}: ${:.2} remaining", provider_id.to_string().bright_cyan(), remaining)
+                    }
+                };
+                if !printed_header {
+                    println!();
+                    println!("{}", "Usage:".dimmed());
+                    printed_header = true;
+                }
+                println!("  {}", line);
+            }
         }
     }
     

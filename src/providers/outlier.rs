@@ -425,7 +425,7 @@ impl Provider for OutlierProvider {
         model: &ModelInfo,
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id = self.get_outlier_model_id(model_name);
         
@@ -547,7 +547,7 @@ impl Provider for OutlierProvider {
             }
         }
 
-        Ok(full_content)
+        Ok((full_content, None))
     }
 
     async fn health_check(&self) -> Result<bool> {

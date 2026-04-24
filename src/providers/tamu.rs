@@ -44,8 +44,15 @@ struct TamuDelta {
 }
 
 #[derive(Debug, Deserialize)]
+struct TamuStreamUsage {
+    total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct TamuStreamChunk {
     choices: Vec<TamuStreamChoice>,
+    #[serde(default)]
+    usage: Option<TamuStreamUsage>,
 }
 
 impl TamuProvider {
@@ -166,7 +173,7 @@ impl Provider for TamuProvider {
         model: &ModelInfo,
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let model_name = self.get_api_model_name(&model.id);
 
         let tamu_messages: Vec<serde_json::Value> = messages
@@ -184,6 +191,7 @@ impl Provider for TamuProvider {
             "messages": tamu_messages,
             "stream": true,
             "max_tokens": 4096,
+            "stream_options": { "include_usage": true },
         });
 
         let response = self
@@ -205,6 +213,7 @@ impl Provider for TamuProvider {
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
         let mut buffer = String::new();
+        let mut total_tokens: Option<u64> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -224,6 +233,9 @@ impl Provider for TamuProvider {
                 }
 
                 if let Ok(parsed) = serde_json::from_str::<TamuStreamChunk>(data) {
+                    if let Some(usage) = parsed.usage {
+                        total_tokens = Some(usage.total_tokens);
+                    }
                     for choice in parsed.choices {
                         if let Some(content) = choice.delta.content {
                             callback(content.clone());
@@ -234,7 +246,7 @@ impl Provider for TamuProvider {
             }
         }
 
-        Ok(full_content)
+        Ok((full_content, total_tokens))
     }
 
     async fn health_check(&self) -> Result<bool> {

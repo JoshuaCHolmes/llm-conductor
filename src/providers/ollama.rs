@@ -92,7 +92,7 @@ impl Provider for OllamaProvider {
         model: &ModelInfo,
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         use futures::StreamExt;
         
         let url = format!("{}/api/chat", self.base_url);
@@ -151,7 +151,7 @@ impl Provider for OllamaProvider {
             }
         }
         
-        Ok(full_response)
+        Ok((full_response, None))
     }
     
     async fn health_check(&self) -> Result<bool> {

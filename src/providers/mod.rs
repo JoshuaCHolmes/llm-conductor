@@ -24,13 +24,14 @@ pub trait Provider: Send + Sync {
     /// Send messages and get response
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String>;
     
-    /// Send messages and stream response
+    /// Send messages and stream response.
+    /// Returns (full_response_text, Option<total_tokens_used>).
     async fn chat_stream(
         &self,
         model: &ModelInfo,
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
-    ) -> Result<String>;
+    ) -> Result<(String, Option<u64>)>;
     
     /// Check if provider is available/healthy
     async fn health_check(&self) -> Result<bool>;

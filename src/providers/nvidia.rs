@@ -175,7 +175,7 @@ impl Provider for NvidiaProvider {
         model: &ModelInfo,
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let model_name = self.get_api_model_name(&model.id);
 
         let nvidia_messages: Vec<serde_json::Value> = messages
@@ -246,7 +246,7 @@ impl Provider for NvidiaProvider {
             }
         }
 
-        Ok(full_content)
+        Ok((full_content, None))
     }
 
     async fn health_check(&self) -> Result<bool> {

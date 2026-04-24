@@ -148,7 +148,7 @@ impl Provider for GitHubProvider {
         model: &ModelInfo,
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let model_name = match &model.id {
             ModelId::Gpt4o => "gpt-4o",
             ModelId::ClaudeSonnet45 => "claude-3-5-sonnet-20241022",
@@ -220,7 +220,8 @@ impl Provider for GitHubProvider {
             }
         }
 
-        Ok(full_content)
+        // GitHub is request-based; return None for tokens (caller uses 1 request)
+        Ok((full_content, None))
     }
 
     async fn health_check(&self) -> Result<bool> {
