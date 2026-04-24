@@ -195,7 +195,7 @@ impl OutlierProvider {
             .iter()
             .map(|msg| match msg.role.as_str() {
                 "system" => format!("System: {}", msg.content),
-                "user" => msg.content.clone(),
+                "user" => format!("User: {}", msg.content),
                 "assistant" => format!("Assistant: {}", msg.content),
                 _ => msg.content.clone(),
             })
