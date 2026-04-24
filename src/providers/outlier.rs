@@ -346,8 +346,8 @@ impl Provider for OutlierProvider {
         
         let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
         
-        // Update last seen index to current message count
-        *self.last_seen_message_index.lock().await = messages.len();
+        // Update last seen index to after assistant response
+        *self.last_seen_message_index.lock().await = messages.len() + 1;  // +1 for assistant response added by REPL
         
         // Always send the turn request to get the AI response
         let url = format!(
@@ -475,8 +475,8 @@ impl Provider for OutlierProvider {
         
         let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
         
-        // Update last seen index to current message count
-        *self.last_seen_message_index.lock().await = messages.len();
+        // Update last seen index to after assistant response
+        *self.last_seen_message_index.lock().await = messages.len() + 1;  // +1 for assistant response added by REPL
         
         // Always send the turn request to get the AI response
         let url = format!(
