@@ -98,14 +98,53 @@ impl OutlierProvider {
         }
     }
 
-    async fn get_or_create_conversation(&self) -> Result<String> {
+    async fn get_or_create_conversation(&self, first_message: Option<&str>, model_name: &str, model_id: &str) -> Result<String> {
         let mut conv_id = self.conversation_id.lock().await;
         
         if let Some(ref id) = *conv_id {
             return Ok(id.clone());
         }
 
-        // Fetch latest conversation
+        // If we have a first message, create a new conversation with it
+        if let Some(text) = first_message {
+            let url = format!("{}/internal/experts/assistant/conversations", BASE_URL); // No trailing slash!
+            let payload = serde_json::json!({
+                "prompt": {
+                    "text": text,
+                    "images": []
+                },
+                "model": model_name,
+                "modelId": model_id,
+                "challengeId": "",
+                "initialTurnMode": "Normal",
+                "initialTurnType": "Text",
+                "isMysteryModel": false
+            });
+
+            let response = self
+                .client
+                .post(&url)
+                .header("origin", BASE_URL)
+                .header("referer", format!("{}/chat", BASE_URL))
+                .header("content-type", "application/json")
+                .header("x-csrf-token", &self.csrf_token)
+                .header("cookie", &self.cookie)
+                .json(&payload)
+                .send()
+                .await?;
+
+            if response.status().is_success() {
+                let data: serde_json::Value = response.json().await?;
+                if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+                    let id = id.to_string();
+                    eprintln!("✅ Created new conversation: {}", &id[..12]);
+                    *conv_id = Some(id.clone());
+                    return Ok(id);
+                }
+            }
+        }
+
+        // Fallback: fetch latest conversation
         let url = format!("{}/internal/experts/assistant/conversations/", BASE_URL);
         let response = self
             .client
@@ -142,6 +181,7 @@ impl OutlierProvider {
             .context("Conversation ID not found")?
             .to_string();
 
+        eprintln!("⚠️  Using existing conversation: {}", &id[..12]);
         *conv_id = Some(id.clone());
         Ok(id)
     }
@@ -257,7 +297,13 @@ impl Provider for OutlierProvider {
         let model_id = self.get_outlier_model_id(model_name);
         let text = self.messages_to_text(messages);
 
-        let conv_id = self.get_or_create_conversation().await?;
+        // Get or create conversation - if creating new, pass the first message
+        let needs_new_conversation = self.conversation_id.lock().await.is_none();
+        let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
+        
+        let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
+        
+        // Always send the turn request to get the AI response
         let url = format!(
             "{}/internal/experts/assistant/conversations/{}/turn-streaming",
             BASE_URL, conv_id
@@ -338,7 +384,13 @@ impl Provider for OutlierProvider {
         let model_id = self.get_outlier_model_id(model_name);
         let text = self.messages_to_text(messages);
 
-        let conv_id = self.get_or_create_conversation().await?;
+        // Get or create conversation - if creating new, pass the first message
+        let needs_new_conversation = self.conversation_id.lock().await.is_none();
+        let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
+        
+        let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
+        
+        // Always send the turn request to get the AI response
         let url = format!(
             "{}/internal/experts/assistant/conversations/{}/turn-streaming",
             BASE_URL, conv_id

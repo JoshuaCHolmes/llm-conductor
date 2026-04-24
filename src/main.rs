@@ -135,30 +135,27 @@ async fn run_chat() -> Result<()> {
         setup.mark_complete()?;
     }
     
-    // Ensure Ollama is running
-    match OllamaInstaller::check_installation().await {
-        InstallStatus::InstalledNotRunning => {
-            use colored::*;
-            println!("{}", "Starting Ollama server...".yellow());
-            OllamaInstaller::start_server().await?;
-        }
-        InstallStatus::NotInstalled => {
-            use colored::*;
-            eprintln!("{}", "Ollama not found!".bright_red());
-            eprintln!("Please run: {}", "llm-conductor setup".bright_white());
-            return Err(anyhow::anyhow!("Ollama not installed"));
-        }
-        _ => {}
-    }
-    
     // Create router
     let mut router = Router::new();
     
     // Load provider configuration
     let provider_config_manager = ProviderConfigManager::new()?;
     
-    // Add Ollama provider if enabled
+    // Add Ollama provider if enabled (and ensure it's running)
     if provider_config_manager.is_enabled("ollama") {
+        match OllamaInstaller::check_installation().await {
+            InstallStatus::InstalledNotRunning => {
+                use colored::*;
+                println!("{}", "Starting Ollama server...".yellow());
+                OllamaInstaller::start_server().await?;
+            }
+            InstallStatus::NotInstalled => {
+                use colored::*;
+                eprintln!("{}", "⚠️  Ollama not found but is enabled in config".bright_yellow());
+                eprintln!("Continuing without Ollama. To install, run: {}", "llm-conductor setup".bright_white());
+            }
+            _ => {}
+        }
         router.add_provider(Box::new(OllamaProvider::new(None)));
     }
     
