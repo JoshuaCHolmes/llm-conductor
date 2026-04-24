@@ -1,0 +1,9 @@
+/model github
+What is 5+5?
+/model outlier
+What was my previous question?
+/model github
+Now what is 10+10?
+/model outlier
+What are the two questions I asked before this?
+/exit

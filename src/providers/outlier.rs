@@ -55,6 +55,8 @@ pub struct OutlierProvider {
     cookie: String,
     csrf_token: String,
     conversation_id: Arc<Mutex<Option<String>>>,
+    // Track the index of the last message this provider has seen
+    last_seen_message_index: Arc<Mutex<usize>>,
 }
 
 impl OutlierProvider {
@@ -68,6 +70,7 @@ impl OutlierProvider {
             cookie,
             csrf_token,
             conversation_id: Arc::new(Mutex::new(None)),
+            last_seen_message_index: Arc::new(Mutex::new(0)),
         })
     }
     
@@ -75,6 +78,8 @@ impl OutlierProvider {
     pub async fn clear_conversation(&self) {
         let mut conv_id = self.conversation_id.lock().await;
         *conv_id = None;
+        let mut last_seen = self.last_seen_message_index.lock().await;
+        *last_seen = 0;
     }
 
     fn get_api_model_name<'a>(&self, model_id: &'a ModelId) -> &'a str {
@@ -137,7 +142,6 @@ impl OutlierProvider {
                 let data: serde_json::Value = response.json().await?;
                 if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
                     let id = id.to_string();
-                    eprintln!("✅ Created new conversation: {}", &id[..12]);
                     *conv_id = Some(id.clone());
                     return Ok(id);
                 }
@@ -295,13 +299,55 @@ impl Provider for OutlierProvider {
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id = self.get_outlier_model_id(model_name);
-        let text = self.messages_to_text(messages);
+        
+        // Determine what messages to send based on conversation state
+        let needs_new_conversation = self.conversation_id.lock().await.is_none();
+        let last_seen = *self.last_seen_message_index.lock().await;
+        
+        let text = if needs_new_conversation {
+            // New conversation: Send all messages with context wrapper if there's history
+            if last_seen > 0 && messages.len() > 1 {
+                // We have previous conversation history to catch up on
+                let history_text = self.messages_to_text(&messages[..messages.len() - 1]);
+                format!(
+                    "\n{}\n\n\n\n{}",
+                    history_text,
+                    messages.last().map(|m| m.content.as_str()).unwrap_or("")
+                )
+            } else {
+                // No previous history or this is the first message
+                self.messages_to_text(messages)
+            }
+        } else {
+            // Existing conversation: Send messages we haven't seen yet
+            if last_seen < messages.len() - 1 {
+                // There are messages between last_seen and current that we missed
+                let missed_messages = &messages[last_seen..messages.len() - 1];
+                let current_message = messages.last().map(|m| m.content.as_str()).unwrap_or("");
+                
+                if !missed_messages.is_empty() {
+                    let missed_text = self.messages_to_text(missed_messages);
+                    format!(
+                        "\n{}\n\n\n{}",
+                        missed_text,
+                        current_message
+                    )
+                } else {
+                    current_message.to_string()
+                }
+            } else {
+                // Just send the current message
+                messages.last().map(|m| m.content.clone()).unwrap_or_default()
+            }
+        };
 
         // Get or create conversation - if creating new, pass the first message
-        let needs_new_conversation = self.conversation_id.lock().await.is_none();
         let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
         
         let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
+        
+        // Update last seen index to current message count
+        *self.last_seen_message_index.lock().await = messages.len();
         
         // Always send the turn request to get the AI response
         let url = format!(
@@ -382,13 +428,55 @@ impl Provider for OutlierProvider {
     ) -> Result<String> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id = self.get_outlier_model_id(model_name);
-        let text = self.messages_to_text(messages);
+        
+        // Determine what messages to send based on conversation state
+        let needs_new_conversation = self.conversation_id.lock().await.is_none();
+        let last_seen = *self.last_seen_message_index.lock().await;
+        
+        let text = if needs_new_conversation {
+            // New conversation: Send all messages with context wrapper if there's history
+            if last_seen > 0 && messages.len() > 1 {
+                // We have previous conversation history to catch up on
+                let history_text = self.messages_to_text(&messages[..messages.len() - 1]);
+                format!(
+                    "\n{}\n\n\n\n{}",
+                    history_text,
+                    messages.last().map(|m| m.content.as_str()).unwrap_or("")
+                )
+            } else {
+                // No previous history or this is the first message
+                self.messages_to_text(messages)
+            }
+        } else {
+            // Existing conversation: Send messages we haven't seen yet
+            if last_seen < messages.len() - 1 {
+                // There are messages between last_seen and current that we missed
+                let missed_messages = &messages[last_seen..messages.len() - 1];
+                let current_message = messages.last().map(|m| m.content.as_str()).unwrap_or("");
+                
+                if !missed_messages.is_empty() {
+                    let missed_text = self.messages_to_text(missed_messages);
+                    format!(
+                        "\n{}\n\n\n{}",
+                        missed_text,
+                        current_message
+                    )
+                } else {
+                    current_message.to_string()
+                }
+            } else {
+                // Just send the current message
+                messages.last().map(|m| m.content.clone()).unwrap_or_default()
+            }
+        };
 
         // Get or create conversation - if creating new, pass the first message
-        let needs_new_conversation = self.conversation_id.lock().await.is_none();
         let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
         
         let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
+        
+        // Update last seen index to current message count
+        *self.last_seen_message_index.lock().await = messages.len();
         
         // Always send the turn request to get the AI response
         let url = format!(
