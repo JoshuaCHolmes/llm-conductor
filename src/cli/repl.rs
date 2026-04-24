@@ -1,19 +1,23 @@
 use anyhow::Result;
 use colored::*;
 use rustyline::DefaultEditor;
+use std::path::PathBuf;
 
 use crate::providers::Provider;
 use crate::router::Router;
-use crate::types::{Context, CoreContext, Message, Task};
+use crate::types::{Context, CoreContext, Message, Task, ProviderId};
+use crate::usage_tracking::UsageTracker;
 
 pub struct Repl {
     router: Router,
     context: Context,
     history: Vec<Message>,
+    usage_tracker: UsageTracker,
+    forced_model: Option<String>, // User can force a specific model
 }
 
 impl Repl {
-    pub fn new(router: Router) -> Self {
+    pub fn new(router: Router, config_dir: PathBuf) -> Result<Self> {
         // Default core context
         let core = CoreContext {
             system_instructions: "You are a helpful AI assistant.".to_string(),
@@ -21,11 +25,15 @@ impl Repl {
             constraints: Vec::new(),
         };
         
-        Self {
+        let usage_tracker = UsageTracker::new(&config_dir)?;
+        
+        Ok(Self {
             router,
             context: Context::new(core),
             history: Vec::new(),
-        }
+            usage_tracker,
+            forced_model: None,
+        })
     }
     
     pub async fn run(&mut self) -> Result<()> {
@@ -100,6 +108,28 @@ impl Repl {
                 self.print_help();
                 Ok(true)
             }
+            Some("/model") => {
+                if parts.len() == 1 {
+                    // List available models
+                    self.list_models();
+                } else if parts.len() == 2 && parts[1] == "reset" {
+                    self.forced_model = None;
+                    println!("{}", "Model selection reset to automatic".green());
+                } else {
+                    // Set forced model
+                    let model_name = parts[1..].join(" ");
+                    let models = self.router.available_models();
+                    if models.iter().any(|m| m.name == model_name) {
+                        self.forced_model = Some(model_name.clone());
+                        println!("{} {}", "Forced model set to:".green(), model_name.bright_white());
+                    } else {
+                        eprintln!("{} Model not found: {}", "Error:".bright_red(), model_name);
+                        println!("Available models:");
+                        self.list_models();
+                    }
+                }
+                Ok(true)
+            }
             Some("/providers") => {
                 self.list_providers().await?;
                 Ok(true)
@@ -130,15 +160,25 @@ impl Repl {
             content,
         );
         
-        // Select model
-        let model = self.router.select_model(&task)
-            .ok_or_else(|| anyhow::anyhow!("No suitable model available"))?;
+        // Select model (forced or automatic)
+        let model = if let Some(forced_name) = &self.forced_model {
+            self.router.find_model(forced_name)
+                .ok_or_else(|| anyhow::anyhow!("Forced model '{}' not found", forced_name))?
+        } else {
+            self.router.select_model_with_usage(&task, &mut self.usage_tracker)
+                .ok_or_else(|| anyhow::anyhow!("No suitable model available"))?
+        };
+        
+        // Clone model info for later use
+        let model_name = model.name.clone();
+        let provider_id = model.provider.clone();
+        let provider_display = model.provider.to_string();
         
         println!("{} {} {} {}", 
             "Using".dimmed(),
-            model.name.bright_white(),
+            model_name.bright_white(),
             "from".dimmed(),
-            format!("{:?}", model.provider).bright_cyan()
+            provider_display.bright_cyan()
         );
         println!();
         
@@ -146,8 +186,10 @@ impl Repl {
         let mut messages = self.context.to_messages();
         messages.extend(self.history.clone());
         
-        // Get provider for this model
-        let provider = &self.router.providers()[0];  // TODO: Match provider to model
+        // Find provider for this model
+        // We need to match the provider - for now use first provider
+        // TODO: Properly match provider to model
+        let provider = &self.router.providers()[0];
         
         // Stream response
         print!("{} ", "❯".bright_green().bold());
@@ -162,6 +204,33 @@ impl Repl {
         response = provider.chat_stream(model, &messages, Box::new(callback)).await?;
         
         println!("\n");
+        
+        // Record usage (1 request, estimate tokens from response length)
+        let estimated_tokens = (response.len() / 4) as u64; // Rough estimate: 4 chars per token
+        self.usage_tracker.record_usage(provider_id.clone(), 1, estimated_tokens, 0.0);
+        
+        // Show usage info
+        if let Some(usage) = self.usage_tracker.get_usage(&provider_id) {
+            use crate::usage_tracking::LimitType;
+            match &usage.limit_type {
+                LimitType::Unlimited => {
+                    // Don't show anything for unlimited
+                }
+                LimitType::RequestBased { max_requests, current_requests, .. } => {
+                    let remaining = max_requests - current_requests;
+                    println!("{} {} requests remaining", "└─".dimmed(), remaining.to_string().bright_yellow());
+                }
+                LimitType::TokenBased { max_tokens, current_tokens, .. } => {
+                    let remaining_pct = ((max_tokens - current_tokens) as f64 / *max_tokens as f64) * 100.0;
+                    println!("{} {:.1}% tokens remaining", "└─".dimmed(), remaining_pct.to_string().bright_yellow());
+                }
+                LimitType::CostBased { max_cost, current_cost, .. } => {
+                    let remaining = max_cost - current_cost;
+                    println!("{} ${:.2} remaining", "└─".dimmed(), remaining.to_string().bright_yellow());
+                }
+            }
+        }
+        println!();
         
         // Add assistant response to history
         self.history.push(Message::assistant(response));
@@ -185,9 +254,24 @@ impl Repl {
         Ok(())
     }
     
+    fn list_models(&self) {
+        let models = self.router.available_models();
+        for model in models {
+            let marker = if self.forced_model.as_ref() == Some(&model.name) {
+                "→".bright_green()
+            } else {
+                "•".bright_blue()
+            };
+            println!("  {} {} ({})", marker, model.name.bright_white(), model.provider.to_string().dimmed());
+        }
+    }
+    
     fn print_help(&self) {
         println!("{}", "Available Commands:".bright_cyan().bold());
         println!("  {} - Show this help message", "/help".bright_white());
+        println!("  {} - List available models", "/model".bright_white());
+        println!("  {} - Force use of a specific model", "/model <name>".bright_white());
+        println!("  {} - Reset to automatic model selection", "/model reset".bright_white());
         println!("  {} - List available providers", "/providers".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());

@@ -210,7 +210,7 @@ async fn run_chat() -> Result<()> {
     let _usage_tracker = UsageTracker::new(&config_dir)?;
     
     // Create and run REPL
-    let mut repl = Repl::new(router);
+    let mut repl = Repl::new(router, config_dir)?;
     repl.run().await?;
     
     Ok(())
