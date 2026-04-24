@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::session::SessionStore;
+use crate::cli::executor::{self, ShellTurn};
 use crate::providers::Provider;
 use crate::router::Router;
 use crate::types::{Context, CoreContext, Message, Task, ProviderId};
@@ -109,6 +110,8 @@ pub struct Repl {
     session_id: Option<String>,
     /// Current page for /sessions pagination
     sessions_page: usize,
+    /// Shell turns this session: index 0 = turn #1
+    shell_turns: Vec<ShellTurn>,
 }
 
 impl Repl {
@@ -132,6 +135,7 @@ impl Repl {
             session_store,
             session_id: None,
             sessions_page: 0,
+            shell_turns: Vec::new(),
         })
     }
 
@@ -263,6 +267,7 @@ impl Repl {
             Some("/new") => {
                 self.history.clear();
                 self.session_id = None;
+                self.shell_turns.clear();
                 println!("{}", "✓ Started new conversation".green());
                 Ok(true)
             }
@@ -299,6 +304,26 @@ impl Repl {
                 }
                 Ok(true)
             }
+            Some("/show") => {
+                match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 && n <= self.shell_turns.len() => {
+                        let turn = &self.shell_turns[n - 1];
+                        println!("{} {} {}", "●".bright_cyan(), turn.cmd.bright_white(), format!("(shell #{})", n).dimmed());
+                        for line in turn.output.lines() {
+                            println!("  {} {}", "│".dimmed(), line);
+                        }
+                        println!("  {}", "└".dimmed());
+                    }
+                    _ => {
+                        if self.shell_turns.is_empty() {
+                            eprintln!("{}", "No shell turns in this session.".yellow());
+                        } else {
+                            eprintln!("{}", format!("Usage: /show N  (1–{})", self.shell_turns.len()).yellow());
+                        }
+                    }
+                }
+                Ok(true)
+            }
             Some("/providers") => {
                 self.list_providers().await?;
                 Ok(true)
@@ -322,74 +347,124 @@ impl Repl {
     async fn handle_message(&mut self, content: &str) -> Result<()> {
         // Add user message to history
         self.history.push(Message::user(content));
-        
-        // Create task
-        let task = Task::new(
-            "User query",
-            content,
-        );
-        
-        // Select model using filter and clone to release router borrow
-        let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
-            .ok_or_else(|| anyhow::anyhow!("No suitable model available with current filters"))?
-            .clone();
-        
-        let model_name = model.name.clone();
-        let provider_id = model.provider.clone();
-        let provider_display = model.provider.to_string();
-        
-        // Show "Using X from Y" with current (pre-turn) usage state
-        let usage_suffix = self.format_usage_suffix(&provider_id);
-        println!("{} {} {} {}{}",
-            "Using".dimmed(),
-            model_name.bright_white(),
-            "from".dimmed(),
-            provider_display.bright_cyan(),
-            usage_suffix
-        );
-        println!();
-        
-        // Get messages for model
-        let mut messages = self.context.to_messages();
-        messages.extend(self.history.clone());
-        
-        // Find provider for this model
-        let provider = self.router.find_provider_for_model(&model)
-            .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
-        
-        // Stream response with think-tag formatting
-        print!("{} ", "❯".bright_green().bold());
-        
-        let think_state = Arc::new(Mutex::new(ThinkStreamState::default()));
-        let think_state_cb = think_state.clone();
-        
-        let callback = move |chunk: String| {
-            think_state_cb.lock().unwrap().process_chunk(&chunk);
-        };
-        
-        let (_raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
-        
-        // Flush any remaining buffered content
-        think_state.lock().unwrap().flush();
-        
-        // Use clean response (no think blocks) for history
-        let clean_response = think_state.lock().unwrap().clean_text.clone();
-        
-        println!("\n");
-        
-        // Record usage: use real token count if available, else estimate from response length
-        let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
-        self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
-        
-        // Add assistant response to history (without think blocks)
-        self.history.push(Message::assistant(clean_response));
 
-        // Auto-save session after every turn
+        const MAX_TOOL_ROUNDS: usize = 5;
+        let mut tool_rounds = 0;
+
+        loop {
+            // Create task from last user message
+            let last_user = self.history.iter().rev()
+                .find(|m| matches!(m.role, crate::types::Role::User))
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+
+            let task = Task::new("User query", &last_user);
+
+            // Select model (clone to release borrow)
+            let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+                .ok_or_else(|| anyhow::anyhow!("No suitable model available with current filters"))?
+                .clone();
+
+            let model_name = model.name.clone();
+            let provider_id = model.provider.clone();
+            let provider_display = model.provider.to_string();
+
+            // Show "Using X from Y" with current usage (only on first round)
+            if tool_rounds == 0 {
+                let usage_suffix = self.format_usage_suffix(&provider_id);
+                println!("{} {} {} {}{}",
+                    "Using".dimmed(),
+                    model_name.bright_white(),
+                    "from".dimmed(),
+                    provider_display.bright_cyan(),
+                    usage_suffix
+                );
+                println!();
+            }
+
+            // Get messages for model
+            let mut messages = self.context.to_messages();
+            messages.extend(self.history.clone());
+
+            // Find provider
+            let provider = self.router.find_provider_for_model(&model)
+                .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
+
+            // Stream response
+            print!("{} ", "❯".bright_green().bold());
+
+            let think_state = Arc::new(Mutex::new(ThinkStreamState::default()));
+            let think_state_cb = think_state.clone();
+            let callback = move |chunk: String| {
+                think_state_cb.lock().unwrap().process_chunk(&chunk);
+            };
+
+            let (_raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
+            think_state.lock().unwrap().flush();
+            let clean_response = think_state.lock().unwrap().clean_text.clone();
+            println!("\n");
+
+            // Record usage
+            let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
+            self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
+
+            // Add assistant response to history
+            self.history.push(Message::assistant(clean_response.clone()));
+
+            // Extract bash blocks and execute (up to MAX_TOOL_ROUNDS)
+            let bash_blocks = executor::extract_bash_blocks(&clean_response);
+            if bash_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
+                break;
+            }
+
+            // Process each bash block
+            let mut shell_results = Vec::new();
+            for cmd in &bash_blocks {
+                let kind = executor::classify(cmd);
+                let approved = match kind {
+                    executor::CommandKind::ReadOnly => true,
+                    executor::CommandKind::NeedsConfirm => {
+                        print!("{} {} {} ",
+                            "⚡".yellow(),
+                            "Run:".bright_white(),
+                            cmd.bright_yellow()
+                        );
+                        print!("{}", " [y/N] ".dimmed());
+                        std::io::stdout().flush()?;
+                        let mut ans = String::new();
+                        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
+                        ans.trim().eq_ignore_ascii_case("y")
+                    }
+                };
+
+                if approved {
+                    let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                    let turn_num = self.shell_turns.len() + 1;
+                    print!("{}", executor::format_shell_display(turn_num, cmd, &output));
+                    self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                    shell_results.push(format!("$ {}\n{}", cmd, output));
+                } else {
+                    println!("{}", "  (skipped)".dimmed());
+                }
+            }
+
+            if shell_results.is_empty() {
+                // All blocks were skipped — don't loop
+                break;
+            }
+
+            // Feed shell results back to model as a user message, then loop
+            let feedback = format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n"));
+            self.history.push(Message::user(feedback));
+            tool_rounds += 1;
+        }
+
+        // Auto-save session
         match self.session_store.save(self.session_id.as_deref(), &self.history) {
             Ok(id) => { self.session_id = Some(id); }
             Err(e) => eprintln!("{} Failed to auto-save session: {}", "⚠".yellow(), e),
         }
-        
+
         Ok(())
     }
 
@@ -504,10 +579,10 @@ impl Repl {
         println!("      /model claude-opus tamu       - Use Opus from TAMU");
         println!("      /model outlier frontier       - Use Outlier frontier models");
         println!("  {} - Reset to automatic model selection", "/model reset".bright_white());
-        println!("  {} - List saved sessions (> / < to page)", "/sessions".bright_white());
+        println!("  {} - Show full shell output for turn N", "/show N".bright_white());
         println!("  {} - Resume a saved session by number", "/load N".bright_white());
+        println!("  {} - List saved sessions (> / < to page)", "/sessions".bright_white());
         println!("  {} - Start a new conversation", "/new".bright_white());
-        println!("  {} - List available providers", "/providers".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();

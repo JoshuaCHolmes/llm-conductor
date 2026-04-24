@@ -168,6 +168,65 @@ impl SessionStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Message, Role};
+    use tempfile::TempDir;
+
+    fn make_store(dir: &TempDir) -> SessionStore {
+        SessionStore::new(dir.path()).unwrap()
+    }
+
+    fn msg(role: Role, content: &str) -> Message {
+        Message { role, content: content.to_string() }
+    }
+
+    #[test]
+    fn resume_writes_back_to_same_slot() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        // First save — no id yet, should create a new slot
+        let msgs1 = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
+        let id = store.save(None, &msgs1).unwrap();
+
+        // Verify single entry in index
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        // Resume: save more messages back to same id
+        let msgs2 = vec![
+            msg(Role::User, "hello"),
+            msg(Role::Assistant, "hi"),
+            msg(Role::User, "second turn"),
+            msg(Role::Assistant, "still here"),
+        ];
+        let id2 = store.save(Some(&id), &msgs2).unwrap();
+
+        // Must reuse the same id and not create a new slot
+        assert_eq!(id, id2, "resumed save should reuse the same session id");
+        assert_eq!(store.list().unwrap().len(), 1, "should still be exactly 1 session");
+
+        // Loaded session should have the updated messages
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.messages.len(), 4);
+    }
+
+    #[test]
+    fn fresh_starts_create_separate_slots() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        let msgs = vec![msg(Role::User, "turn 1"), msg(Role::Assistant, "a")];
+        store.save(None, &msgs).unwrap();
+
+        let msgs2 = vec![msg(Role::User, "turn 2"), msg(Role::Assistant, "b")];
+        store.save(None, &msgs2).unwrap();
+
+        assert_eq!(store.list().unwrap().len(), 2, "two fresh sessions should produce two slots");
+    }
+}
+
 fn format_age(dt: DateTime<Utc>) -> String {
     let secs = (Utc::now() - dt).num_seconds();
     if secs < 60 {
