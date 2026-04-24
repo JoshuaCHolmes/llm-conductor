@@ -76,7 +76,7 @@ impl Provider for TamuProvider {
         Ok(vec![
             ModelInfo {
                 id: ModelId::ClaudeOpus45,
-                name: "Claude Opus 4.5".to_string(),
+                name: "claude-opus-4.5".to_string(),
                 provider: ProviderId::Tamu,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 200_000,
@@ -86,7 +86,7 @@ impl Provider for TamuProvider {
             },
             ModelInfo {
                 id: ModelId::ClaudeSonnet45,
-                name: "Claude Sonnet 4.5".to_string(),
+                name: "claude-sonnet-4.5".to_string(),
                 provider: ProviderId::Tamu,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 200_000,
@@ -106,7 +106,7 @@ impl Provider for TamuProvider {
             },
             ModelInfo {
                 id: ModelId::Custom("gemini-2.5-pro".to_string()),
-                name: "Gemini 2.5 Pro".to_string(),
+                name: "gemini-2.5-pro".to_string(),
                 provider: ProviderId::Tamu,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 2_000_000,

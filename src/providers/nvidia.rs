@@ -71,7 +71,7 @@ impl Provider for NvidiaProvider {
         Ok(vec![
             ModelInfo {
                 id: ModelId::Glm5Plus,
-                name: "GLM-5 (89B)".to_string(),
+                name: "glm-5-89b".to_string(),
                 provider: ProviderId::NvidiaNim,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 128_000,
@@ -81,7 +81,7 @@ impl Provider for NvidiaProvider {
             },
             ModelInfo {
                 id: ModelId::Custom("nvidia/llama-3.1-nemotron-70b-instruct".to_string()),
-                name: "Llama 3.1 Nemotron 70B".to_string(),
+                name: "llama-3.1-nemotron-70b".to_string(),
                 provider: ProviderId::NvidiaNim,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 32_768,
@@ -91,7 +91,7 @@ impl Provider for NvidiaProvider {
             },
             ModelInfo {
                 id: ModelId::Custom("meta/llama-3.1-405b-instruct".to_string()),
-                name: "Llama 3.1 405B Instruct".to_string(),
+                name: "llama-3.1-405b-instruct".to_string(),
                 provider: ProviderId::NvidiaNim,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 128_000,
@@ -101,7 +101,7 @@ impl Provider for NvidiaProvider {
             },
             ModelInfo {
                 id: ModelId::Custom("mistralai/mistral-large-2-instruct".to_string()),
-                name: "Mistral Large 2".to_string(),
+                name: "mistral-large-2".to_string(),
                 provider: ProviderId::NvidiaNim,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 128_000,
@@ -111,7 +111,7 @@ impl Provider for NvidiaProvider {
             },
             ModelInfo {
                 id: ModelId::Custom("qwen/qwen2.5-coder-32b-instruct".to_string()),
-                name: "Qwen 2.5 Coder 32B".to_string(),
+                name: "qwen-2.5-coder-32b".to_string(),
                 provider: ProviderId::NvidiaNim,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 32_768,

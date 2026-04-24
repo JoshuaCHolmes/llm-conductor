@@ -7,13 +7,14 @@ use crate::providers::Provider;
 use crate::router::Router;
 use crate::types::{Context, CoreContext, Message, Task, ProviderId};
 use crate::usage_tracking::UsageTracker;
+use crate::model_filter::ModelFilter;
 
 pub struct Repl {
     router: Router,
     context: Context,
     history: Vec<Message>,
     usage_tracker: UsageTracker,
-    forced_model: Option<String>, // User can force a specific model
+    model_filter: ModelFilter, // User-specified filter
 }
 
 impl Repl {
@@ -32,7 +33,7 @@ impl Repl {
             context: Context::new(core),
             history: Vec::new(),
             usage_tracker,
-            forced_model: None,
+            model_filter: ModelFilter::new(),
         })
     }
     
@@ -110,22 +111,41 @@ impl Repl {
             }
             Some("/model") => {
                 if parts.len() == 1 {
-                    // List available models
+                    // List available models with current filter
                     self.list_models();
                 } else if parts.len() == 2 && parts[1] == "reset" {
-                    self.forced_model = None;
-                    println!("{}", "Model selection reset to automatic".green());
+                    self.model_filter = ModelFilter::new();
+                    println!("{}", "Model filter reset to automatic selection".green());
                 } else {
-                    // Set forced model
-                    let model_name = parts[1..].join(" ");
-                    let models = self.router.available_models();
-                    if models.iter().any(|m| m.name == model_name) {
-                        self.forced_model = Some(model_name.clone());
-                        println!("{} {}", "Forced model set to:".green(), model_name.bright_white());
-                    } else {
-                        eprintln!("{} Model not found: {}", "Error:".bright_red(), model_name);
-                        println!("Available models:");
+                    // Parse filter arguments
+                    let args = &parts[1..];
+                    self.model_filter = ModelFilter::from_args(args);
+                    
+                    // Show what models match the filter
+                    let filtered: Vec<_> = self.router.available_models()
+                        .iter()
+                        .filter(|m| self.model_filter.matches(m))
+                        .collect();
+                    
+                    if filtered.is_empty() {
+                        eprintln!("{} No models match filter: {}", 
+                            "Error:".bright_red(), 
+                            self.model_filter.description());
+                        println!("\nAvailable models:");
                         self.list_models();
+                    } else {
+                        println!("{} Applied filter: {}", 
+                            "✓".bright_green(), 
+                            self.model_filter.description());
+                        println!("\nMatching models:");
+                        for model in filtered {
+                            println!("  • {} ({}, {:?}, {}k ctx)", 
+                                model.name.bright_white(),
+                                model.provider.to_string().dimmed(),
+                                model.capability_tier,
+                                model.context_window / 1000
+                            );
+                        }
                     }
                 }
                 Ok(true)
@@ -160,14 +180,9 @@ impl Repl {
             content,
         );
         
-        // Select model (forced or automatic)
-        let model = if let Some(forced_name) = &self.forced_model {
-            self.router.find_model(forced_name)
-                .ok_or_else(|| anyhow::anyhow!("Forced model '{}' not found", forced_name))?
-        } else {
-            self.router.select_model_with_usage(&task, &mut self.usage_tracker)
-                .ok_or_else(|| anyhow::anyhow!("No suitable model available"))?
-        };
+        // Select model using filter
+        let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+            .ok_or_else(|| anyhow::anyhow!("No suitable model available with current filters"))?;
         
         // Clone model info for later use
         let model_name = model.name.clone();
@@ -255,14 +270,29 @@ impl Repl {
     }
     
     fn list_models(&self) {
+        println!("Active filter: {}", self.model_filter.description());
+        println!();
+        
         let models = self.router.available_models();
+        let mut shown = 0;
+        
         for model in models {
-            let marker = if self.forced_model.as_ref() == Some(&model.name) {
-                "→".bright_green()
-            } else {
-                "•".bright_blue()
-            };
-            println!("  {} {} ({})", marker, model.name.bright_white(), model.provider.to_string().dimmed());
+            // Show all models if no filter, or only matching models
+            if !self.model_filter.is_empty() && !self.model_filter.matches(model) {
+                continue;
+            }
+            
+            println!("  • {} ({}, {:?}, {}k ctx)", 
+                model.name.bright_white(),
+                model.provider.to_string().dimmed(),
+                model.capability_tier,
+                model.context_window / 1000
+            );
+            shown += 1;
+        }
+        
+        if shown == 0 {
+            println!("  {}", "No models match current filter".yellow());
         }
     }
     
@@ -270,7 +300,13 @@ impl Repl {
         println!("{}", "Available Commands:".bright_cyan().bold());
         println!("  {} - Show this help message", "/help".bright_white());
         println!("  {} - List available models", "/model".bright_white());
-        println!("  {} - Force use of a specific model", "/model <name>".bright_white());
+        println!("  {} - Filter by model/provider/tier", "/model <filters...>".bright_white());
+        println!("    Examples:");
+        println!("      /model claude-opus-4.6        - Use specific model");
+        println!("      /model tamu                   - Use TAMU models only");
+        println!("      /model frontier               - Use frontier-tier models");
+        println!("      /model claude-opus tamu       - Use Opus from TAMU");
+        println!("      /model outlier frontier       - Use Outlier frontier models");
         println!("  {} - Reset to automatic model selection", "/model reset".bright_white());
         println!("  {} - List available providers", "/providers".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());

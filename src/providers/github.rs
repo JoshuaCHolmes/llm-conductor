@@ -63,7 +63,7 @@ impl Provider for GitHubProvider {
         Ok(vec![
             ModelInfo {
                 id: ModelId::Gpt4o,
-                name: "GPT-4o".to_string(),
+                name: "gpt-4o".to_string(),
                 provider: ProviderId::GitHubCopilot,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 128_000,
@@ -73,7 +73,7 @@ impl Provider for GitHubProvider {
             },
             ModelInfo {
                 id: ModelId::Custom("gpt-4o-mini".to_string()),
-                name: "GPT-4o Mini".to_string(),
+                name: "gpt-4o-mini".to_string(),
                 provider: ProviderId::GitHubCopilot,
                 capability_tier: CapabilityTier::Advanced,
                 context_window: 128_000,
@@ -83,7 +83,7 @@ impl Provider for GitHubProvider {
             },
             ModelInfo {
                 id: ModelId::ClaudeSonnet45,
-                name: "Claude 3.5 Sonnet".to_string(),
+                name: "claude-3.5-sonnet".to_string(),
                 provider: ProviderId::GitHubCopilot,
                 capability_tier: CapabilityTier::Frontier,
                 context_window: 200_000,

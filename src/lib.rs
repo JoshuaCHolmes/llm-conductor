@@ -6,5 +6,6 @@ pub mod cli;
 pub mod config;
 pub mod setup;
 pub mod usage_tracking;
+pub mod model_filter;
 
 pub use types::*;

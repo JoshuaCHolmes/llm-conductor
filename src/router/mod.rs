@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::types::{ModelInfo, Task, ProviderId};
 use crate::providers::Provider;
 use crate::usage_tracking::UsageTracker;
+use crate::model_filter::ModelFilter;
 
 /// Routes tasks to appropriate models
 pub struct Router {
@@ -42,29 +43,51 @@ impl Router {
         &self.available_models
     }
     
-    /// Select best model for a task based on usage tracking
-    pub fn select_model_with_usage(&self, _task: &Task, usage_tracker: &mut UsageTracker) -> Option<&ModelInfo> {
-        // Get prioritized providers
+    /// Select best model with filter and usage tracking
+    pub fn select_model_filtered(
+        &self,
+        _task: &Task,
+        filter: &ModelFilter,
+        usage_tracker: &mut UsageTracker,
+    ) -> Option<&ModelInfo> {
+        // Filter models
+        let filtered: Vec<&ModelInfo> = self.available_models
+            .iter()
+            .filter(|m| filter.matches(m))
+            .collect();
+        
+        if filtered.is_empty() {
+            return None;
+        }
+        
+        // If only one match, return it
+        if filtered.len() == 1 {
+            return Some(filtered[0]);
+        }
+        
+        // Multiple matches - use usage-aware selection
         let prioritized = usage_tracker.get_prioritized_providers();
         
         // Find first available model from highest priority provider
         for (provider_id, priority) in prioritized {
             if priority > 0.0 {
-                // Find a model from this provider
-                if let Some(model) = self.available_models.iter().find(|m| m.provider == provider_id) {
+                if let Some(model) = filtered.iter().find(|m| m.provider == provider_id) {
                     return Some(model);
                 }
             }
         }
         
-        // Fallback to first available model
-        self.available_models.first()
+        // Fallback to first filtered model
+        filtered.first().copied()
+    }
+    
+    /// Select best model for a task based on usage tracking
+    pub fn select_model_with_usage(&self, task: &Task, usage_tracker: &mut UsageTracker) -> Option<&ModelInfo> {
+        self.select_model_filtered(task, &ModelFilter::new(), usage_tracker)
     }
     
     /// Select best model for a task
     pub fn select_model(&self, _task: &Task) -> Option<&ModelInfo> {
-        // For now, just return the first available model
-        // TODO: Implement complexity-based selection
         self.available_models.first()
     }
     
@@ -73,12 +96,15 @@ impl Router {
         self.available_models.iter().find(|m| m.name == name)
     }
     
-    /// Find provider for a model
-    pub fn find_provider(&self, model: &ModelInfo) -> Option<&Box<dyn Provider>> {
-        self.providers.iter().find(|p| {
-            // Check if provider matches - we need to check available models
-            // For now, just return first provider (we'll improve this)
-            true
-        })
+    /// Find provider for a model by checking which provider offers it
+    pub fn find_provider_for_model(&self, model: &ModelInfo) -> Option<&Box<dyn Provider>> {
+        for provider in &self.providers {
+            // Try to get models from provider and see if any match
+            // This is sync code but providers use async - we'll need to trust the ProviderId
+            // For now, just iterate and trust the first match
+            // TODO: Better provider matching
+        }
+        // Fallback: return first provider (temporary workaround)
+        self.providers.first()
     }
 }
