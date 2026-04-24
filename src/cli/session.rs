@@ -179,7 +179,7 @@ mod tests {
     }
 
     fn msg(role: Role, content: &str) -> Message {
-        Message { role, content: content.to_string() }
+        Message { role, content: content.to_string(), tool_calls: None, tool_call_id: None }
     }
 
     #[test]

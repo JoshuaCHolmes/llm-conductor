@@ -5,8 +5,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
-use super::Provider;
+use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role, ToolCall};
+use super::{Provider, ToolDefinition, ToolCallResponse};
 
 /// GitHub Copilot provider using GitHub Models API
 /// Free tier: Rate limited per repository/user
@@ -56,6 +56,33 @@ impl GitHubProvider {
     }
 }
 
+/// Serialize messages to OpenAI format with tool call / tool result support.
+fn serialize_messages_openai(messages: &[Message]) -> Vec<serde_json::Value> {
+    messages.iter().map(|m| {
+        match m.role {
+            Role::Tool => json!({
+                "role": "tool",
+                "tool_call_id": m.tool_call_id.as_deref().unwrap_or(""),
+                "content": m.content,
+            }),
+            Role::Assistant if m.tool_calls.is_some() => {
+                let tc: Vec<serde_json::Value> = m.tool_calls.as_ref().unwrap().iter().map(|tc| json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments }
+                })).collect();
+                let content_val = if m.content.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    json!(m.content)
+                };
+                json!({ "role": "assistant", "content": content_val, "tool_calls": tc })
+            }
+            _ => json!({ "role": m.role.as_str(), "content": m.content }),
+        }
+    }).collect()
+}
+
 #[async_trait]
 impl Provider for GitHubProvider {
     async fn available_models(&self) -> Result<Vec<ModelInfo>> {
@@ -70,6 +97,7 @@ impl Provider for GitHubProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: true,
             },
             ModelInfo {
                 id: ModelId::Custom("gpt-4o-mini".to_string()),
@@ -80,6 +108,7 @@ impl Provider for GitHubProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: true,
             },
             ModelInfo {
                 id: ModelId::ClaudeSonnet45,
@@ -90,6 +119,7 @@ impl Provider for GitHubProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: true,
             },
         ])
     }
@@ -102,15 +132,7 @@ impl Provider for GitHubProvider {
             _ => return Err(anyhow!("Invalid model ID for GitHub provider")),
         };
 
-        let github_messages: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": m.role.as_str(),
-                    "content": m.content
-                })
-            })
-            .collect();
+        let github_messages = serialize_messages_openai(messages);
 
         let payload = json!({
             "model": model_name,
@@ -156,15 +178,7 @@ impl Provider for GitHubProvider {
             _ => return Err(anyhow!("Invalid model ID for GitHub provider")),
         };
 
-        let github_messages: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": m.role.as_str(),
-                    "content": m.content
-                })
-            })
-            .collect();
+        let github_messages = serialize_messages_openai(messages);
 
         let payload = json!({
             "model": model_name,
@@ -222,6 +236,69 @@ impl Provider for GitHubProvider {
 
         // GitHub is request-based; return None for tokens (caller uses 1 request)
         Ok((full_content, None))
+    }
+
+    async fn call_with_tools(
+        &self,
+        model: &ModelInfo,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<ToolCallResponse> {
+        let model_name = match &model.id {
+            ModelId::Gpt4o => "gpt-4o",
+            ModelId::ClaudeSonnet45 => "claude-3-5-sonnet-20241022",
+            ModelId::Custom(name) => name.as_str(),
+            _ => return Err(anyhow!("Invalid model ID for GitHub provider")),
+        };
+
+        let github_messages = serialize_messages_openai(messages);
+        let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            }
+        })).collect();
+
+        let payload = json!({
+            "model": model_name,
+            "messages": github_messages,
+            "tools": tool_defs,
+            "tool_choice": "auto",
+            "max_tokens": 4096,
+        });
+
+        let response = self
+            .client
+            .post("https://models.inference.ai.azure.com/chat/completions")
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("GitHub API error {}: {}", status, body));
+        }
+
+        let raw: serde_json::Value = response.json().await?;
+        let choice = raw["choices"][0]["message"].clone();
+        let text = choice["content"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+
+        if let Some(tc_arr) = choice["tool_calls"].as_array() {
+            let tool_calls: Vec<ToolCall> = tc_arr.iter().filter_map(|tc| {
+                let id = tc["id"].as_str()?.to_string();
+                let name = tc["function"]["name"].as_str()?.to_string();
+                let arguments = tc["function"]["arguments"].as_str()?.to_string();
+                Some(ToolCall { id, name, arguments })
+            }).collect();
+            Ok(ToolCallResponse { text, tool_calls: Some(tool_calls), tokens: None })
+        } else {
+            Ok(ToolCallResponse { text, tool_calls: None, tokens: None })
+        }
     }
 
     async fn health_check(&self) -> Result<bool> {

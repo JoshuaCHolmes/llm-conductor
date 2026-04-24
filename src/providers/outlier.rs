@@ -191,13 +191,30 @@ impl OutlierProvider {
     }
 
     fn messages_to_text(&self, messages: &[Message]) -> String {
+        use crate::types::Role;
         messages
             .iter()
-            .map(|msg| match msg.role.as_str() {
-                "system" => format!("System: {}", msg.content),
-                "user" => format!("User: {}", msg.content),
-                "assistant" => format!("Assistant: {}", msg.content),
-                _ => msg.content.clone(),
+            .map(|msg| match msg.role {
+                Role::System => format!("System: {}", msg.content),
+                Role::User => format!("User: {}", msg.content),
+                // If the assistant message has tool calls, summarise them inline
+                Role::Assistant => {
+                    if let Some(ref tcs) = msg.tool_calls {
+                        let calls: Vec<String> = tcs.iter().map(|tc| {
+                            let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                .ok()
+                                .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
+                                .unwrap_or_else(|| tc.arguments.clone());
+                            format!("[Called bash: {}]", cmd)
+                        }).collect();
+                        let prefix = if msg.content.is_empty() { String::new() } else { format!("{}\n", msg.content) };
+                        format!("Assistant: {}{}", prefix, calls.join("\n"))
+                    } else {
+                        format!("Assistant: {}", msg.content)
+                    }
+                }
+                // Tool results become user messages so the model gets the output
+                Role::Tool => format!("User: [Shell output]\n{}\n[End of shell output]", msg.content),
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -218,6 +235,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::ClaudeSonnet45,
@@ -228,6 +246,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             // OpenAI
             ModelInfo {
@@ -239,6 +258,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("gpt-5.1-chat-latest".to_string()),
@@ -249,6 +269,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("o3".to_string()),
@@ -259,6 +280,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             // Google
             ModelInfo {
@@ -270,6 +292,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             // xAI
             ModelInfo {
@@ -281,6 +304,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             // DeepSeek
             ModelInfo {
@@ -292,6 +316,7 @@ impl Provider for OutlierProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
         ])
     }

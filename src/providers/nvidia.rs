@@ -78,6 +78,7 @@ impl Provider for NvidiaProvider {
                 supports_vision: true,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("nvidia/llama-3.1-nemotron-70b-instruct".to_string()),
@@ -88,6 +89,7 @@ impl Provider for NvidiaProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("meta/llama-3.1-405b-instruct".to_string()),
@@ -98,6 +100,7 @@ impl Provider for NvidiaProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("mistralai/mistral-large-2-instruct".to_string()),
@@ -108,6 +111,7 @@ impl Provider for NvidiaProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
             ModelInfo {
                 id: ModelId::Custom("qwen/qwen2.5-coder-32b-instruct".to_string()),
@@ -118,6 +122,7 @@ impl Provider for NvidiaProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,
+                supports_tool_calling: false,
             },
         ])
     }

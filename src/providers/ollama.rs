@@ -44,6 +44,7 @@ impl Provider for OllamaProvider {
                 supports_vision: false,
                 supports_streaming: true,
                 cost_per_token: 0.0,  // Free!
+                supports_tool_calling: false,
             })
             .collect();
         
@@ -60,6 +61,7 @@ impl Provider for OllamaProvider {
                     Role::User => "user".to_string(),
                     Role::Assistant => "assistant".to_string(),
                     Role::System => "system".to_string(),
+                    Role::Tool => "user".to_string(),
                 },
                 content: m.content.clone(),
             })
@@ -104,6 +106,7 @@ impl Provider for OllamaProvider {
                     Role::User => "user".to_string(),
                     Role::Assistant => "assistant".to_string(),
                     Role::System => "system".to_string(),
+                    Role::Tool => "user".to_string(),
                 },
                 content: m.content.clone(),
             })

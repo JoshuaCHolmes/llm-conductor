@@ -53,6 +53,9 @@ pub struct ModelInfo {
     pub supports_vision: bool,
     pub supports_streaming: bool,
     pub cost_per_token: f64,
+    /// Whether this model supports OpenAI-style function calling (tool_calls / tool results)
+    #[serde(default)]
+    pub supports_tool_calling: bool,
 }
 
 /// Provider identifier

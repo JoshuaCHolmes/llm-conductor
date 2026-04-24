@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::cli::session::SessionStore;
 use crate::cli::executor::{self, ShellTurn};
-use crate::providers::Provider;
+use crate::providers::{ToolDefinition};
 use crate::router::Router;
-use crate::types::{Context, CoreContext, Message, Task, ProviderId};
+use crate::types::{Message, Task};
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
 
@@ -101,7 +101,6 @@ impl ThinkStreamState {
 
 pub struct Repl {
     router: Router,
-    context: Context,
     history: Vec<Message>,
     usage_tracker: UsageTracker,
     model_filter: ModelFilter,
@@ -116,19 +115,11 @@ pub struct Repl {
 
 impl Repl {
     pub fn new(router: Router, config_dir: PathBuf) -> Result<Self> {
-        // Default core context
-        let core = CoreContext {
-            system_instructions: "You are a helpful AI assistant.".to_string(),
-            user_info: None,
-            constraints: Vec::new(),
-        };
-        
         let usage_tracker = UsageTracker::new(&config_dir)?;
         let session_store = SessionStore::new(&config_dir)?;
         
         Ok(Self {
             router,
-            context: Context::new(core),
             history: Vec::new(),
             usage_tracker,
             model_filter: ModelFilter::new(),
@@ -137,6 +128,19 @@ impl Repl {
             sessions_page: 0,
             shell_turns: Vec::new(),
         })
+    }
+
+    /// Build a capability-aware system prompt.
+    /// - Tool-calling models: told they have a bash tool available.
+    /// - Code-block models: instructed to wrap commands in ```bash blocks.
+    fn build_system_prompt(supports_tool_calling: bool) -> Message {
+        let base = "You are a helpful AI assistant.";
+        let instructions = if supports_tool_calling {
+            format!("{}\n\nYou have access to a `bash` tool. Use it to run shell commands when needed to help the user. Prefer running commands over asking the user to do so themselves.", base)
+        } else {
+            format!("{}\n\nYou can run shell commands by wrapping them in ```bash\n...\n``` code blocks. Include only one command per block. The system will execute it and show you the output. Only run commands that are safe and directly relevant to the user's request.", base)
+        };
+        Message::system(instructions)
     }
 
     /// Load an existing session by ID, restoring conversation history.
@@ -368,6 +372,7 @@ impl Repl {
             let model_name = model.name.clone();
             let provider_id = model.provider.clone();
             let provider_display = model.provider.to_string();
+            let supports_tool_calling = model.supports_tool_calling;
 
             // Show "Using X from Y" with current usage (only on first round)
             if tool_rounds == 0 {
@@ -382,81 +387,164 @@ impl Repl {
                 println!();
             }
 
-            // Get messages for model
-            let mut messages = self.context.to_messages();
+            // Build messages: dynamic system prompt + history
+            let system_msg = Self::build_system_prompt(supports_tool_calling);
+            let mut messages = vec![system_msg];
             messages.extend(self.history.clone());
 
             // Find provider
             let provider = self.router.find_provider_for_model(&model)
                 .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
 
-            // Stream response
-            print!("{} ", "❯".bright_green().bold());
+            if supports_tool_calling {
+                // ── Function-calling path (TAMU / GitHub) ────────────────────────
+                let result = provider.call_with_tools(&model, &messages, &[ToolDefinition::bash()]).await?;
 
-            let think_state = Arc::new(Mutex::new(ThinkStreamState::default()));
-            let think_state_cb = think_state.clone();
-            let callback = move |chunk: String| {
-                think_state_cb.lock().unwrap().process_chunk(&chunk);
-            };
-
-            let (_raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
-            think_state.lock().unwrap().flush();
-            let clean_response = think_state.lock().unwrap().clean_text.clone();
-            println!("\n");
-
-            // Record usage
-            let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
-            self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
-
-            // Add assistant response to history
-            self.history.push(Message::assistant(clean_response.clone()));
-
-            // Extract bash blocks and execute (up to MAX_TOOL_ROUNDS)
-            let bash_blocks = executor::extract_bash_blocks(&clean_response);
-            if bash_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
-                break;
-            }
-
-            // Process each bash block
-            let mut shell_results = Vec::new();
-            for cmd in &bash_blocks {
-                let kind = executor::classify(cmd);
-                let approved = match kind {
-                    executor::CommandKind::ReadOnly => true,
-                    executor::CommandKind::NeedsConfirm => {
-                        print!("{} {} {} ",
-                            "⚡".yellow(),
-                            "Run:".bright_white(),
-                            cmd.bright_yellow()
-                        );
-                        print!("{}", " [y/N] ".dimmed());
-                        std::io::stdout().flush()?;
-                        let mut ans = String::new();
-                        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
-                        ans.trim().eq_ignore_ascii_case("y")
+                // Display any text content the model returned alongside the tool call
+                if let Some(ref text) = result.text {
+                    if !text.is_empty() {
+                        print!("{} ", "❯".bright_green().bold());
+                        println!("{}", text);
+                        println!();
                     }
+                }
+
+                let tokens = result.tokens.unwrap_or_else(|| {
+                    result.text.as_deref().map(|t| (t.len() / 4) as u64).unwrap_or(1)
+                });
+                self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
+
+                if let Some(tool_calls) = result.tool_calls {
+                    if tool_rounds >= MAX_TOOL_ROUNDS {
+                        eprintln!("{} Tool round limit reached", "⚠".yellow());
+                        break;
+                    }
+
+                    // Add assistant tool-call message to history
+                    self.history.push(Message::assistant_tool_calls(
+                        result.text.clone().unwrap_or_default(),
+                        tool_calls.clone(),
+                    ));
+
+                    let mut any_executed = false;
+                    for tc in &tool_calls {
+                        if tc.name != "bash" {
+                            continue;
+                        }
+                        let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            .ok()
+                            .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| tc.arguments.clone());
+
+                        let kind = executor::classify(&cmd);
+                        let approved = match kind {
+                            executor::CommandKind::ReadOnly => true,
+                            executor::CommandKind::NeedsConfirm => {
+                                print!("{} {} {} ",
+                                    "⚡".yellow(),
+                                    "Run:".bright_white(),
+                                    cmd.bright_yellow()
+                                );
+                                print!("{}", " [y/N] ".dimmed());
+                                std::io::stdout().flush()?;
+                                let mut ans = String::new();
+                                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
+                                ans.trim().eq_ignore_ascii_case("y")
+                            }
+                        };
+
+                        if approved {
+                            let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                            let turn_num = self.shell_turns.len() + 1;
+                            print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                            self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                            any_executed = true;
+                        } else {
+                            println!("{}", "  (skipped)".dimmed());
+                            self.history.push(Message::tool_result(&tc.id, "(command skipped by user)"));
+                        }
+                    }
+
+                    if any_executed {
+                        tool_rounds += 1;
+                        continue;
+                    } else {
+                        break;
+                    }
+                } else {
+                    // Text response, no tool calls — already displayed above if non-empty
+                    let text = result.text.unwrap_or_default();
+                    self.history.push(Message::assistant(&text));
+                    break;
+                }
+            } else {
+                // ── Streaming code-block path (Outlier / Ollama) ─────────────────
+                print!("{} ", "❯".bright_green().bold());
+
+                let think_state = Arc::new(Mutex::new(ThinkStreamState::default()));
+                let think_state_cb = think_state.clone();
+                let callback = move |chunk: String| {
+                    think_state_cb.lock().unwrap().process_chunk(&chunk);
                 };
 
-                if approved {
-                    let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
-                    let turn_num = self.shell_turns.len() + 1;
-                    print!("{}", executor::format_shell_display(turn_num, cmd, &output));
-                    self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
-                    shell_results.push(format!("$ {}\n{}", cmd, output));
-                } else {
-                    println!("{}", "  (skipped)".dimmed());
+                let (_raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
+                think_state.lock().unwrap().flush();
+                let clean_response = think_state.lock().unwrap().clean_text.clone();
+                println!("\n");
+
+                // Record usage
+                let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
+                self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
+
+                // Add assistant response to history
+                self.history.push(Message::assistant(clean_response.clone()));
+
+                // Extract bash blocks and execute (up to MAX_TOOL_ROUNDS)
+                let bash_blocks = executor::extract_bash_blocks(&clean_response);
+                if bash_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
+                    break;
                 }
-            }
 
-            if shell_results.is_empty() {
-                // All blocks were skipped — don't loop
-                break;
-            }
+                // Process each bash block
+                let mut shell_results = Vec::new();
+                for cmd in &bash_blocks {
+                    let kind = executor::classify(cmd);
+                    let approved = match kind {
+                        executor::CommandKind::ReadOnly => true,
+                        executor::CommandKind::NeedsConfirm => {
+                            print!("{} {} {} ",
+                                "⚡".yellow(),
+                                "Run:".bright_white(),
+                                cmd.bright_yellow()
+                            );
+                            print!("{}", " [y/N] ".dimmed());
+                            std::io::stdout().flush()?;
+                            let mut ans = String::new();
+                            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
+                            ans.trim().eq_ignore_ascii_case("y")
+                        }
+                    };
 
-            // Feed shell results back to model as a user message, then loop
-            let feedback = format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n"));
-            self.history.push(Message::user(feedback));
-            tool_rounds += 1;
+                    if approved {
+                        let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                        let turn_num = self.shell_turns.len() + 1;
+                        print!("{}", executor::format_shell_display(turn_num, cmd, &output));
+                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                        shell_results.push(format!("$ {}\n{}", cmd, output));
+                    } else {
+                        println!("{}", "  (skipped)".dimmed());
+                    }
+                }
+
+                if shell_results.is_empty() {
+                    break;
+                }
+
+                let feedback = format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n"));
+                self.history.push(Message::user(feedback));
+                tool_rounds += 1;
+            }
         }
 
         // Auto-save session
