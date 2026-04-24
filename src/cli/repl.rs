@@ -1,13 +1,95 @@
 use anyhow::Result;
 use colored::*;
 use rustyline::DefaultEditor;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::providers::Provider;
 use crate::router::Router;
 use crate::types::{Context, CoreContext, Message, Task, ProviderId};
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
+
+/// State machine for streaming responses that may contain <think>...</think> blocks.
+/// Think blocks are printed dimmed; clean_text accumulates the response without them.
+#[derive(Default)]
+struct ThinkStreamState {
+    in_think: bool,
+    pending: String,
+    clean_text: String,
+    showed_thinking: bool,
+}
+
+impl ThinkStreamState {
+    fn process_chunk(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        loop {
+            if self.in_think {
+                if let Some(pos) = self.pending.find("</think>") {
+                    let before = &self.pending[..pos];
+                    if !before.is_empty() {
+                        print!("{}", before.dimmed());
+                        std::io::stdout().flush().unwrap();
+                    }
+                    // End think block with a visual separator
+                    println!("{}", "\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔".dimmed());
+                    self.in_think = false;
+                    self.pending = self.pending[pos + "</think>".len()..].to_string();
+                } else {
+                    // Keep last 8 chars buffered in case </think> spans chunks
+                    let safe_len = self.pending.len().saturating_sub(8);
+                    if safe_len > 0 {
+                        let to_print = self.pending[..safe_len].to_string();
+                        print!("{}", to_print.dimmed());
+                        std::io::stdout().flush().unwrap();
+                        self.pending = self.pending[safe_len..].to_string();
+                    }
+                    break;
+                }
+            } else {
+                if let Some(pos) = self.pending.find("<think>") {
+                    let before = &self.pending[..pos];
+                    if !before.is_empty() {
+                        print!("{}", before);
+                        std::io::stdout().flush().unwrap();
+                        self.clean_text.push_str(before);
+                    }
+                    if !self.showed_thinking {
+                        println!("{}", "💭 Thinking...".dimmed().italic());
+                        self.showed_thinking = true;
+                    }
+                    self.in_think = true;
+                    self.pending = self.pending[pos + "<think>".len()..].to_string();
+                } else {
+                    // Keep last 7 chars buffered in case <think> spans chunks
+                    let safe_len = self.pending.len().saturating_sub(7);
+                    if safe_len > 0 {
+                        let to_print = self.pending[..safe_len].to_string();
+                        print!("{}", to_print);
+                        std::io::stdout().flush().unwrap();
+                        self.clean_text.push_str(&to_print);
+                        self.pending = self.pending[safe_len..].to_string();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.pending.is_empty() {
+            if self.in_think {
+                print!("{}", self.pending.dimmed());
+            } else {
+                print!("{}", self.pending);
+                self.clean_text.push_str(&self.pending);
+            }
+            std::io::stdout().flush().unwrap();
+            self.pending.clear();
+        }
+    }
+}
 
 pub struct Repl {
     router: Router,
@@ -211,22 +293,28 @@ impl Repl {
         let provider = self.router.find_provider_for_model(model)
             .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
         
-        // Stream response
+        // Stream response with think-tag formatting
         print!("{} ", "❯".bright_green().bold());
         
-        let mut response = String::new();
-        let callback = |chunk: String| {
-            print!("{}", chunk);
-            use std::io::{self, Write};
-            io::stdout().flush().unwrap();
+        let think_state = Arc::new(Mutex::new(ThinkStreamState::default()));
+        let think_state_cb = think_state.clone();
+        
+        let callback = move |chunk: String| {
+            think_state_cb.lock().unwrap().process_chunk(&chunk);
         };
         
-        response = provider.chat_stream(model, &messages, Box::new(callback)).await?;
+        let _response = provider.chat_stream(model, &messages, Box::new(callback)).await?;
+        
+        // Flush any remaining buffered content
+        think_state.lock().unwrap().flush();
+        
+        // Use clean response (no think blocks) for history
+        let clean_response = think_state.lock().unwrap().clean_text.clone();
         
         println!("\n");
         
         // Record usage (1 request, estimate tokens from response length)
-        let estimated_tokens = (response.len() / 4) as u64; // Rough estimate: 4 chars per token
+        let estimated_tokens = (clean_response.len() / 4) as u64;
         self.usage_tracker.record_usage(provider_id.clone(), 1, estimated_tokens, 0.0);
         
         // Show usage info
@@ -252,8 +340,8 @@ impl Repl {
         }
         println!();
         
-        // Add assistant response to history
-        self.history.push(Message::assistant(response));
+        // Add assistant response to history (without think blocks)
+        self.history.push(Message::assistant(clean_response));
         
         Ok(())
     }
