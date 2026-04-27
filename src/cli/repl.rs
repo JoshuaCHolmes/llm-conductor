@@ -13,46 +13,136 @@ use crate::types::{Message, Task};
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
 
-/// State machine for streaming responses that handles `<think>` and ` ```bash ` blocks.
+/// Find the byte offset of a sync ` ```bash ` block (not ` ```bash-async `).
+fn find_sync_bash(s: &str) -> Option<usize> {
+    let mut start = 0;
+    while let Some(rel) = s[start..].find("```bash") {
+        let abs = start + rel;
+        if !s[abs..].starts_with("```bash-async") {
+            return Some(abs);
+        }
+        start = abs + 7;
+    }
+    None
+}
+
+/// State machine for streaming model responses.
 ///
-/// - `<think>...</think>` sections are printed dimmed and excluded from `clean_text`.
-/// - ` ```bash...``` ` sections are silently captured into `bash_blocks` and excluded
-///   from both display and `clean_text`. This prevents raw markdown from cluttering
-///   the output; the REPL executes them via `format_shell_display` instead.
+/// Handles three special regions transparently:
+/// - `<think>...</think>` — printed dimmed, excluded from `clean_text`
+/// - ` ```bash...``` ` (sync) — silently captured; deferred newlines before it are
+///   discarded so no blank gap appears where the block would have been
+/// - ` ```bash-async...``` ` — an inline `[⚡ cmd]` placeholder is printed in place;
+///   command captured in `bash_async_blocks` for execution after the full response
+///
+/// Trailing newlines at the end of the response are also discarded to avoid a blank
+/// line between the model's prose and the shell-output display.
 #[derive(Default)]
 struct ReplyStreamState {
     in_think: bool,
     in_bash: bool,
+    in_bash_async: bool,
     showed_thinking: bool,
     pending: String,
     bash_block_buf: String,
+    bash_async_block_buf: String,
+    /// Trailing newlines held back until we know what follows them.
+    /// Discarded if a bash block comes next; flushed before any non-whitespace text.
+    deferred_newlines: usize,
+    /// Sync bash blocks (model ends its turn here; execute before next round).
     pub bash_blocks: Vec<String>,
+    /// Async bash blocks (model continued writing; execute after full response).
+    pub bash_async_blocks: Vec<String>,
     pub clean_text: String,
 }
 
 impl ReplyStreamState {
-    fn process_chunk(&mut self, chunk: &str) {
+    /// Walk back from `raw_len` to the nearest valid UTF-8 char boundary.
+    fn char_safe_len(s: &str, raw_len: usize) -> usize {
+        (0..=raw_len).rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0)
+    }
+
+    /// Print any deferred newlines (called before non-whitespace content).
+    fn flush_deferred(&mut self) {
+        for _ in 0..self.deferred_newlines {
+            print!("\n");
+            self.clean_text.push('\n');
+        }
+        self.deferred_newlines = 0;
+        std::io::stdout().flush().unwrap();
+    }
+
+    /// Print normal prose, deferring any trailing newlines.
+    fn print_normal(&mut self, text: &str) {
+        let trimmed = text.trim_end_matches('\n');
+        let trailing = text.len() - trimmed.len();
+        if !trimmed.is_empty() {
+            self.flush_deferred();
+            print!("{}", trimmed);
+            std::io::stdout().flush().unwrap();
+            self.clean_text.push_str(trimmed);
+        }
+        self.deferred_newlines += trailing;
+    }
+
+    /// Print text before a bash block: trim trailing whitespace and discard
+    /// any previously deferred newlines (no blank gap before the block).
+    fn flush_before_bash(&mut self, before: &str) {
+        let trimmed = before.trim_end_matches(|c: char| c == '\n' || c == ' ');
+        if !trimmed.is_empty() {
+            self.flush_deferred();
+            print!("{}", trimmed);
+            std::io::stdout().flush().unwrap();
+            self.clean_text.push_str(trimmed);
+        }
+        self.deferred_newlines = 0;
+    }
+
+    pub fn process_chunk(&mut self, chunk: &str) {
         self.pending.push_str(chunk);
         loop {
             if self.in_bash {
-                // Scan for closing ```
                 if let Some(pos) = self.pending.find("```") {
                     self.bash_block_buf.push_str(&self.pending[..pos]);
-                    let trimmed = self.bash_block_buf.trim().to_string();
-                    if !trimmed.is_empty() {
-                        self.bash_blocks.push(trimmed);
+                    let cmd = self.bash_block_buf.trim().to_string();
+                    if !cmd.is_empty() {
+                        self.bash_blocks.push(cmd);
                     }
                     self.bash_block_buf.clear();
                     self.in_bash = false;
                     self.pending = self.pending[pos + 3..].to_string();
                 } else {
-                    let safe_len = self.pending.len().saturating_sub(3);
-                    let safe_len = (0..=safe_len).rev()
-                        .find(|&i| self.pending.is_char_boundary(i))
-                        .unwrap_or(0);
-                    if safe_len > 0 {
-                        self.bash_block_buf.push_str(&self.pending[..safe_len]);
-                        self.pending = self.pending[safe_len..].to_string();
+                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                    if safe > 0 {
+                        self.bash_block_buf.push_str(&self.pending[..safe]);
+                        self.pending = self.pending[safe..].to_string();
+                    }
+                    break;
+                }
+            } else if self.in_bash_async {
+                if let Some(pos) = self.pending.find("```") {
+                    self.bash_async_block_buf.push_str(&self.pending[..pos]);
+                    let cmd = self.bash_async_block_buf.trim().to_string();
+                    if !cmd.is_empty() {
+                        // Show a brief inline placeholder where the block appeared.
+                        let preview: String = cmd.lines().next().unwrap_or("").chars().take(40).collect();
+                        self.flush_deferred();
+                        let ph = format!("[⚡ {}]", preview);
+                        print!("{}", ph.yellow().dimmed());
+                        std::io::stdout().flush().unwrap();
+                        self.clean_text.push_str(&ph);
+                        self.bash_async_blocks.push(cmd);
+                    }
+                    self.bash_async_block_buf.clear();
+                    self.in_bash_async = false;
+                    self.pending = self.pending[pos + 3..].to_string();
+                } else {
+                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                    if safe > 0 {
+                        self.bash_async_block_buf.push_str(&self.pending[..safe]);
+                        self.pending = self.pending[safe..].to_string();
                     }
                     break;
                 }
@@ -66,35 +156,35 @@ impl ReplyStreamState {
                     self.in_think = false;
                     self.pending = self.pending[pos + "</think>".len()..].to_string();
                 } else {
-                    let safe_len = self.pending.len().saturating_sub(8);
-                    let safe_len = (0..=safe_len).rev()
-                        .find(|&i| self.pending.is_char_boundary(i))
-                        .unwrap_or(0);
-                    if safe_len > 0 {
-                        let to_print = self.pending[..safe_len].to_string();
-                        print!("{}", to_print.dimmed());
+                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(8));
+                    if safe > 0 {
+                        print!("{}", self.pending[..safe].dimmed());
                         std::io::stdout().flush().unwrap();
-                        self.pending = self.pending[safe_len..].to_string();
+                        self.pending = self.pending[safe..].to_string();
                     }
                     break;
                 }
             } else {
-                // Normal mode: find whichever special token comes first.
+                // Normal mode: find whichever special marker comes first.
                 let think_pos = self.pending.find("<think>");
-                let bash_pos = self.pending.find("```bash");
-                let first = match (think_pos, bash_pos) {
-                    (Some(t), Some(b)) => Some(if t < b { ('t', t) } else { ('b', b) }),
-                    (Some(t), None) => Some(('t', t)),
-                    (None, Some(b)) => Some(('b', b)),
-                    (None, None) => None,
-                };
+                let async_pos = self.pending.find("```bash-async");
+                let sync_pos  = find_sync_bash(&self.pending);
+
+                let first = [
+                    think_pos.map(|p| (0u8, p)),
+                    async_pos.map(|p| (1u8, p)),
+                    sync_pos .map(|p| (2u8, p)),
+                ].iter().filter_map(|x| *x).min_by_key(|&(_, p)| p);
+
                 match first {
-                    Some(('t', pos)) => {
-                        let before = &self.pending[..pos];
+                    Some((0, pos)) => {
+                        // <think>
+                        let before = self.pending[..pos].to_string();
                         if !before.is_empty() {
+                            self.flush_deferred();
                             print!("{}", before);
                             std::io::stdout().flush().unwrap();
-                            self.clean_text.push_str(before);
+                            self.clean_text.push_str(&before);
                         }
                         if !self.showed_thinking {
                             println!("{}", "💭 Thinking...".dimmed().italic());
@@ -103,32 +193,29 @@ impl ReplyStreamState {
                         self.in_think = true;
                         self.pending = self.pending[pos + "<think>".len()..].to_string();
                     }
-                    Some(('b', pos)) => {
-                        let before = &self.pending[..pos];
-                        if !before.is_empty() {
-                            print!("{}", before);
-                            std::io::stdout().flush().unwrap();
-                            self.clean_text.push_str(before);
-                        }
+                    Some((1, pos)) => {
+                        // ```bash-async
+                        let before = self.pending[..pos].to_string();
+                        self.flush_before_bash(&before);
+                        self.in_bash_async = true;
+                        let rest = &self.pending[pos + "```bash-async".len()..];
+                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+                    }
+                    Some((2, pos)) => {
+                        // ```bash (sync)
+                        let before = self.pending[..pos].to_string();
+                        self.flush_before_bash(&before);
                         self.in_bash = true;
-                        // Skip "```bash" and optional leading newline
-                        let after = &self.pending[pos + 7..];
-                        let after = after.strip_prefix('\n').unwrap_or(after);
-                        self.pending = after.to_string();
+                        let rest = &self.pending[pos + "```bash".len()..];
+                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     _ => {
-                        // No special tokens found; buffer with lookahead for partial matches.
-                        // Longest opener is 7 chars ("```bash" or "<think>").
-                        let safe_len = self.pending.len().saturating_sub(7);
-                        let safe_len = (0..=safe_len).rev()
-                            .find(|&i| self.pending.is_char_boundary(i))
-                            .unwrap_or(0);
-                        if safe_len > 0 {
-                            let to_print = self.pending[..safe_len].to_string();
-                            print!("{}", to_print);
-                            std::io::stdout().flush().unwrap();
-                            self.clean_text.push_str(&to_print);
-                            self.pending = self.pending[safe_len..].to_string();
+                        // No special markers; flush with 13-char lookahead (len of "```bash-async").
+                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
+                        if safe > 0 {
+                            let to_print = self.pending[..safe].to_string();
+                            self.print_normal(&to_print);
+                            self.pending = self.pending[safe..].to_string();
                         }
                         break;
                     }
@@ -137,24 +224,27 @@ impl ReplyStreamState {
         }
     }
 
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
+        // Discard any trailing deferred newlines (end-of-response whitespace).
+        self.deferred_newlines = 0;
         if !self.pending.is_empty() {
-            if self.in_bash {
-                // Unclosed bash block — treat as plain text
-                self.clean_text.push_str(&self.pending);
-                self.pending.clear();
+            if self.in_bash || self.in_bash_async {
+                // Truncated/unclosed block — discard silently.
             } else if self.in_think {
                 print!("{}", self.pending.dimmed());
                 std::io::stdout().flush().unwrap();
-                self.pending.clear();
             } else {
-                print!("{}", self.pending);
-                self.clean_text.push_str(&self.pending);
-                std::io::stdout().flush().unwrap();
-                self.pending.clear();
+                let trimmed = self.pending.trim_end_matches('\n');
+                if !trimmed.is_empty() {
+                    print!("{}", trimmed);
+                    std::io::stdout().flush().unwrap();
+                    self.clean_text.push_str(trimmed);
+                }
             }
+            self.pending.clear();
         }
         self.bash_block_buf.clear();
+        self.bash_async_block_buf.clear();
     }
 }
 
@@ -191,13 +281,25 @@ impl Repl {
 
     /// Build a capability-aware system prompt.
     /// - Tool-calling models: told they have a bash tool available.
-    /// - Code-block models: instructed to use ```bash blocks; multiple allowed per response.
+    /// - Code-block models: detailed instructions for bash / bash-async blocks.
     fn build_system_prompt(supports_tool_calling: bool) -> Message {
         let base = "You are a helpful AI assistant.";
         let instructions = if supports_tool_calling {
-            format!("{}\n\nYou have access to a `bash` tool. Use it to run shell commands when needed to help the user. Prefer running commands over asking the user to do so themselves.", base)
+            format!("{}\n\nYou have access to a `bash` tool. Use it to run shell commands when needed. Prefer running commands over asking the user to do so.", base)
         } else {
-            format!("{}\n\nYou have access to a bash shell. When you need to run commands, include them in ```bash code blocks. You may include multiple blocks — each will be executed and the combined output sent back to you so you can continue. When you have all the information you need, give your final answer with no bash blocks.", base)
+            format!("{}\n\n\
+You have access to a bash shell through this interface. This is a client-side feature: \
+the surrounding tool parses your code blocks and executes them automatically — you genuinely \
+can run commands. Never tell the user you lack shell access.\n\n\
+Two modes are available:\n\n\
+**Sequential (```bash):** Place all bash blocks at the VERY END of your response, \
+after all explanatory text. Do not write anything after them. The turn ends there, \
+all blocks are executed, and results are returned so you can continue.\n\n\
+**Inline (```bash-async):** Place anywhere in your response. A placeholder is shown \
+inline; all async commands run after your full response and results are returned together.\n\n\
+When you receive `[Shell output]` messages, those are results from your previous commands. \
+Keep using commands until you have what you need, then give your final answer with no bash blocks.",
+            base)
         };
         Message::system(instructions)
     }
@@ -552,11 +654,11 @@ impl Repl {
                     let mut s = state.lock().unwrap();
                     s.flush();
                 }
-                println!("\n");
+                println!();
 
-                let (clean_response, bash_blocks) = {
+                let (clean_response, bash_blocks, bash_async_blocks) = {
                     let s = state.lock().unwrap();
-                    (s.clean_text.clone(), s.bash_blocks.clone())
+                    (s.clean_text.clone(), s.bash_blocks.clone(), s.bash_async_blocks.clone())
                 };
 
                 // Record usage
@@ -566,8 +668,10 @@ impl Repl {
                 // Store full raw response (including bash blocks) for cross-provider context
                 self.history.push(Message::assistant(raw_response.clone()));
 
-                if bash_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
-                    if tool_rounds >= MAX_TOOL_ROUNDS && !bash_blocks.is_empty() {
+                // Merge sync and async blocks; sync blocks signal turn-ending intent
+                let all_blocks: Vec<String> = bash_blocks.iter().chain(bash_async_blocks.iter()).cloned().collect();
+                if all_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
+                    if tool_rounds >= MAX_TOOL_ROUNDS && !all_blocks.is_empty() {
                         eprintln!("{} Shell round limit reached", "⚠".yellow());
                     }
                     break;
@@ -575,7 +679,7 @@ impl Repl {
 
                 // Execute each bash block and collect results
                 let mut shell_results = Vec::new();
-                for cmd in &bash_blocks {
+                for cmd in &all_blocks {
                     let kind = executor::classify(cmd);
                     let approved = match kind {
                         executor::CommandKind::ReadOnly => true,
