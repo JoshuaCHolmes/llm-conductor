@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::cli::session::SessionStore;
+use crate::cli::session::{SessionStore, Todo, TodoStatus};
 use crate::cli::executor::{self, ShellTurn};
 use crate::providers::{ToolDefinition};
 use crate::router::Router;
@@ -109,12 +109,13 @@ fn render_markdown_line(line: &str) -> String {
 
 /// State machine for streaming model responses.
 ///
-/// Handles three special regions transparently:
+/// Handles four special regions transparently:
 /// - `<think>...</think>` — printed dimmed, excluded from `clean_text`
 /// - ` ```bash...``` ` (sync) — silently captured; newlines before it are
 ///   discarded so no blank gap appears where the block would have been
 /// - ` ```bash-async...``` ` — an inline `[⚡ cmd]` placeholder is printed;
 ///   command captured in `bash_async_blocks` for execution after the response
+/// - ` ```tool...``` ` — silently captured as JSON tool calls; no display output
 ///
 /// Normal prose is rendered through `render_markdown_line` on a line-by-line
 /// basis so markdown formatting (bold, code, headings, lists) is properly
@@ -127,17 +128,20 @@ struct ReplyStreamState {
     in_think: bool,
     in_bash: bool,
     in_bash_async: bool,
+    in_tool: bool,
     showed_thinking: bool,
     pending: String,
     bash_block_buf: String,
     bash_async_block_buf: String,
+    tool_block_buf: String,
     /// Accumulates the current incomplete line until a newline arrives.
     line_buf: String,
     /// Trailing newlines held back until we know what follows them.
-    /// Discarded if a bash block comes next; flushed before any content.
+    /// Discarded if a bash/tool block comes next; flushed before any content.
     deferred_newlines: usize,
     pub bash_blocks: Vec<String>,
     pub bash_async_blocks: Vec<String>,
+    pub tool_blocks: Vec<String>,
     pub clean_text: String,
 }
 
@@ -250,6 +254,24 @@ impl ReplyStreamState {
                     }
                     break;
                 }
+            } else if self.in_tool {
+                if let Some(pos) = self.pending.find("```") {
+                    self.tool_block_buf.push_str(&self.pending[..pos]);
+                    let content = self.tool_block_buf.trim().to_string();
+                    if !content.is_empty() {
+                        self.tool_blocks.push(content);
+                    }
+                    self.tool_block_buf.clear();
+                    self.in_tool = false;
+                    self.pending = self.pending[pos + 3..].to_string();
+                } else {
+                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                    if safe > 0 {
+                        self.tool_block_buf.push_str(&self.pending[..safe]);
+                        self.pending = self.pending[safe..].to_string();
+                    }
+                    break;
+                }
             } else if self.in_think {
                 if let Some(pos) = self.pending.find("</think>") {
                     let before = &self.pending[..pos];
@@ -272,11 +294,15 @@ impl ReplyStreamState {
                 let think_pos = self.pending.find("<think>");
                 let async_pos = self.pending.find("```bash-async");
                 let sync_pos  = find_sync_bash(&self.pending);
+                // "```tool" but not "```tool-" variants
+                let tool_pos  = self.pending.find("```tool")
+                    .filter(|&p| !self.pending[p..].starts_with("```tool-"));
 
                 let first = [
                     think_pos.map(|p| (0u8, p)),
                     async_pos.map(|p| (1u8, p)),
                     sync_pos .map(|p| (2u8, p)),
+                    tool_pos .map(|p| (3u8, p)),
                 ].iter().filter_map(|x| *x).min_by_key(|&(_, p)| p);
 
                 match first {
@@ -308,7 +334,15 @@ impl ReplyStreamState {
                         let rest = &self.pending[pos + "```bash".len()..];
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
+                    Some((3, pos)) => {
+                        let before = self.pending[..pos].to_string();
+                        self.flush_before_bash(&before);
+                        self.in_tool = true;
+                        let rest = &self.pending[pos + "```tool".len()..];
+                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+                    }
                     _ => {
+                        // Keep enough bytes to detect the longest possible marker (13 chars for bash-async)
                         let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
                         if safe > 0 {
                             let to_print = self.pending[..safe].to_string();
@@ -334,7 +368,7 @@ impl ReplyStreamState {
         // Discard trailing deferred newlines (end-of-response whitespace)
         self.deferred_newlines = 0;
         if !self.pending.is_empty() {
-            if self.in_bash || self.in_bash_async {
+            if self.in_bash || self.in_bash_async || self.in_tool {
                 // Truncated/unclosed block — discard silently
             } else if self.in_think {
                 print!("{}", self.pending.dimmed());
@@ -352,6 +386,7 @@ impl ReplyStreamState {
         }
         self.bash_block_buf.clear();
         self.bash_async_block_buf.clear();
+        self.tool_block_buf.clear();
     }
 }
 
@@ -376,6 +411,8 @@ pub struct Repl {
     shell_turns: Vec<ShellTurn>,
     /// Commands that have been accepted for the full session (exact match).
     session_auto_accepts: HashSet<String>,
+    /// Todo list, persisted with the session.
+    todos: Vec<Todo>,
 }
 
 impl Repl {
@@ -393,39 +430,68 @@ impl Repl {
             sessions_page: 0,
             shell_turns: Vec::new(),
             session_auto_accepts: HashSet::new(),
+            todos: Vec::new(),
         })
     }
 
     /// Build a capability-aware system prompt.
-    fn build_system_prompt(supports_tool_calling: bool) -> Message {
-        let base = "You are a helpful AI assistant.";
+    fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo]) -> Message {
+        let env_context = "\
+You are running on NixOS inside WSL2 on an ARM64 (aarch64) machine. \
+If a program is missing, it can be installed with `nix-shell -p <package>`. \
+Write concise code and direct answers. Avoid verbose explanations unless the user asks for them.";
+
+        let todo_section = if todos.is_empty() {
+            String::new()
+        } else {
+            let active: Vec<_> = todos.iter().enumerate()
+                .filter(|(_, t)| t.status != TodoStatus::Done)
+                .collect();
+            if active.is_empty() {
+                String::new()
+            } else {
+                let lines: Vec<String> = active.iter()
+                    .map(|(i, t)| t.summary(i + 1))
+                    .collect();
+                format!("\n\n## Active Tasks\n{}", lines.join("\n"))
+            }
+        };
+
+        let todo_tool_desc = "\n\n\
+You have access to a todo list tool to track tasks for this session. \
+Use it to organize multi-step work. Available functions:\n\
+- `todo_add(title, description?)` — create a new task\n\
+- `todo_update(id, status)` — set status to pending/in_progress/done/blocked\n\
+- `todo_list()` — get the current list";
+
         let instructions = if supports_tool_calling {
             format!("{}\n\n\
-You have access to a `bash` tool. Use it freely to run shell commands. \
-Read-only commands (ls, cat, grep, etc.) run automatically. Commands that \
-modify the system require the user's confirmation — if a command is denied, \
-you will receive a tool result explaining why, so adjust your approach accordingly.",
-                base)
+You have access to a `bash` tool and todo list tools. Use them freely to run shell commands \
+and track tasks. Read-only commands (ls, cat, grep, etc.) run automatically. Commands that \
+modify the system require the user's confirmation — if a command is denied, you will receive \
+a tool result explaining why, so adjust your approach accordingly.{}{}",
+                env_context, todo_tool_desc, todo_section)
         } else {
             format!("{}\n\n\
-You have access to a bash shell through this interface. This is a client-side \
-feature: the surrounding tool parses your code blocks and executes them — you \
-genuinely can run commands. Never tell the user you lack shell access.\n\n\
-Two block modes are available:\n\n\
+You have access to a bash shell and a todo list through this interface. These are client-side \
+features: the surrounding tool parses your code blocks and executes them — you genuinely \
+can run commands and manage todos. Never tell the user you lack these capabilities.\n\n\
+Two bash modes:\n\n\
 **Sequential (```bash):** All bash blocks must be at the VERY END of your response, \
-after all prose. Do not write anything after them. The turn ends there, all blocks \
-are executed, and results are returned so you can continue.\n\n\
-**Inline (```bash-async):** May appear anywhere in your response. A placeholder is \
-shown inline; all async commands run after your full response and results are \
-returned together.\n\n\
+after all prose. The turn ends there, all blocks are executed, and results are returned.\n\n\
+**Inline (```bash-async):** May appear anywhere; a placeholder is shown inline; all async \
+commands run after your full response and results are returned together.\n\n\
 Read-only commands (ls, cat, grep, etc.) run automatically. Commands that modify \
 the system require the user's approval. If a command is denied, the `[Shell output]` \
-message will say `[DENIED: <cmd>]` along with the user's correction — adjust your \
-approach based on that feedback. A bare refusal with no text means the user simply \
-does not want that command run.\n\n\
+message will say `[DENIED: <cmd>]` with the user's correction — adjust your approach. \
+A bare refusal with no text means the user does not want that command run.\n\n\
 When you receive `[Shell output]` messages, use them to continue. Once you have \
-what you need, give your final answer with no bash blocks.",
-                base)
+what you need, give your final answer with no bash blocks.\n\n\
+**Todo list (```tool):** To manage tasks, emit a ```tool block containing JSON like:\n\
+```tool\n{{\"function\": \"todo_add\", \"args\": {{\"title\": \"my task\"}}}}\n```\n\
+or: `todo_update(id, status)`, `todo_list()`. Tool blocks are silently executed and \
+results are returned in `[Tool output]` messages.{}{}",
+                env_context, todo_tool_desc, todo_section)
         };
         Message::system(instructions)
     }
@@ -449,16 +515,98 @@ what you need, give your final answer with no bash blocks.",
         })
     }
 
-    /// Load an existing session by ID, restoring conversation history.
+    /// Reset all per-session state to a clean baseline.
+    fn reset_session_state(&mut self) {
+        self.history.clear();
+        self.session_id = None;
+        self.shell_turns.clear();
+        self.session_auto_accepts.clear();
+        self.todos.clear();
+    }
+
+    /// Load an existing session by ID, restoring conversation history and todos.
     pub fn load_session(&mut self, session_id: &str) -> Result<()> {
         let session = self.session_store.load(session_id)?;
+        self.reset_session_state();
         self.history = session.messages;
+        self.todos = session.todos;
         self.session_id = Some(session_id.to_string());
-        println!("{} Resumed session with {} messages",
+        let todo_note = if self.todos.is_empty() {
+            String::new()
+        } else {
+            format!(", {} todo(s)", self.todos.len())
+        };
+        println!("{} Resumed session with {} messages{}",
             "✓".bright_green(),
-            self.history.len()
+            self.history.len(),
+            todo_note,
         );
         Ok(())
+    }
+
+    /// Save current session state (history + todos).
+    fn save_session(&mut self) {
+        match self.session_store.save(self.session_id.as_deref(), &self.history, &self.todos) {
+            Ok(id) => { self.session_id = Some(id); }
+            Err(e) => eprintln!("{} Failed to save session: {}", "⚠".yellow(), e),
+        }
+    }
+
+    /// Dispatch a JSON tool-call string (from a ```tool block or LLM function call) to todo ops.
+    /// Returns a human-readable result string.
+    fn apply_todo_action(&mut self, json: &str) -> String {
+        let v: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => return format!("[todo error] Invalid JSON: {}", e),
+        };
+        let func = v["function"].as_str().unwrap_or("");
+        let args = &v["args"];
+        match func {
+            "todo_add" => {
+                let title = match args["title"].as_str() {
+                    Some(t) => t,
+                    None => return "[todo_add error] missing 'title'".to_string(),
+                };
+                let desc = args["description"].as_str();
+                let todo = Todo::new(title, desc);
+                let id = todo.id.clone();
+                let num = self.todos.len() + 1;
+                self.todos.push(todo);
+                format!("[todo_add] Created #{}: {} (id: {})", num, title, &id[..8])
+            }
+            "todo_update" => {
+                let id_arg = match args["id"].as_str() {
+                    Some(i) => i,
+                    None => return "[todo_update error] missing 'id'".to_string(),
+                };
+                let status_str = match args["status"].as_str() {
+                    Some(s) => s,
+                    None => return "[todo_update error] missing 'status'".to_string(),
+                };
+                let new_status = match TodoStatus::from_str(status_str) {
+                    Some(s) => s,
+                    None => return format!("[todo_update error] unknown status '{}'", status_str),
+                };
+                match self.todos.iter_mut().find(|t| t.id.starts_with(id_arg) || t.id == id_arg) {
+                    Some(t) => {
+                        t.status = new_status;
+                        format!("[todo_update] '{}' → {}", t.title, t.status)
+                    }
+                    None => format!("[todo_update error] no todo with id starting '{}'", id_arg),
+                }
+            }
+            "todo_list" => {
+                if self.todos.is_empty() {
+                    "[todo_list] No todos.".to_string()
+                } else {
+                    let lines: Vec<String> = self.todos.iter().enumerate()
+                        .map(|(i, t)| t.summary(i + 1))
+                        .collect();
+                    format!("[todo_list]\n{}", lines.join("\n"))
+                }
+            }
+            other => format!("[todo error] Unknown function '{}'", other),
+        }
     }
     
     pub async fn run(&mut self) -> Result<()> {
@@ -574,10 +722,8 @@ what you need, give your final answer with no bash blocks.",
                 }
                 Ok(true)
             }
-            Some("/new") => {
-                self.history.clear();
-                self.session_id = None;
-                self.shell_turns.clear();
+            Some("/new") | Some("/session") if parts.get(1).map_or(true, |s| *s == "new") => {
+                self.reset_session_state();
                 println!("{}", "✓ Started new conversation".green());
                 Ok(true)
             }
@@ -638,6 +784,68 @@ what you need, give your final answer with no bash blocks.",
                 self.list_providers().await?;
                 Ok(true)
             }
+            Some("/todo") => {
+                match parts.get(1).map(|s| *s) {
+                    None | Some("list") => {
+                        if self.todos.is_empty() {
+                            println!("{}", "No todos.".dimmed());
+                        } else {
+                            println!("{}", "Todos:".bright_cyan().bold());
+                            for (i, t) in self.todos.iter().enumerate() {
+                                println!("  {}", t.summary(i + 1));
+                            }
+                        }
+                    }
+                    Some("add") => {
+                        let title: String = parts[2..].join(" ");
+                        if title.is_empty() {
+                            eprintln!("{}", "Usage: /todo add <title>".yellow());
+                        } else {
+                            let todo = Todo::new(&title, None);
+                            let num = self.todos.len() + 1;
+                            println!("{} Added #{}: {}", "✓".bright_green(), num, todo.title);
+                            self.todos.push(todo);
+                            self.save_session();
+                        }
+                    }
+                    Some("done") | Some("start") | Some("block") | Some("pending") => {
+                        let subcmd = parts[1];
+                        let status = match subcmd {
+                            "done"    => TodoStatus::Done,
+                            "start"   => TodoStatus::InProgress,
+                            "block"   => TodoStatus::Blocked,
+                            _         => TodoStatus::Pending,
+                        };
+                        match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
+                            Some(n) if n >= 1 && n <= self.todos.len() => {
+                                self.todos[n - 1].status = status;
+                                println!("{} #{} → {}", "✓".bright_green(), n, self.todos[n - 1].status);
+                                self.save_session();
+                            }
+                            _ => eprintln!("{}", format!("Usage: /todo {} <N>", subcmd).yellow()),
+                        }
+                    }
+                    Some("rm") => {
+                        match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
+                            Some(n) if n >= 1 && n <= self.todos.len() => {
+                                let removed = self.todos.remove(n - 1);
+                                println!("{} Removed: {}", "✓".bright_green(), removed.title);
+                                self.save_session();
+                            }
+                            _ => eprintln!("{}", "Usage: /todo rm <N>".yellow()),
+                        }
+                    }
+                    Some("reset") => {
+                        self.todos.clear();
+                        println!("{}", "✓ Todos cleared".green());
+                        self.save_session();
+                    }
+                    Some(other) => {
+                        eprintln!("{}", format!("Unknown todo subcommand '{}'. Use: list add done start block rm reset", other).yellow());
+                    }
+                }
+                Ok(true)
+            }
             Some("/clear") => {
                 self.history.clear();
                 println!("{}", "History cleared".green());
@@ -694,7 +902,7 @@ what you need, give your final answer with no bash blocks.",
             }
 
             // Build messages: dynamic system prompt + history
-            let system_msg = Self::build_system_prompt(supports_tool_calling);
+            let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos);
             let mut messages = vec![system_msg];
             messages.extend(self.history.clone());
 
@@ -704,7 +912,13 @@ what you need, give your final answer with no bash blocks.",
 
             if supports_tool_calling {
                 // ── Function-calling path (TAMU / GitHub) ────────────────────────
-                let result = provider.call_with_tools(&model, &messages, &[ToolDefinition::bash()]).await?;
+                let tools = vec![
+                    ToolDefinition::bash(),
+                    ToolDefinition::todo_add(),
+                    ToolDefinition::todo_update(),
+                    ToolDefinition::todo_list(),
+                ];
+                let result = provider.call_with_tools(&model, &messages, &tools).await?;
 
                 // Display any text content the model returned alongside the tool call
                 if let Some(ref text) = result.text {
@@ -733,45 +947,59 @@ what you need, give your final answer with no bash blocks.",
                     ));
 
                     for tc in &tool_calls {
-                        if tc.name != "bash" {
-                            continue;
-                        }
-                        let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                            .ok()
-                            .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| tc.arguments.clone());
+                        match tc.name.as_str() {
+                            "bash" => {
+                                let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                    .ok()
+                                    .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| tc.arguments.clone());
 
-                        let kind = executor::classify(&cmd);
-                        let decision = if kind == executor::CommandKind::ReadOnly {
-                            CommandDecision::Accept
-                        } else {
-                            Self::prompt_command_decision(&cmd, &self.session_auto_accepts)?
-                        };
-
-                        match decision {
-                            CommandDecision::AcceptForSession => {
-                                self.session_auto_accepts.insert(cmd.clone());
-                                let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
-                                let turn_num = self.shell_turns.len() + 1;
-                                print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
-                                self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
-                                self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
-                            }
-                            CommandDecision::Accept => {
-                                let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
-                                let turn_num = self.shell_turns.len() + 1;
-                                print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
-                                self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
-                                self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
-                            }
-                            CommandDecision::Deny(reason) => {
-                                let denial = if reason.is_empty() {
-                                    format!("[Command denied: {}] (no reason given)", cmd)
+                                let kind = executor::classify(&cmd);
+                                let decision = if kind == executor::CommandKind::ReadOnly {
+                                    CommandDecision::Accept
                                 } else {
-                                    format!("[Command denied: {}]\nUser correction: {}", cmd, reason)
+                                    Self::prompt_command_decision(&cmd, &self.session_auto_accepts)?
                                 };
-                                println!("{}", "  (denied)".dimmed());
-                                self.history.push(Message::tool_result(&tc.id, denial));
+
+                                match decision {
+                                    CommandDecision::AcceptForSession => {
+                                        self.session_auto_accepts.insert(cmd.clone());
+                                        let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                                        let turn_num = self.shell_turns.len() + 1;
+                                        print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                                    }
+                                    CommandDecision::Accept => {
+                                        let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                                        let turn_num = self.shell_turns.len() + 1;
+                                        print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                                    }
+                                    CommandDecision::Deny(reason) => {
+                                        let denial = if reason.is_empty() {
+                                            format!("[Command denied: {}] (no reason given)", cmd)
+                                        } else {
+                                            format!("[Command denied: {}]\nUser correction: {}", cmd, reason)
+                                        };
+                                        println!("{}", "  (denied)".dimmed());
+                                        self.history.push(Message::tool_result(&tc.id, denial));
+                                    }
+                                }
+                            }
+                            "todo_add" | "todo_update" | "todo_list" => {
+                                // Build a JSON dispatch object matching the text-model format
+                                let dispatch = serde_json::json!({
+                                    "function": tc.name,
+                                    "args": serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+                                });
+                                let result_text = self.apply_todo_action(&dispatch.to_string());
+                                println!("{}", result_text.dimmed());
+                                self.history.push(Message::tool_result(&tc.id, result_text));
+                            }
+                            _ => {
+                                self.history.push(Message::tool_result(&tc.id, format!("[unknown tool: {}]", tc.name)));
                             }
                         }
                     }
@@ -801,9 +1029,9 @@ what you need, give your final answer with no bash blocks.",
                 }
                 println!();
 
-                let (clean_response, bash_blocks, bash_async_blocks) = {
+                let (clean_response, bash_blocks, bash_async_blocks, tool_blocks) = {
                     let s = state.lock().unwrap();
-                    (s.clean_text.clone(), s.bash_blocks.clone(), s.bash_async_blocks.clone())
+                    (s.clean_text.clone(), s.bash_blocks.clone(), s.bash_async_blocks.clone(), s.tool_blocks.clone())
                 };
 
                 // Record usage
@@ -815,8 +1043,9 @@ what you need, give your final answer with no bash blocks.",
 
                 // Merge sync and async blocks; sync blocks signal turn-ending intent
                 let all_blocks: Vec<String> = bash_blocks.iter().chain(bash_async_blocks.iter()).cloned().collect();
-                if all_blocks.is_empty() || tool_rounds >= MAX_TOOL_ROUNDS {
-                    if tool_rounds >= MAX_TOOL_ROUNDS && !all_blocks.is_empty() {
+                let has_any_action = !all_blocks.is_empty() || !tool_blocks.is_empty();
+                if !has_any_action || tool_rounds >= MAX_TOOL_ROUNDS {
+                    if tool_rounds >= MAX_TOOL_ROUNDS && has_any_action {
                         eprintln!("{} Shell round limit reached", "⚠".yellow());
                     }
                     break;
@@ -859,23 +1088,39 @@ what you need, give your final answer with no bash blocks.",
                         }
                     }
                 }
-                println!(); // blank line after shell output batch
 
-                if shell_results.is_empty() {
+                // Dispatch tool blocks (todo operations) — separate from shell output
+                let mut tool_results = Vec::new();
+                for json in &tool_blocks {
+                    let result_text = self.apply_todo_action(json);
+                    println!("{}", result_text.dimmed());
+                    tool_results.push(result_text);
+                }
+
+                if !all_blocks.is_empty() || !tool_blocks.is_empty() {
+                    println!(); // blank line after action batch
+                }
+
+                // Build feedback message(s) — shell and tool results go in separate wrappers
+                let mut feedback_parts = Vec::new();
+                if !shell_results.is_empty() {
+                    feedback_parts.push(format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n")));
+                }
+                if !tool_results.is_empty() {
+                    feedback_parts.push(format!("[Tool output]\n{}\n[End of tool output]", tool_results.join("\n---\n")));
+                }
+
+                if feedback_parts.is_empty() {
                     break;
                 }
 
-                let feedback = format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n"));
-                self.history.push(Message::user(feedback));
+                self.history.push(Message::user(feedback_parts.join("\n\n")));
                 tool_rounds += 1;
             }
         }
 
         // Auto-save session
-        match self.session_store.save(self.session_id.as_deref(), &self.history) {
-            Ok(id) => { self.session_id = Some(id); }
-            Err(e) => eprintln!("{} Failed to auto-save session: {}", "⚠".yellow(), e),
-        }
+        self.save_session();
 
         Ok(())
     }
@@ -994,11 +1239,64 @@ what you need, give your final answer with no bash blocks.",
         println!("  {} - Show full shell output for turn N", "/show N".bright_white());
         println!("  {} - Resume a saved session by number", "/load N".bright_white());
         println!("  {} - List saved sessions (> / < to page)", "/sessions".bright_white());
-        println!("  {} - Start a new conversation", "/new".bright_white());
+        println!("  {} - Start a new conversation", "/new or /session new".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
+        println!("  {} - Show/add/update todos", "/todo [add|done|start|block|rm]".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();
         println!("{}", "Tip: start with --resume to pick a previous session".dimmed());
         println!("{}", "Just type a message to chat!".dimmed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(state: &mut ReplyStreamState, text: &str) {
+        for ch in text.chars() {
+            state.process_chunk(&ch.to_string());
+        }
+        state.flush();
+    }
+
+    #[test]
+    fn tool_block_captured_silently() {
+        let mut s = ReplyStreamState::default();
+        feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nAfter");
+        assert_eq!(s.tool_blocks.len(), 1);
+        assert!(s.tool_blocks[0].contains("todo_list"));
+        // tool block content must not appear in clean_text
+        assert!(!s.clean_text.contains("todo_list"));
+        assert!(s.clean_text.contains("Before"));
+        assert!(s.clean_text.contains("After"));
+    }
+
+    #[test]
+    fn tool_block_chunk_boundary() {
+        let mut s = ReplyStreamState::default();
+        // Split across the opener
+        s.process_chunk("```to");
+        s.process_chunk("ol\n{\"function\":\"todo_add\",\"args\":{\"title\":\"x\"}}\n```");
+        s.flush();
+        assert_eq!(s.tool_blocks.len(), 1);
+    }
+
+    #[test]
+    fn bash_and_tool_blocks_coexist() {
+        let mut s = ReplyStreamState::default();
+        feed(&mut s, "Text\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nMore\n```bash\nls\n```");
+        assert_eq!(s.tool_blocks.len(), 1);
+        assert_eq!(s.bash_blocks.len(), 1);
+        assert_eq!(s.bash_blocks[0], "ls");
+    }
+
+    #[test]
+    fn unclosed_tool_block_discarded() {
+        let mut s = ReplyStreamState::default();
+        feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\"");
+        // No closing ``` — should be silently discarded, not panic
+        assert_eq!(s.tool_blocks.len(), 0);
+        assert!(s.clean_text.contains("Before"));
     }
 }

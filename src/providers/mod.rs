@@ -42,6 +42,47 @@ impl ToolDefinition {
             }),
         }
     }
+
+    pub fn todo_add() -> Self {
+        Self {
+            name: "todo_add".to_string(),
+            description: "Add a new task to the todo list with pending status.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short task title" },
+                    "description": { "type": "string", "description": "Optional longer description" }
+                },
+                "required": ["title"]
+            }),
+        }
+    }
+
+    pub fn todo_update() -> Self {
+        Self {
+            name: "todo_update".to_string(),
+            description: "Update the status of an existing todo by its UUID. Valid statuses: pending, in_progress, done, blocked.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Full UUID of the todo to update" },
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "done", "blocked"] }
+                },
+                "required": ["id", "status"]
+            }),
+        }
+    }
+
+    pub fn todo_list() -> Self {
+        Self {
+            name: "todo_list".to_string(),
+            description: "Return the current todo list as text.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        }
+    }
 }
 
 /// Response from `call_with_tools` — either text or a list of tool calls

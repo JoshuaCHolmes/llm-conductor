@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,72 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Message;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+    Blocked,
+}
+
+impl TodoStatus {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "pending" => Some(Self::Pending),
+            "in_progress" | "inprogress" | "active" => Some(Self::InProgress),
+            "done" | "complete" | "completed" | "finished" => Some(Self::Done),
+            "blocked" | "block" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TodoStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Pending    => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done       => "done",
+            Self::Blocked    => "blocked",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: TodoStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Todo {
+    pub fn new(title: &str, description: Option<&str>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            description: description.map(|s| s.to_string()),
+            status: TodoStatus::Pending,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// One-line display: "● [status] title (id_prefix)"
+    pub fn summary(&self, num: usize) -> String {
+        let icon = match self.status {
+            TodoStatus::Pending    => "○",
+            TodoStatus::InProgress => "◐",
+            TodoStatus::Done       => "✓",
+            TodoStatus::Blocked    => "✗",
+        };
+        format!("{:2}. {} [{}] {}", num, icon, self.status, self.title)
+    }
+}
+
 const SESSIONS_PER_PAGE: usize = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,6 +82,8 @@ pub struct SessionFile {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub todos: Vec<Todo>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -39,7 +108,7 @@ impl SessionStore {
     }
 
     /// Save or update a session. Returns the session ID (created on first save).
-    pub fn save(&self, session_id: Option<&str>, messages: &[Message]) -> Result<String> {
+    pub fn save(&self, session_id: Option<&str>, messages: &[Message], todos: &[Todo]) -> Result<String> {
         let id = session_id
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -69,6 +138,7 @@ impl SessionStore {
             created_at,
             updated_at: Utc::now(),
             messages: messages.to_vec(),
+            todos: todos.to_vec(),
         };
 
         fs::write(&path, serde_json::to_string_pretty(&session)?)?;
@@ -189,7 +259,7 @@ mod tests {
 
         // First save — no id yet, should create a new slot
         let msgs1 = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
-        let id = store.save(None, &msgs1).unwrap();
+        let id = store.save(None, &msgs1, &[]).unwrap();
 
         // Verify single entry in index
         assert_eq!(store.list().unwrap().len(), 1);
@@ -201,7 +271,7 @@ mod tests {
             msg(Role::User, "second turn"),
             msg(Role::Assistant, "still here"),
         ];
-        let id2 = store.save(Some(&id), &msgs2).unwrap();
+        let id2 = store.save(Some(&id), &msgs2, &[]).unwrap();
 
         // Must reuse the same id and not create a new slot
         assert_eq!(id, id2, "resumed save should reuse the same session id");
@@ -213,15 +283,49 @@ mod tests {
     }
 
     #[test]
-    fn fresh_starts_create_separate_slots() {
+    fn todos_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        let todos = vec![Todo::new("Task A", None), Todo::new("Task B", Some("do the thing"))];
+        let id = store.save(None, &[], &todos).unwrap();
+
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.todos.len(), 2);
+        assert_eq!(loaded.todos[0].title, "Task A");
+        assert_eq!(loaded.todos[1].description.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn old_session_without_todos_loads_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+
+        // Write a session file that has no `todos` field
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = dir.path().join("sessions").join(format!("{}.json", id));
+        let raw = serde_json::json!({
+            "id": id,
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "messages": []
+        });
+        std::fs::write(&path, raw.to_string()).unwrap();
+
+        let loaded = store.load(&id).unwrap();
+        assert!(loaded.todos.is_empty(), "old session should deserialize with empty todos");
+    }
+
+    #[test]
+    fn two_separate_new_sessions_create_two_slots() {
         let dir = TempDir::new().unwrap();
         let store = make_store(&dir);
 
         let msgs = vec![msg(Role::User, "turn 1"), msg(Role::Assistant, "a")];
-        store.save(None, &msgs).unwrap();
+        store.save(None, &msgs, &[]).unwrap();
 
         let msgs2 = vec![msg(Role::User, "turn 2"), msg(Role::Assistant, "b")];
-        store.save(None, &msgs2).unwrap();
+        store.save(None, &msgs2, &[]).unwrap();
 
         assert_eq!(store.list().unwrap().len(), 2, "two fresh sessions should produce two slots");
     }
