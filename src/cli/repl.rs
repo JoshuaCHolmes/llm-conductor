@@ -1,6 +1,7 @@
 use anyhow::Result;
 use colored::*;
 use rustyline::DefaultEditor;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,16 +27,100 @@ fn find_sync_bash(s: &str) -> Option<usize> {
     None
 }
 
+/// Strip `**`, `*`, `` ` ``, `_` marker characters (used for heading text).
+fn strip_md_markers(s: &str) -> String {
+    s.chars().filter(|&c| c != '*' && c != '`' && c != '_').collect()
+}
+
+/// Render inline markdown spans in a string to ANSI terminal sequences.
+/// Handles `**bold**`, `` `code` ``, and `*italic*` (asterisks stripped).
+fn render_inline(s: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < s.len() {
+        // **bold**
+        if s[i..].starts_with("**") {
+            if let Some(end) = s.get(i + 2..).and_then(|t| t.find("**")) {
+                out.push_str(&s[i + 2..i + 2 + end].bold().to_string());
+                i += 4 + end;
+                continue;
+            }
+        }
+        // `code` (not triple-backtick)
+        if s[i..].starts_with('`') && !s[i..].starts_with("```") {
+            if let Some(end) = s.get(i + 1..).and_then(|t| t.find('`')) {
+                out.push_str(&s[i + 1..i + 1 + end].cyan().to_string());
+                i += 2 + end;
+                continue;
+            }
+        }
+        // *italic* — strip asterisks, keep text
+        if s[i..].starts_with('*') && !s[i..].starts_with("**") {
+            if let Some(end) = s.get(i + 1..).and_then(|t| t.find('*')) {
+                let close = i + 1 + end;
+                if !s[close..].starts_with("**") {
+                    out.push_str(&s[i + 1..close]);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        let c = s[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// Render a complete buffered line with markdown formatting to a display string.
+fn render_markdown_line(line: &str) -> String {
+    // Headings: strip markers, apply bold+bright_white
+    if let Some(rest) = line.strip_prefix("### ") {
+        return strip_md_markers(rest).bold().bright_white().to_string();
+    }
+    if let Some(rest) = line.strip_prefix("## ") {
+        return strip_md_markers(rest).bold().bright_white().to_string();
+    }
+    if let Some(rest) = line.strip_prefix("# ") {
+        return strip_md_markers(rest).bold().bright_white().to_string();
+    }
+    // Horizontal rule
+    let t = line.trim();
+    if t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '=')) {
+        return "──────────────────────────────".dimmed().to_string();
+    }
+    // List items (with optional indentation)
+    let leading = line.len() - line.trim_start().len();
+    let indent = &line[..leading];
+    let rest = &line[leading..];
+    if let Some(item) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        return format!("{}• {}", indent, render_inline(item));
+    }
+    // Numbered list: "1. " etc.
+    let digit_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+    if digit_end > 0 && rest[digit_end..].starts_with(". ") {
+        let num = &rest[..digit_end];
+        let item = &rest[digit_end + 2..];
+        return format!("{}{}. {}", indent, num, render_inline(item));
+    }
+    // Normal prose — inline formatting only
+    render_inline(line)
+}
+
 /// State machine for streaming model responses.
 ///
 /// Handles three special regions transparently:
 /// - `<think>...</think>` — printed dimmed, excluded from `clean_text`
-/// - ` ```bash...``` ` (sync) — silently captured; deferred newlines before it are
+/// - ` ```bash...``` ` (sync) — silently captured; newlines before it are
 ///   discarded so no blank gap appears where the block would have been
-/// - ` ```bash-async...``` ` — an inline `[⚡ cmd]` placeholder is printed in place;
-///   command captured in `bash_async_blocks` for execution after the full response
+/// - ` ```bash-async...``` ` — an inline `[⚡ cmd]` placeholder is printed;
+///   command captured in `bash_async_blocks` for execution after the response
 ///
-/// Trailing newlines at the end of the response are also discarded to avoid a blank
+/// Normal prose is rendered through `render_markdown_line` on a line-by-line
+/// basis so markdown formatting (bold, code, headings, lists) is properly
+/// displayed instead of showing raw markdown markers.
+///
+/// Trailing newlines at the end of the response are discarded to avoid a blank
 /// line between the model's prose and the shell-output display.
 #[derive(Default)]
 struct ReplyStreamState {
@@ -46,25 +131,22 @@ struct ReplyStreamState {
     pending: String,
     bash_block_buf: String,
     bash_async_block_buf: String,
+    /// Accumulates the current incomplete line until a newline arrives.
+    line_buf: String,
     /// Trailing newlines held back until we know what follows them.
-    /// Discarded if a bash block comes next; flushed before any non-whitespace text.
+    /// Discarded if a bash block comes next; flushed before any content.
     deferred_newlines: usize,
-    /// Sync bash blocks (model ends its turn here; execute before next round).
     pub bash_blocks: Vec<String>,
-    /// Async bash blocks (model continued writing; execute after full response).
     pub bash_async_blocks: Vec<String>,
     pub clean_text: String,
 }
 
 impl ReplyStreamState {
-    /// Walk back from `raw_len` to the nearest valid UTF-8 char boundary.
     fn char_safe_len(s: &str, raw_len: usize) -> usize {
-        (0..=raw_len).rev()
-            .find(|&i| s.is_char_boundary(i))
-            .unwrap_or(0)
+        (0..=raw_len).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
     }
 
-    /// Print any deferred newlines (called before non-whitespace content).
+    /// Print any deferred blank lines before new content.
     fn flush_deferred(&mut self) {
         for _ in 0..self.deferred_newlines {
             print!("\n");
@@ -74,29 +156,52 @@ impl ReplyStreamState {
         std::io::stdout().flush().unwrap();
     }
 
-    /// Print normal prose, deferring any trailing newlines.
-    fn print_normal(&mut self, text: &str) {
-        let trimmed = text.trim_end_matches('\n');
-        let trailing = text.len() - trimmed.len();
-        if !trimmed.is_empty() {
-            self.flush_deferred();
-            print!("{}", trimmed);
+    /// Render and print the current `line_buf` content (does not touch deferred_newlines).
+    fn flush_line_buf(&mut self) {
+        if !self.line_buf.is_empty() {
+            let rendered = render_markdown_line(&self.line_buf);
+            print!("{}", rendered);
+            self.clean_text.push_str(&self.line_buf);
+            self.line_buf.clear();
             std::io::stdout().flush().unwrap();
-            self.clean_text.push_str(trimmed);
         }
-        self.deferred_newlines += trailing;
     }
 
-    /// Print text before a bash block: trim trailing whitespace and discard
-    /// any previously deferred newlines (no blank gap before the block).
+    /// Buffer prose text into lines; flush complete lines through the markdown renderer.
+    /// Trailing newlines are deferred rather than printed immediately.
+    fn print_normal(&mut self, text: &str) {
+        let mut remaining = text;
+        loop {
+            match remaining.find('\n') {
+                Some(nl_pos) => {
+                    let segment = &remaining[..nl_pos];
+                    if !segment.is_empty() || !self.line_buf.is_empty() {
+                        self.line_buf.push_str(segment);
+                        self.flush_deferred();
+                        self.flush_line_buf();
+                    }
+                    self.deferred_newlines += 1;
+                    remaining = &remaining[nl_pos + 1..];
+                }
+                None => {
+                    if !remaining.is_empty() {
+                        self.flush_deferred();
+                        self.line_buf.push_str(remaining);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Flush text that precedes a bash block: trim trailing whitespace, print via
+    /// normal renderer, then discard any deferred newlines so no blank gap appears.
     fn flush_before_bash(&mut self, before: &str) {
         let trimmed = before.trim_end_matches(|c: char| c == '\n' || c == ' ');
         if !trimmed.is_empty() {
-            self.flush_deferred();
-            print!("{}", trimmed);
-            std::io::stdout().flush().unwrap();
-            self.clean_text.push_str(trimmed);
+            self.print_normal(trimmed);
         }
+        self.flush_line_buf(); // flush partial line if any
         self.deferred_newlines = 0;
     }
 
@@ -126,7 +231,6 @@ impl ReplyStreamState {
                     self.bash_async_block_buf.push_str(&self.pending[..pos]);
                     let cmd = self.bash_async_block_buf.trim().to_string();
                     if !cmd.is_empty() {
-                        // Show a brief inline placeholder where the block appeared.
                         let preview: String = cmd.lines().next().unwrap_or("").chars().take(40).collect();
                         self.flush_deferred();
                         let ph = format!("[⚡ {}]", preview);
@@ -165,7 +269,6 @@ impl ReplyStreamState {
                     break;
                 }
             } else {
-                // Normal mode: find whichever special marker comes first.
                 let think_pos = self.pending.find("<think>");
                 let async_pos = self.pending.find("```bash-async");
                 let sync_pos  = find_sync_bash(&self.pending);
@@ -178,14 +281,12 @@ impl ReplyStreamState {
 
                 match first {
                     Some((0, pos)) => {
-                        // <think>
                         let before = self.pending[..pos].to_string();
                         if !before.is_empty() {
-                            self.flush_deferred();
-                            print!("{}", before);
-                            std::io::stdout().flush().unwrap();
-                            self.clean_text.push_str(&before);
+                            self.print_normal(&before);
                         }
+                        self.flush_line_buf();
+                        self.flush_deferred();
                         if !self.showed_thinking {
                             println!("{}", "💭 Thinking...".dimmed().italic());
                             self.showed_thinking = true;
@@ -194,7 +295,6 @@ impl ReplyStreamState {
                         self.pending = self.pending[pos + "<think>".len()..].to_string();
                     }
                     Some((1, pos)) => {
-                        // ```bash-async
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
                         self.in_bash_async = true;
@@ -202,7 +302,6 @@ impl ReplyStreamState {
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     Some((2, pos)) => {
-                        // ```bash (sync)
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
                         self.in_bash = true;
@@ -210,7 +309,6 @@ impl ReplyStreamState {
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     _ => {
-                        // No special markers; flush with 13-char lookahead (len of "```bash-async").
                         let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
                         if safe > 0 {
                             let to_print = self.pending[..safe].to_string();
@@ -225,20 +323,29 @@ impl ReplyStreamState {
     }
 
     pub fn flush(&mut self) {
-        // Discard any trailing deferred newlines (end-of-response whitespace).
+        // Flush any remaining line content first
+        if !self.line_buf.is_empty() {
+            let rendered = render_markdown_line(&self.line_buf);
+            print!("{}", rendered);
+            self.clean_text.push_str(&self.line_buf);
+            self.line_buf.clear();
+            std::io::stdout().flush().unwrap();
+        }
+        // Discard trailing deferred newlines (end-of-response whitespace)
         self.deferred_newlines = 0;
         if !self.pending.is_empty() {
             if self.in_bash || self.in_bash_async {
-                // Truncated/unclosed block — discard silently.
+                // Truncated/unclosed block — discard silently
             } else if self.in_think {
                 print!("{}", self.pending.dimmed());
                 std::io::stdout().flush().unwrap();
             } else {
                 let trimmed = self.pending.trim_end_matches('\n');
                 if !trimmed.is_empty() {
-                    print!("{}", trimmed);
-                    std::io::stdout().flush().unwrap();
+                    let rendered = render_markdown_line(trimmed);
+                    print!("{}", rendered);
                     self.clean_text.push_str(trimmed);
+                    std::io::stdout().flush().unwrap();
                 }
             }
             self.pending.clear();
@@ -248,18 +355,27 @@ impl ReplyStreamState {
     }
 }
 
+/// Decision returned when prompting the user about a destructive command.
+#[derive(Debug)]
+enum CommandDecision {
+    Accept,
+    /// Accept and remember this exact command for the rest of the session.
+    AcceptForSession,
+    /// Deny — the string is the user's correction text (may be empty).
+    Deny(String),
+}
+
 pub struct Repl {
     router: Router,
     history: Vec<Message>,
     usage_tracker: UsageTracker,
     model_filter: ModelFilter,
     session_store: SessionStore,
-    /// Current session ID (set after first message)
     session_id: Option<String>,
-    /// Current page for /sessions pagination
     sessions_page: usize,
-    /// Shell turns this session: index 0 = turn #1
     shell_turns: Vec<ShellTurn>,
+    /// Commands that have been accepted for the full session (exact match).
+    session_auto_accepts: HashSet<String>,
 }
 
 impl Repl {
@@ -276,32 +392,61 @@ impl Repl {
             session_id: None,
             sessions_page: 0,
             shell_turns: Vec::new(),
+            session_auto_accepts: HashSet::new(),
         })
     }
 
     /// Build a capability-aware system prompt.
-    /// - Tool-calling models: told they have a bash tool available.
-    /// - Code-block models: detailed instructions for bash / bash-async blocks.
     fn build_system_prompt(supports_tool_calling: bool) -> Message {
         let base = "You are a helpful AI assistant.";
         let instructions = if supports_tool_calling {
-            format!("{}\n\nYou have access to a `bash` tool. Use it to run shell commands when needed. Prefer running commands over asking the user to do so.", base)
+            format!("{}\n\n\
+You have access to a `bash` tool. Use it freely to run shell commands. \
+Read-only commands (ls, cat, grep, etc.) run automatically. Commands that \
+modify the system require the user's confirmation — if a command is denied, \
+you will receive a tool result explaining why, so adjust your approach accordingly.",
+                base)
         } else {
             format!("{}\n\n\
-You have access to a bash shell through this interface. This is a client-side feature: \
-the surrounding tool parses your code blocks and executes them automatically — you genuinely \
-can run commands. Never tell the user you lack shell access.\n\n\
-Two modes are available:\n\n\
-**Sequential (```bash):** Place all bash blocks at the VERY END of your response, \
-after all explanatory text. Do not write anything after them. The turn ends there, \
-all blocks are executed, and results are returned so you can continue.\n\n\
-**Inline (```bash-async):** Place anywhere in your response. A placeholder is shown \
-inline; all async commands run after your full response and results are returned together.\n\n\
-When you receive `[Shell output]` messages, those are results from your previous commands. \
-Keep using commands until you have what you need, then give your final answer with no bash blocks.",
-            base)
+You have access to a bash shell through this interface. This is a client-side \
+feature: the surrounding tool parses your code blocks and executes them — you \
+genuinely can run commands. Never tell the user you lack shell access.\n\n\
+Two block modes are available:\n\n\
+**Sequential (```bash):** All bash blocks must be at the VERY END of your response, \
+after all prose. Do not write anything after them. The turn ends there, all blocks \
+are executed, and results are returned so you can continue.\n\n\
+**Inline (```bash-async):** May appear anywhere in your response. A placeholder is \
+shown inline; all async commands run after your full response and results are \
+returned together.\n\n\
+Read-only commands (ls, cat, grep, etc.) run automatically. Commands that modify \
+the system require the user's approval. If a command is denied, the `[Shell output]` \
+message will say `[DENIED: <cmd>]` along with the user's correction — adjust your \
+approach based on that feedback. A bare refusal with no text means the user simply \
+does not want that command run.\n\n\
+When you receive `[Shell output]` messages, use them to continue. Once you have \
+what you need, give your final answer with no bash blocks.",
+                base)
         };
         Message::system(instructions)
+    }
+
+    /// Prompt the user about a command that requires confirmation.
+    /// Returns immediately (Accept) if the command was session-accepted previously.
+    fn prompt_command_decision(cmd: &str, auto_accepts: &HashSet<String>) -> Result<CommandDecision> {
+        if auto_accepts.contains(cmd) {
+            return Ok(CommandDecision::Accept);
+        }
+        println!("{} {} {}", "⚡".yellow(), "Run:".bright_white(), cmd.bright_yellow());
+        print!("{}", "  [y] accept · [Y] session accept · [text] correct: ".dimmed());
+        std::io::stdout().flush()?;
+        let mut ans = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
+        let ans = ans.trim().to_string();
+        Ok(match ans.as_str() {
+            "y" => CommandDecision::Accept,
+            "Y" => CommandDecision::AcceptForSession,
+            _ => CommandDecision::Deny(ans),
+        })
     }
 
     /// Load an existing session by ID, restoring conversation history.
@@ -513,7 +658,7 @@ Keep using commands until you have what you need, then give your final answer wi
         // Add user message to history
         self.history.push(Message::user(content));
 
-        const MAX_TOOL_ROUNDS: usize = 5;
+        const MAX_TOOL_ROUNDS: usize = 30; // safety limit; user confirmation is the primary gate
         let mut tool_rounds = 0;
 
         loop {
@@ -587,7 +732,6 @@ Keep using commands until you have what you need, then give your final answer wi
                         tool_calls.clone(),
                     ));
 
-                    let mut any_executed = false;
                     for tc in &tool_calls {
                         if tc.name != "bash" {
                             continue;
@@ -598,41 +742,42 @@ Keep using commands until you have what you need, then give your final answer wi
                             .unwrap_or_else(|| tc.arguments.clone());
 
                         let kind = executor::classify(&cmd);
-                        let approved = match kind {
-                            executor::CommandKind::ReadOnly => true,
-                            executor::CommandKind::NeedsConfirm => {
-                                print!("{} {} {} ",
-                                    "⚡".yellow(),
-                                    "Run:".bright_white(),
-                                    cmd.bright_yellow()
-                                );
-                                print!("{}", " [y/N] ".dimmed());
-                                std::io::stdout().flush()?;
-                                let mut ans = String::new();
-                                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
-                                ans.trim().eq_ignore_ascii_case("y")
-                            }
+                        let decision = if kind == executor::CommandKind::ReadOnly {
+                            CommandDecision::Accept
+                        } else {
+                            Self::prompt_command_decision(&cmd, &self.session_auto_accepts)?
                         };
 
-                        if approved {
-                            let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
-                            let turn_num = self.shell_turns.len() + 1;
-                            print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
-                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
-                            self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
-                            any_executed = true;
-                        } else {
-                            println!("{}", "  (skipped)".dimmed());
-                            self.history.push(Message::tool_result(&tc.id, "(command skipped by user)"));
+                        match decision {
+                            CommandDecision::AcceptForSession => {
+                                self.session_auto_accepts.insert(cmd.clone());
+                                let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                                let turn_num = self.shell_turns.len() + 1;
+                                print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                                self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                                self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                            }
+                            CommandDecision::Accept => {
+                                let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                                let turn_num = self.shell_turns.len() + 1;
+                                print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                                self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                                self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                            }
+                            CommandDecision::Deny(reason) => {
+                                let denial = if reason.is_empty() {
+                                    format!("[Command denied: {}] (no reason given)", cmd)
+                                } else {
+                                    format!("[Command denied: {}]\nUser correction: {}", cmd, reason)
+                                };
+                                println!("{}", "  (denied)".dimmed());
+                                self.history.push(Message::tool_result(&tc.id, denial));
+                            }
                         }
                     }
-
-                    if any_executed {
-                        tool_rounds += 1;
-                        continue;
-                    } else {
-                        break;
-                    }
+                    println!(); // blank line after shell output batch
+                    tool_rounds += 1;
+                    continue;
                 } else {
                     // Text response, no tool calls — already displayed above if non-empty
                     let text = result.text.unwrap_or_default();
@@ -681,32 +826,40 @@ Keep using commands until you have what you need, then give your final answer wi
                 let mut shell_results = Vec::new();
                 for cmd in &all_blocks {
                     let kind = executor::classify(cmd);
-                    let approved = match kind {
-                        executor::CommandKind::ReadOnly => true,
-                        executor::CommandKind::NeedsConfirm => {
-                            print!("{} {} {} ",
-                                "⚡".yellow(),
-                                "Run:".bright_white(),
-                                cmd.bright_yellow()
-                            );
-                            print!("{}", " [y/N] ".dimmed());
-                            std::io::stdout().flush()?;
-                            let mut ans = String::new();
-                            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
-                            ans.trim().eq_ignore_ascii_case("y")
-                        }
+                    let decision = if kind == executor::CommandKind::ReadOnly {
+                        CommandDecision::Accept
+                    } else {
+                        Self::prompt_command_decision(cmd, &self.session_auto_accepts)?
                     };
 
-                    if approved {
-                        let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
-                        let turn_num = self.shell_turns.len() + 1;
-                        print!("{}", executor::format_shell_display(turn_num, cmd, &output));
-                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
-                        shell_results.push(format!("$ {}\n{}", cmd, output));
-                    } else {
-                        println!("{}", "  (skipped)".dimmed());
+                    match decision {
+                        CommandDecision::AcceptForSession => {
+                            self.session_auto_accepts.insert(cmd.clone());
+                            let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                            let turn_num = self.shell_turns.len() + 1;
+                            print!("{}", executor::format_shell_display(turn_num, cmd, &output));
+                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                            shell_results.push(format!("$ {}\n{}", cmd, output));
+                        }
+                        CommandDecision::Accept => {
+                            let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                            let turn_num = self.shell_turns.len() + 1;
+                            print!("{}", executor::format_shell_display(turn_num, cmd, &output));
+                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                            shell_results.push(format!("$ {}\n{}", cmd, output));
+                        }
+                        CommandDecision::Deny(reason) => {
+                            let entry = if reason.is_empty() {
+                                format!("[DENIED: {}] (no reason given)", cmd)
+                            } else {
+                                format!("[DENIED: {}]\nUser correction: {}", cmd, reason)
+                            };
+                            println!("{}", "  (denied)".dimmed());
+                            shell_results.push(entry);
+                        }
                     }
                 }
+                println!(); // blank line after shell output batch
 
                 if shell_results.is_empty() {
                     break;
