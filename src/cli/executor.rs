@@ -6,7 +6,19 @@ use std::process::Stdio;
 
 const MAX_PREVIEW_LINES: usize = 5;
 const MAX_OUTPUT_BYTES: usize = 8_000;
-const EXEC_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Programs known to take a long time — upgraded to LONG_TIMEOUT automatically.
+const LONG_RUNNING_PROGRAMS: &[&str] = &[
+    "cargo", "rustc", "npm", "yarn", "pnpm", "bun",
+    "pip", "pip3", "pip3.11", "poetry", "uv",
+    "make", "cmake", "ninja", "gradle", "mvn", "ant", "bazel", "buck", "meson",
+    "docker", "podman",
+    "nix", "nix-build", "nix-shell", "nixos-rebuild",
+    "go", "tsc", "webpack", "vite", "esbuild", "rollup",
+    "pytest", "jest", "cargo-test",
+];
 
 /// Sentinel strings used to delimit shell output from tracking lines.
 /// Double-underscored to reduce collision risk with real output.
@@ -86,10 +98,13 @@ impl Shell {
 
     /// Run a command. Returns `(output, exit_code)`.
     /// Working directory and environment persist across calls.
-    pub async fn run(&mut self, cmd: &str) -> Result<(String, i32)> {
+    /// Pass `None` for timeout to use auto-detection via `classify_timeout`.
+    pub async fn run(&mut self, cmd: &str, timeout_dur: Option<Duration>) -> Result<(String, i32)> {
         if self.process.is_none() {
             self.start().await?;
         }
+
+        let t = timeout_dur.unwrap_or_else(|| classify_timeout(cmd));
 
         // Write command followed by sentinels that capture exit code and cwd.
         {
@@ -106,11 +121,7 @@ impl Shell {
         let mut proc = self.process.take().unwrap();
         let cwd_snapshot = self.cwd.clone();
 
-        let read_result = timeout(
-            Duration::from_secs(EXEC_TIMEOUT_SECS),
-            collect_output(&mut proc, &cwd_snapshot),
-        )
-        .await;
+        let read_result = timeout(t, collect_output(&mut proc, &cwd_snapshot)).await;
 
         match read_result {
             Ok(Ok((output, code, new_cwd))) => {
@@ -127,11 +138,78 @@ impl Shell {
                 let _ = proc._child.kill().await;
                 let _ = self.start().await;
                 Ok((
-                    format!("[command timed out after {}s]", EXEC_TIMEOUT_SECS),
-                    1,
+                    format!("[command timed out after {}s — use bash-long for extended tasks]", t.as_secs()),
+                    124,
                 ))
             }
         }
+    }
+}
+
+/// Determine the appropriate execution timeout for a command block.
+/// Scans all non-comment lines; any line whose first meaningful token is a
+/// known long-running program upgrades the whole block to LONG_TIMEOUT.
+pub fn classify_timeout(cmd: &str) -> Duration {
+    for line in cmd.trim().lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Skip common wrappers and env-var assignments, find the real program.
+        let mut tokens = line.split_whitespace().peekable();
+        let program = loop {
+            match tokens.next() {
+                None => break None,
+                Some(tok) => match tok {
+                    "env" | "time" | "sudo" | "doas" | "nice" | "nohup" | "taskset" => continue,
+                    t if t.contains('=') && !t.starts_with('-') => continue,
+                    t => break Some(t.rsplit('/').next().unwrap_or(t)),
+                },
+            }
+        };
+        if let Some(prog) = program {
+            if LONG_RUNNING_PROGRAMS.contains(&prog) {
+                return LONG_TIMEOUT;
+            }
+        }
+    }
+    DEFAULT_TIMEOUT
+}
+
+/// Run a command in a fresh subshell with no persistent state (used for
+/// bash-parallel blocks). Returns `(output, exit_code)`.
+pub async fn run_stateless(cmd: &str) -> (String, i32) {
+    let result = timeout(
+        DEFAULT_TIMEOUT,
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(out)) => {
+            let mut output = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.is_empty() {
+                output.push_str(&stderr);
+            }
+            if output.len() > MAX_OUTPUT_BYTES {
+                let mut boundary = MAX_OUTPUT_BYTES;
+                while !output.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                output.truncate(boundary);
+                output.push_str("\n[output truncated]");
+            }
+            (output, out.status.code().unwrap_or(1))
+        }
+        Ok(Err(e)) => (format!("Error: {}", e), 1),
+        Err(_) => (
+            format!("[command timed out after {}s]", DEFAULT_TIMEOUT.as_secs()),
+            124,
+        ),
     }
 }
 

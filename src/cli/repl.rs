@@ -15,17 +15,33 @@ use crate::types::{Message, Task};
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
 
-/// Find the byte offset of a sync ` ```bash ` block (not ` ```bash-async `).
+/// Find the byte offset of a plain ` ```bash ` block — not bash-long or bash-parallel.
 fn find_sync_bash(s: &str) -> Option<usize> {
     let mut start = 0;
     while let Some(rel) = s[start..].find("```bash") {
         let abs = start + rel;
-        if !s[abs..].starts_with("```bash-async") {
+        let tail = &s[abs..];
+        if !tail.starts_with("```bash-long") && !tail.starts_with("```bash-parallel") {
             return Some(abs);
         }
         start = abs + 7;
     }
     None
+}
+
+/// Ordered action extracted from a streaming model response.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// Sequential command in the persistent shell; timeout auto-detected.
+    Bash(String),
+    /// Sequential command, extended (300 s) timeout for builds/installs.
+    BashLong(String),
+    /// Stateless command run in a fresh subshell, independent of session.
+    BashParallel(String),
+    /// JSON tool invocation (todo operations).
+    Tool(String),
+    /// Adversarial think request — spawns a critic model call.
+    Think(String),
 }
 
 /// Strip `**`, `*`, `` ` ``, `_` marker characters (used for heading text).
@@ -110,39 +126,38 @@ fn render_markdown_line(line: &str) -> String {
 
 /// State machine for streaming model responses.
 ///
-/// Handles four special regions transparently:
+/// Handles six special regions transparently:
 /// - `<think>...</think>` — printed dimmed, excluded from `clean_text`
-/// - ` ```bash...``` ` (sync) — silently captured; newlines before it are
-///   discarded so no blank gap appears where the block would have been
-/// - ` ```bash-async...``` ` — an inline `[⚡ cmd]` placeholder is printed;
-///   command captured in `bash_async_blocks` for execution after the response
-/// - ` ```tool...``` ` — silently captured as JSON tool calls; no display output
+/// - ` ```bash...``` ` (sync) — silently captured; blank gap suppressed
+/// - ` ```bash-long...``` ` — same as bash but uses extended timeout on run
+/// - ` ```bash-parallel...``` ` — runs in stateless subshell (not persistent)
+/// - ` ```tool...``` ` — silently captured as JSON tool calls
+/// - ` ```think...``` ` — silently captured as adversarial review requests
 ///
 /// Normal prose is rendered through `render_markdown_line` on a line-by-line
-/// basis so markdown formatting (bold, code, headings, lists) is properly
-/// displayed instead of showing raw markdown markers.
-///
-/// Trailing newlines at the end of the response are discarded to avoid a blank
-/// line between the model's prose and the shell-output display.
+/// basis. Trailing newlines are discarded to avoid blank lines after output.
 #[derive(Default)]
 struct ReplyStreamState {
     in_think: bool,
     in_bash: bool,
-    in_bash_async: bool,
+    in_bash_long: bool,
+    in_bash_parallel: bool,
     in_tool: bool,
+    in_think_fence: bool,
     showed_thinking: bool,
     pending: String,
     bash_block_buf: String,
-    bash_async_block_buf: String,
+    bash_long_block_buf: String,
+    bash_parallel_block_buf: String,
     tool_block_buf: String,
+    think_fence_buf: String,
     /// Accumulates the current incomplete line until a newline arrives.
     line_buf: String,
     /// Trailing newlines held back until we know what follows them.
     /// Discarded if a bash/tool block comes next; flushed before any content.
     deferred_newlines: usize,
-    pub bash_blocks: Vec<String>,
-    pub bash_async_blocks: Vec<String>,
-    pub tool_blocks: Vec<String>,
+    /// Ordered list of actions to execute after the response completes.
+    pub actions: Vec<Action>,
     pub clean_text: String,
 }
 
@@ -218,7 +233,7 @@ impl ReplyStreamState {
                     self.bash_block_buf.push_str(&self.pending[..pos]);
                     let cmd = self.bash_block_buf.trim().to_string();
                     if !cmd.is_empty() {
-                        self.bash_blocks.push(cmd);
+                        self.actions.push(Action::Bash(cmd));
                     }
                     self.bash_block_buf.clear();
                     self.in_bash = false;
@@ -231,10 +246,28 @@ impl ReplyStreamState {
                     }
                     break;
                 }
-            } else if self.in_bash_async {
+            } else if self.in_bash_long {
                 if let Some(pos) = self.pending.find("```") {
-                    self.bash_async_block_buf.push_str(&self.pending[..pos]);
-                    let cmd = self.bash_async_block_buf.trim().to_string();
+                    self.bash_long_block_buf.push_str(&self.pending[..pos]);
+                    let cmd = self.bash_long_block_buf.trim().to_string();
+                    if !cmd.is_empty() {
+                        self.actions.push(Action::BashLong(cmd));
+                    }
+                    self.bash_long_block_buf.clear();
+                    self.in_bash_long = false;
+                    self.pending = self.pending[pos + 3..].to_string();
+                } else {
+                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                    if safe > 0 {
+                        self.bash_long_block_buf.push_str(&self.pending[..safe]);
+                        self.pending = self.pending[safe..].to_string();
+                    }
+                    break;
+                }
+            } else if self.in_bash_parallel {
+                if let Some(pos) = self.pending.find("```") {
+                    self.bash_parallel_block_buf.push_str(&self.pending[..pos]);
+                    let cmd = self.bash_parallel_block_buf.trim().to_string();
                     if !cmd.is_empty() {
                         let preview: String = cmd.lines().next().unwrap_or("").chars().take(40).collect();
                         self.flush_deferred();
@@ -242,15 +275,15 @@ impl ReplyStreamState {
                         print!("{}", ph.yellow().dimmed());
                         std::io::stdout().flush().unwrap();
                         self.clean_text.push_str(&ph);
-                        self.bash_async_blocks.push(cmd);
+                        self.actions.push(Action::BashParallel(cmd));
                     }
-                    self.bash_async_block_buf.clear();
-                    self.in_bash_async = false;
+                    self.bash_parallel_block_buf.clear();
+                    self.in_bash_parallel = false;
                     self.pending = self.pending[pos + 3..].to_string();
                 } else {
                     let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
                     if safe > 0 {
-                        self.bash_async_block_buf.push_str(&self.pending[..safe]);
+                        self.bash_parallel_block_buf.push_str(&self.pending[..safe]);
                         self.pending = self.pending[safe..].to_string();
                     }
                     break;
@@ -260,7 +293,6 @@ impl ReplyStreamState {
                     self.tool_block_buf.push_str(&self.pending[..pos]);
                     let content = self.tool_block_buf.trim().to_string();
                     if !content.is_empty() {
-                        // Print inline placeholder showing which function was called
                         let fn_name = serde_json::from_str::<serde_json::Value>(&content)
                             .ok()
                             .and_then(|v| v["function"].as_str().map(|s| s.to_string()))
@@ -270,7 +302,7 @@ impl ReplyStreamState {
                         print!("{}", ph.yellow().dimmed());
                         std::io::stdout().flush().unwrap();
                         self.clean_text.push_str(&ph);
-                        self.tool_blocks.push(content);
+                        self.actions.push(Action::Tool(content));
                     }
                     self.tool_block_buf.clear();
                     self.in_tool = false;
@@ -279,6 +311,29 @@ impl ReplyStreamState {
                     let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
                     if safe > 0 {
                         self.tool_block_buf.push_str(&self.pending[..safe]);
+                        self.pending = self.pending[safe..].to_string();
+                    }
+                    break;
+                }
+            } else if self.in_think_fence {
+                if let Some(pos) = self.pending.find("```") {
+                    self.think_fence_buf.push_str(&self.pending[..pos]);
+                    let query = self.think_fence_buf.trim().to_string();
+                    if !query.is_empty() {
+                        self.flush_deferred();
+                        let ph = "[🧠 thinking...]";
+                        print!("{}", ph.cyan().dimmed());
+                        std::io::stdout().flush().unwrap();
+                        self.clean_text.push_str(ph);
+                        self.actions.push(Action::Think(query));
+                    }
+                    self.think_fence_buf.clear();
+                    self.in_think_fence = false;
+                    self.pending = self.pending[pos + 3..].to_string();
+                } else {
+                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                    if safe > 0 {
+                        self.think_fence_buf.push_str(&self.pending[..safe]);
                         self.pending = self.pending[safe..].to_string();
                     }
                     break;
@@ -302,18 +357,22 @@ impl ReplyStreamState {
                     break;
                 }
             } else {
-                let think_pos = self.pending.find("<think>");
-                let async_pos = self.pending.find("```bash-async");
-                let sync_pos  = find_sync_bash(&self.pending);
-                // "```tool" but not "```tool-" variants
-                let tool_pos  = self.pending.find("```tool")
+                let think_pos    = self.pending.find("<think>");
+                let parallel_pos = self.pending.find("```bash-parallel");
+                let long_pos     = self.pending.find("```bash-long");
+                let sync_pos     = find_sync_bash(&self.pending);
+                let tool_pos     = self.pending.find("```tool")
                     .filter(|&p| !self.pending[p..].starts_with("```tool-"));
+                let think_fence_pos = self.pending.find("```think")
+                    .filter(|&p| !self.pending[p..].starts_with("```think-"));
 
                 let first = [
-                    think_pos.map(|p| (0u8, p)),
-                    async_pos.map(|p| (1u8, p)),
-                    sync_pos .map(|p| (2u8, p)),
-                    tool_pos .map(|p| (3u8, p)),
+                    think_pos       .map(|p| (0u8, p)),
+                    parallel_pos    .map(|p| (1u8, p)),
+                    long_pos        .map(|p| (2u8, p)),
+                    sync_pos        .map(|p| (3u8, p)),
+                    tool_pos        .map(|p| (4u8, p)),
+                    think_fence_pos .map(|p| (5u8, p)),
                 ].iter().filter_map(|x| *x).min_by_key(|&(_, p)| p);
 
                 match first {
@@ -334,27 +393,41 @@ impl ReplyStreamState {
                     Some((1, pos)) => {
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
-                        self.in_bash_async = true;
-                        let rest = &self.pending[pos + "```bash-async".len()..];
+                        self.in_bash_parallel = true;
+                        let rest = &self.pending[pos + "```bash-parallel".len()..];
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     Some((2, pos)) => {
+                        let before = self.pending[..pos].to_string();
+                        self.flush_before_bash(&before);
+                        self.in_bash_long = true;
+                        let rest = &self.pending[pos + "```bash-long".len()..];
+                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+                    }
+                    Some((3, pos)) => {
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
                         self.in_bash = true;
                         let rest = &self.pending[pos + "```bash".len()..];
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
-                    Some((3, pos)) => {
+                    Some((4, pos)) => {
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
                         self.in_tool = true;
                         let rest = &self.pending[pos + "```tool".len()..];
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
+                    Some((5, pos)) => {
+                        let before = self.pending[..pos].to_string();
+                        self.flush_before_bash(&before);
+                        self.in_think_fence = true;
+                        let rest = &self.pending[pos + "```think".len()..];
+                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+                    }
                     _ => {
-                        // Keep enough bytes to detect the longest possible marker (13 chars for bash-async)
-                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
+                        // Keep enough bytes to detect the longest marker ("```bash-parallel" = 16)
+                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(16));
                         if safe > 0 {
                             let to_print = self.pending[..safe].to_string();
                             self.print_normal(&to_print);
@@ -368,7 +441,6 @@ impl ReplyStreamState {
     }
 
     pub fn flush(&mut self) {
-        // Flush any remaining line content first
         if !self.line_buf.is_empty() {
             let rendered = render_markdown_line(&self.line_buf);
             print!("{}", rendered);
@@ -376,10 +448,11 @@ impl ReplyStreamState {
             self.line_buf.clear();
             std::io::stdout().flush().unwrap();
         }
-        // Discard trailing deferred newlines (end-of-response whitespace)
         self.deferred_newlines = 0;
         if !self.pending.is_empty() {
-            if self.in_bash || self.in_bash_async || self.in_tool {
+            let in_any_block = self.in_bash || self.in_bash_long || self.in_bash_parallel
+                || self.in_tool || self.in_think_fence;
+            if in_any_block {
                 // Truncated/unclosed block — discard silently
             } else if self.in_think {
                 print!("{}", self.pending.dimmed());
@@ -396,8 +469,10 @@ impl ReplyStreamState {
             self.pending.clear();
         }
         self.bash_block_buf.clear();
-        self.bash_async_block_buf.clear();
+        self.bash_long_block_buf.clear();
+        self.bash_parallel_block_buf.clear();
         self.tool_block_buf.clear();
+        self.think_fence_buf.clear();
     }
 }
 
@@ -499,6 +574,8 @@ pub struct Repl {
     todos: Vec<Todo>,
     /// Summary of compacted conversation history, injected into system prompt.
     compacted_summary: Option<String>,
+    /// Prevents recursive think invocations.
+    is_thinking: bool,
 }
 
 impl Repl {
@@ -520,6 +597,7 @@ impl Repl {
             session_auto_accepts: HashSet::new(),
             todos: Vec::new(),
             compacted_summary: None,
+            is_thinking: false,
         })
     }
 
@@ -560,12 +638,18 @@ Prefer read-only exploration (ls, cat, grep) before modifying anything. \
 When multiple approaches exist, favor the safer or more reversible one. \
 Never run destructive commands (rm -rf, overwriting configs, etc.) without clear user intent. \
 Verify assumptions with a read-only check rather than assuming a path or argument is correct. \
-Check each result before proceeding to the next step in a sequence.
+Check each result before proceeding to the next step in a sequence. \
+For multi-step plans, destructive actions, or when uncertain: use the `think` tool to get an \
+adversarial critique of your plan before acting. This is the same rubber-duck process used in \
+advanced coding assistants — catching blind spots early prevents wasted effort.
 
-You have access to a `bash` tool and todo list tools. \
+You have access to a `bash` tool, a `think` tool, and todo list tools. \
 Read-only commands run automatically; commands that modify the system require user confirmation. \
 If a command is denied, a tool result will explain why — adjust your approach accordingly. \
 If a command fails, report the error output and ask the user how to proceed; don't retry silently.
+
+Think tool: pass a description of your plan or decision as `query`. You will receive an adversarial \
+critique pointing out risks and gaps. Use this before complex or risky actions.
 
 Todo list: todos persist with the session across saves and loads. Use them to track multi-step work. \
 Three operations — todo_add (title, optional description), todo_update (id and new status: \
@@ -584,28 +668,42 @@ Prefer read-only exploration (ls, cat, grep) before modifying anything. \
 When multiple approaches exist, favor the safer or more reversible one. \
 Never run destructive commands (rm -rf, overwriting configs, etc.) without clear user intent. \
 Verify assumptions with a read-only check rather than assuming a path or argument is correct. \
-Check each result before proceeding to the next step in a sequence.
+Check each result before proceeding to the next step in a sequence. \
+For multi-step plans, destructive actions, or when uncertain: use a `think` block to get an \
+adversarial critique before acting — catching blind spots early prevents wasted effort.
 
-You have access to a bash shell and a todo list through this interface. \
+You have access to a bash shell, a think block, and a todo list through this interface. \
 These are client-side features: the surrounding tool parses your code blocks and executes them. \
-You genuinely can run commands and manage todos — never tell the user you lack these capabilities.
+You genuinely can run commands, think critically, and manage todos — never tell the user you lack these capabilities.
 
-**Bash — sequential (`bash` blocks):** Place all bash blocks at the end of your response, after all prose. \
-The turn ends there, all blocks execute, and results are returned as a [Shell output] message.
+**Bash — sequential (`bash` block):** Place these at the end of your response, after all prose. \
+The turn ends there, all blocks execute in the persistent shell, and results return as [Shell output].
 
-**Bash — async (`bash-async` blocks):** May appear inline anywhere in your response; \
-a placeholder is shown when encountered; all async blocks run after your full response \
-and results are returned together.
+**Bash — extended timeout (`bash-long` block):** Identical to `bash` but uses a 300-second timeout. \
+Use for builds, package installs, nixos-rebuild, and other long-running commands.
+
+**Bash — parallel (`bash-parallel` block):** May appear inline anywhere in your response; \
+a placeholder is shown when encountered. Each block runs in an independent subshell with no \
+persistent state — use only for stateless, independent reads (e.g., checking multiple files). \
+All parallel blocks run after your full response and results return together.
 
 Read-only commands (ls, cat, grep, etc.) run automatically. Commands that modify the system \
 require user approval. If denied, [Shell output] will include `[DENIED: <cmd>]` with any \
-correction from the user. A bare denial with no text is a simple refusal — don't retry that command. \
+correction from the user — a bare denial means don't retry that command. \
+Non-zero exit codes appear as `[exit N]` next to the command. \
 If a command fails, report the error output and ask the user how to proceed; don't retry silently.
 
 When you receive [Shell output] messages, use them to continue reasoning. \
 Once you have what you need, give your final answer without any bash blocks.
 
-**Todo list:** Emit a fenced code block tagged `tool` containing a single JSON object:
+**Think block:** Emit a fenced `think` block containing a concise description of your plan or \
+decision. An adversarial critic reviews it and returns a critique in [Think result]. \
+Use before multi-step work, destructive commands, or when you are uncertain. Example:
+```think
+Plan: cd into src/, read all .rs files, then run cargo test. Concern: I don't know if tests pass currently.
+```
+
+**Todo list:** Emit a fenced `tool` block containing a single JSON object:
   todo_add:    {{\"function\":\"todo_add\",\"args\":{{\"title\":\"...\",\"description\":\"...\"}}}}
   todo_update: {{\"function\":\"todo_update\",\"args\":{{\"id\":\"<uuid>\",\"status\":\"done\"}}}}
   todo_list:   {{\"function\":\"todo_list\",\"args\":{{}}}}
@@ -1085,6 +1183,29 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 println!("{}", "✓ Session cleared".green());
                 Ok(true)
             }
+            Some("/think") => {
+                let query = parts[1..].join(" ");
+                if query.is_empty() {
+                    eprintln!("{}", "Usage: /think <question or plan to review>".yellow());
+                    return Ok(true);
+                }
+                // Find a model to use for the critic call
+                let task = crate::types::Task::new("think", &query);
+                let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+                    .cloned();
+                match model {
+                    None => eprintln!("{}", "No model available for think call".yellow()),
+                    Some(m) => {
+                        let result = Self::do_think_call(&mut self.is_thinking, &self.router, &m, &query).await;
+                        println!("\n{}", "🧠 Think result:".cyan().bold());
+                        for line in result.lines() {
+                            println!("  {}", render_markdown_line(line));
+                        }
+                        println!();
+                    }
+                }
+                Ok(true)
+            }
             Some("/exit") | Some("/quit") => {
                 println!("{}", "Goodbye!".bright_cyan());
                 Ok(false)
@@ -1153,6 +1274,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 // ── Function-calling path (TAMU / GitHub) ────────────────────────
                 let tools = vec![
                     ToolDefinition::bash(),
+                    ToolDefinition::think(),
                     ToolDefinition::todo_add(),
                     ToolDefinition::todo_update(),
                     ToolDefinition::todo_list(),
@@ -1203,18 +1325,20 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                 match decision {
                                     CommandDecision::AcceptForSession => {
                                         self.session_auto_accepts.insert(cmd.clone());
-                                        let (output, exit_code) = self.shell.run(&cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
+                                        let (output, exit_code) = self.shell.run(&cmd, None).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
                                         let turn_num = self.shell_turns.len() + 1;
                                         print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
                                         self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                                        let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
+                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}{}\n{}", cmd, exit_note, output)));
                                     }
                                     CommandDecision::Accept => {
-                                        let (output, exit_code) = self.shell.run(&cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
+                                        let (output, exit_code) = self.shell.run(&cmd, None).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
                                         let turn_num = self.shell_turns.len() + 1;
                                         print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
                                         self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
+                                        let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
+                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}{}\n{}", cmd, exit_note, output)));
                                     }
                                     CommandDecision::Deny(reason) => {
                                         let denial = if reason.is_empty() {
@@ -1227,8 +1351,25 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                     }
                                 }
                             }
+                            "think" => {
+                                let query = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                    .ok()
+                                    .and_then(|v| v["query"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| tc.arguments.clone());
+                                let tc_id = tc.id.clone();
+                                let result = Self::do_think_call(
+                                    &mut self.is_thinking, &self.router, &model, &query,
+                                ).await;
+                                if !result.starts_with("[Think") {
+                                    println!("\n{}", "🧠 Think result:".cyan().bold());
+                                    for line in result.lines() {
+                                        println!("  {}", render_markdown_line(line));
+                                    }
+                                    println!();
+                                }
+                                self.history.push(Message::tool_result(&tc_id, result));
+                            }
                             "todo_add" | "todo_update" | "todo_list" => {
-                                // Build a JSON dispatch object matching the text-model format
                                 let dispatch = serde_json::json!({
                                     "function": tc.name,
                                     "args": serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::Value::Object(Default::default()))
@@ -1301,9 +1442,9 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     StreamOutcome::Completed(raw, tokens) => (raw, tokens),
                 };
 
-                let (clean_response, bash_blocks, bash_async_blocks, tool_blocks) = {
+                let (clean_response, actions) = {
                     let s = state.lock().unwrap();
-                    (s.clean_text.clone(), s.bash_blocks.clone(), s.bash_async_blocks.clone(), s.tool_blocks.clone())
+                    (s.clean_text.clone(), s.actions.clone())
                 };
 
                 // Record usage
@@ -1313,9 +1454,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 // Store full raw response (including bash blocks) for cross-provider context
                 self.history.push(Message::assistant(raw_response.clone()));
 
-                // Merge sync and async blocks; sync blocks signal turn-ending intent
-                let all_blocks: Vec<String> = bash_blocks.iter().chain(bash_async_blocks.iter()).cloned().collect();
-                let has_any_action = !all_blocks.is_empty() || !tool_blocks.is_empty();
+                let has_any_action = !actions.is_empty();
                 if !has_any_action || tool_rounds >= MAX_TOOL_ROUNDS {
                     if tool_rounds >= MAX_TOOL_ROUNDS && has_any_action {
                         eprintln!("{} Shell round limit reached", "⚠".yellow());
@@ -1323,9 +1462,38 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     break;
                 }
 
-                // Execute each bash block and collect results
-                let mut shell_results = Vec::new();
-                for cmd in &all_blocks {
+                // Execute actions in source order
+                let mut shell_results: Vec<String> = Vec::new();
+                let mut tool_results: Vec<String> = Vec::new();
+                let mut think_results: Vec<String> = Vec::new();
+
+                for action in &actions {
+                    let (cmd, timeout, is_parallel) = match action {
+                        Action::Bash(c)         => (c, None, false),
+                        Action::BashLong(c)     => (c, Some(executor::LONG_TIMEOUT), false),
+                        Action::BashParallel(c) => (c, None, true),
+                        Action::Tool(json) => {
+                            let result_text = self.apply_todo_action(json);
+                            println!("{}", result_text.dimmed());
+                            tool_results.push(result_text);
+                            continue;
+                        }
+                        Action::Think(query) => {
+                            let result = Self::do_think_call(
+                                &mut self.is_thinking, &self.router, &model, query,
+                            ).await;
+                            if !result.starts_with("[Think") {
+                                println!("\n{}", "🧠 Think result:".cyan().bold());
+                                for line in result.lines() {
+                                    println!("  {}", render_markdown_line(line));
+                                }
+                                println!();
+                            }
+                            think_results.push(result);
+                            continue;
+                        }
+                    };
+
                     let kind = executor::classify(cmd);
                     let decision = if kind == executor::CommandKind::ReadOnly {
                         CommandDecision::Accept
@@ -1336,18 +1504,28 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     match decision {
                         CommandDecision::AcceptForSession => {
                             self.session_auto_accepts.insert(cmd.clone());
-                            let (output, exit_code) = self.shell.run(cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
+                            let (output, exit_code) = if is_parallel {
+                                executor::run_stateless(cmd).await
+                            } else {
+                                self.shell.run(cmd, timeout).await.unwrap_or_else(|e| (format!("Error: {}", e), 1))
+                            };
                             let turn_num = self.shell_turns.len() + 1;
                             print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
                             self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                            shell_results.push(format!("$ {}\n{}", cmd, output));
+                            let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
+                            shell_results.push(format!("$ {}{}\n{}", cmd, exit_note, output));
                         }
                         CommandDecision::Accept => {
-                            let (output, exit_code) = self.shell.run(cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
+                            let (output, exit_code) = if is_parallel {
+                                executor::run_stateless(cmd).await
+                            } else {
+                                self.shell.run(cmd, timeout).await.unwrap_or_else(|e| (format!("Error: {}", e), 1))
+                            };
                             let turn_num = self.shell_turns.len() + 1;
                             print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
                             self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                            shell_results.push(format!("$ {}\n{}", cmd, output));
+                            let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
+                            shell_results.push(format!("$ {}{}\n{}", cmd, exit_note, output));
                         }
                         CommandDecision::Deny(reason) => {
                             let entry = if reason.is_empty() {
@@ -1361,25 +1539,20 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     }
                 }
 
-                // Dispatch tool blocks (todo operations) — separate from shell output
-                let mut tool_results = Vec::new();
-                for json in &tool_blocks {
-                    let result_text = self.apply_todo_action(json);
-                    println!("{}", result_text.dimmed());
-                    tool_results.push(result_text);
-                }
-
-                if !all_blocks.is_empty() || !tool_blocks.is_empty() {
+                if !actions.is_empty() {
                     println!(); // blank line after action batch
                 }
 
-                // Build feedback message(s) — shell and tool results go in separate wrappers
+                // Build feedback message
                 let mut feedback_parts = Vec::new();
                 if !shell_results.is_empty() {
                     feedback_parts.push(format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n")));
                 }
                 if !tool_results.is_empty() {
                     feedback_parts.push(format!("[Tool output]\n{}\n[End of tool output]", tool_results.join("\n---\n")));
+                }
+                if !think_results.is_empty() {
+                    feedback_parts.push(format!("[Think result]\n{}\n[End of think result]", think_results.join("\n---\n")));
                 }
 
                 if feedback_parts.is_empty() {
@@ -1395,6 +1568,48 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         self.save_session();
 
         Ok(())
+    }
+
+    /// Adversarial critic prompt used for think calls.
+    const THINK_SYSTEM_PROMPT: &'static str = "\
+You are a critical reviewer. Your only job is to find flaws, gaps, edge cases, and risks \
+in the provided plan, approach, or decision. Be adversarial, thorough, and direct. \
+Do not be sycophantic. Never say the plan is good without substantial caveats. \
+Focus exclusively on what could go wrong, what is missing, or what should be reconsidered. \
+If the plan is sound, still find the weakest points and surface them. \
+Be concise — short paragraphs or bullet points. No preamble.";
+
+    /// Spawn a critic model call for adversarial review of a plan or decision.
+    /// Uses the current model but with a separate adversarial system prompt and
+    /// no conversation history. Protected by `is_thinking` to prevent recursion.
+    async fn do_think_call(
+        is_thinking: &mut bool,
+        router: &crate::router::Router,
+        model: &crate::types::ModelInfo,
+        query: &str,
+    ) -> String {
+        if *is_thinking {
+            return "[Think skipped — already thinking]".to_string();
+        }
+        *is_thinking = true;
+        println!("\n{}", "🧠 Consulting critic...".cyan().dimmed().italic());
+        std::io::stdout().flush().ok();
+
+        let messages = vec![
+            Message::system(Self::THINK_SYSTEM_PROMPT),
+            Message::user(query),
+        ];
+
+        let result = match router.find_provider_for_model(model) {
+            Some(provider) => provider.chat(model, &messages).await,
+            None => Err(anyhow::anyhow!("provider not found for think call")),
+        };
+
+        *is_thinking = false;
+        match result {
+            Ok(text) => text,
+            Err(e) => format!("[Think error: {}]", e),
+        }
     }
 
     fn format_usage_suffix(&mut self, provider_id: &crate::types::ProviderId) -> String {
@@ -1514,6 +1729,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         println!("  {} - Start a new conversation", "/new or /session new".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
         println!("  {} - Summarize and compact old history", "/compact".bright_white());
+        println!("  {} - Adversarial review of a plan or decision", "/think <question>".bright_white());
         println!("  {} - Show/add/update todos", "/todo [add|done|start|block|rm]".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();
@@ -1537,9 +1753,9 @@ mod tests {
     fn tool_block_captured_with_inline_placeholder() {
         let mut s = ReplyStreamState::default();
         feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nAfter");
-        assert_eq!(s.tool_blocks.len(), 1);
-        assert!(s.tool_blocks[0].contains("todo_list"));
-        // The raw JSON should not appear in clean_text, but the placeholder should
+        let tool_actions: Vec<_> = s.actions.iter().filter_map(|a| if let Action::Tool(j) = a { Some(j) } else { None }).collect();
+        assert_eq!(tool_actions.len(), 1);
+        assert!(tool_actions[0].contains("todo_list"));
         assert!(!s.clean_text.contains("\"function\""));
         assert!(s.clean_text.contains("[🔧 todo_list]"));
         assert!(s.clean_text.contains("Before"));
@@ -1549,28 +1765,30 @@ mod tests {
     #[test]
     fn tool_block_chunk_boundary() {
         let mut s = ReplyStreamState::default();
-        // Split across the opener
         s.process_chunk("```to");
         s.process_chunk("ol\n{\"function\":\"todo_add\",\"args\":{\"title\":\"x\"}}\n```");
         s.flush();
-        assert_eq!(s.tool_blocks.len(), 1);
+        let tool_count = s.actions.iter().filter(|a| matches!(a, Action::Tool(_))).count();
+        assert_eq!(tool_count, 1);
     }
 
     #[test]
     fn bash_and_tool_blocks_coexist() {
         let mut s = ReplyStreamState::default();
         feed(&mut s, "Text\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nMore\n```bash\nls\n```");
-        assert_eq!(s.tool_blocks.len(), 1);
-        assert_eq!(s.bash_blocks.len(), 1);
-        assert_eq!(s.bash_blocks[0], "ls");
+        let tool_count = s.actions.iter().filter(|a| matches!(a, Action::Tool(_))).count();
+        let bash_cmds: Vec<_> = s.actions.iter().filter_map(|a| if let Action::Bash(c) = a { Some(c) } else { None }).collect();
+        assert_eq!(tool_count, 1);
+        assert_eq!(bash_cmds.len(), 1);
+        assert_eq!(bash_cmds[0], "ls");
     }
 
     #[test]
     fn unclosed_tool_block_discarded() {
         let mut s = ReplyStreamState::default();
         feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\"");
-        // No closing ``` — should be silently discarded, not panic
-        assert_eq!(s.tool_blocks.len(), 0);
+        let tool_count = s.actions.iter().filter(|a| matches!(a, Action::Tool(_))).count();
+        assert_eq!(tool_count, 0);
         assert!(s.clean_text.contains("Before"));
     }
 }

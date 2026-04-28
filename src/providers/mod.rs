@@ -83,6 +83,25 @@ impl ToolDefinition {
             }),
         }
     }
+
+    pub fn think() -> Self {
+        Self {
+            name: "think".to_string(),
+            description: "Spawn an adversarial critic review of your current plan, approach, or a specific decision. \
+Use this before multi-step work, destructive commands, or when you are uncertain. \
+The reviewer is deliberately critical and will surface risks and gaps you may have missed.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to think about — your plan, a specific decision, or a risk to evaluate"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
 }
 
 /// Response from `call_with_tools` — either text or a list of tool calls
