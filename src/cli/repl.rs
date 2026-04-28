@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::session::{SessionStore, Todo, TodoStatus};
-use crate::cli::executor::{self, ShellTurn};
+use crate::cli::executor::{self, Shell, ShellTurn};
 use crate::providers::{ToolDefinition};
 use crate::router::Router;
 use crate::types::{Message, Task};
@@ -492,6 +492,7 @@ pub struct Repl {
     session_id: Option<String>,
     sessions_page: usize,
     shell_turns: Vec<ShellTurn>,
+    shell: Shell,
     /// Commands that have been accepted for the full session (exact match).
     session_auto_accepts: HashSet<String>,
     /// Todo list, persisted with the session.
@@ -501,9 +502,10 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn new(router: Router, config_dir: PathBuf) -> Result<Self> {
+    pub async fn new(router: Router, config_dir: PathBuf) -> Result<Self> {
         let usage_tracker = UsageTracker::new(&config_dir)?;
         let session_store = SessionStore::new(&config_dir)?;
+        let shell = Shell::new().await?;
         
         Ok(Self {
             router,
@@ -514,6 +516,7 @@ impl Repl {
             session_id: None,
             sessions_page: 0,
             shell_turns: Vec::new(),
+            shell,
             session_auto_accepts: HashSet::new(),
             todos: Vec::new(),
             compacted_summary: None,
@@ -521,11 +524,7 @@ impl Repl {
     }
 
     /// Build a capability-aware system prompt.
-    fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo], compacted_summary: Option<&str>) -> Message {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
-
+    fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo], compacted_summary: Option<&str>, cwd: &str) -> Message {
         let summary_section = match compacted_summary {
             Some(s) if !s.is_empty() => format!("\n\n## Earlier Conversation Summary\n{}", s),
             _ => String::new(),
@@ -636,19 +635,20 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
     }
 
     /// Reset all per-session state to a clean baseline.
-    fn reset_session_state(&mut self) {
+    async fn reset_session_state(&mut self) {
         self.history.clear();
         self.session_id = None;
         self.shell_turns.clear();
         self.session_auto_accepts.clear();
         self.todos.clear();
         self.compacted_summary = None;
+        self.shell.reset().await;
     }
 
     /// Load an existing session by ID, restoring conversation history and todos.
-    pub fn load_session(&mut self, session_id: &str) -> Result<()> {
+    pub async fn load_session(&mut self, session_id: &str) -> Result<()> {
         let session = self.session_store.load(session_id)?;
-        self.reset_session_state();
+        self.reset_session_state().await;
         self.history = session.messages;
         self.todos = session.todos;
         self.compacted_summary = session.compacted_summary;
@@ -828,10 +828,17 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         }
 
         let serialized = serialize_for_compaction(to_summarize);
+        let prior_context = match &self.compacted_summary {
+            Some(prev) if !prev.is_empty() => format!(
+                "Previous summary:\n{}\n\nNew messages to summarize:\n{}",
+                prev, serialized
+            ),
+            _ => serialized,
+        };
         let prompt = format!(
-            "Summarize the following conversation history concisely, preserving key decisions, \
-findings, and context that would be needed to continue. Omit pleasantries and filler:\n\n{}",
-            serialized
+            "Produce a single concise summary of all conversation history below, preserving key \
+decisions, findings, and context needed to continue. Omit pleasantries and filler:\n\n{}",
+            prior_context
         );
 
         // Grab model selection before the async borrow
@@ -873,12 +880,8 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
             return Ok(false);
         }
 
-        // Prepend any previous summary so history is never lost across multiple compactions.
-        let new_summary = match &self.compacted_summary {
-            Some(prev) => format!("{}\n\n{}", prev, summary_buf),
-            None => summary_buf,
-        };
-        self.compacted_summary = Some(new_summary);
+        // Replace previous summary with the new re-summarized version (bounded growth).
+        self.compacted_summary = Some(summary_buf);
         self.history.drain(0..boundary);
 
         // Reset again so future Outlier turns start with a clean server session.
@@ -940,7 +943,7 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
             }
             Some("/new") | Some("/session") if parts.get(1).map_or(true, |s| *s == "new") => {
                 self.router.reset_all_sessions().await;
-                self.reset_session_state();
+                self.reset_session_state().await;
                 println!("{}", "✓ Started new conversation".green());
                 Ok(true)
             }
@@ -970,7 +973,7 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
                     Some(n) => {
                         let meta = self.session_store.get_by_number(n)?;
                         self.router.reset_all_sessions().await;
-                        self.load_session(&meta.id)?;
+                        self.load_session(&meta.id).await?;
                     }
                     None => {
                         eprintln!("{}", "Usage: /load N  (use /sessions to see numbers)".yellow());
@@ -989,7 +992,12 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
                 match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
                     Some(n) if n >= 1 && n <= self.shell_turns.len() => {
                         let turn = &self.shell_turns[n - 1];
-                        println!("{} {} {}", "●".bright_cyan(), turn.cmd.bright_white(), format!("(shell #{})", n).dimmed());
+                        let exit_suffix = if turn.exit_code != 0 {
+                            format!(" {}", format!("[exit {}]", turn.exit_code).bright_red())
+                        } else {
+                            String::new()
+                        };
+                        println!("{} {}{} {}", "●".bright_cyan(), turn.cmd.bright_white(), exit_suffix, format!("(shell #{})", n).dimmed());
                         for line in turn.output.lines() {
                             println!("  {} {}", "│".dimmed(), line);
                         }
@@ -1072,8 +1080,9 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
                 Ok(true)
             }
             Some("/clear") => {
-                self.history.clear();
-                println!("{}", "History cleared".green());
+                self.router.reset_all_sessions().await;
+                self.reset_session_state().await;
+                println!("{}", "✓ Session cleared".green());
                 Ok(true)
             }
             Some("/exit") | Some("/quit") => {
@@ -1132,7 +1141,7 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
             }
 
             // Build messages: dynamic system prompt + history
-            let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos, self.compacted_summary.as_deref());
+            let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos, self.compacted_summary.as_deref(), &self.shell.cwd);
             let mut messages = vec![system_msg];
             messages.extend(self.history.clone());
 
@@ -1194,17 +1203,17 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
                                 match decision {
                                     CommandDecision::AcceptForSession => {
                                         self.session_auto_accepts.insert(cmd.clone());
-                                        let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                                        let (output, exit_code) = self.shell.run(&cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
                                         let turn_num = self.shell_turns.len() + 1;
-                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output));
-                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
+                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
                                         self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
                                     }
                                     CommandDecision::Accept => {
-                                        let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                                        let (output, exit_code) = self.shell.run(&cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
                                         let turn_num = self.shell_turns.len() + 1;
-                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output));
-                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
+                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
                                         self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
                                     }
                                     CommandDecision::Deny(reason) => {
@@ -1283,6 +1292,10 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
                     StreamOutcome::Cancelled => {
                         println!("{}", "(interrupted)".dimmed().italic());
                         println!();
+                        // Remove the dangling user message so the next turn isn't confused.
+                        if matches!(self.history.last().map(|m| &m.role), Some(crate::types::Role::User)) {
+                            self.history.pop();
+                        }
                         break;
                     }
                     StreamOutcome::Completed(raw, tokens) => (raw, tokens),
@@ -1323,17 +1336,17 @@ findings, and context that would be needed to continue. Omit pleasantries and fi
                     match decision {
                         CommandDecision::AcceptForSession => {
                             self.session_auto_accepts.insert(cmd.clone());
-                            let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                            let (output, exit_code) = self.shell.run(cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
                             let turn_num = self.shell_turns.len() + 1;
-                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output));
-                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
+                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
                             shell_results.push(format!("$ {}\n{}", cmd, output));
                         }
                         CommandDecision::Accept => {
-                            let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
+                            let (output, exit_code) = self.shell.run(cmd).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
                             let turn_num = self.shell_turns.len() + 1;
-                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output));
-                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
+                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
+                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
                             shell_results.push(format!("$ {}\n{}", cmd, output));
                         }
                         CommandDecision::Deny(reason) => {

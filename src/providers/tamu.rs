@@ -58,7 +58,11 @@ struct TamuStreamChunk {
 impl TamuProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("Failed to build HTTP client"),
             api_key,
             base_url: "https://chat-api.tamu.ai".to_string(),
         }

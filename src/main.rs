@@ -212,7 +212,7 @@ async fn run_chat(resume: bool) -> Result<()> {
     let _usage_tracker = UsageTracker::new(&config_dir)?;
     
     // Create and run REPL
-    let mut repl = Repl::new(router, config_dir)?;
+    let mut repl = Repl::new(router, config_dir).await?;
 
     // Handle --resume: show session picker before entering REPL
     if resume {
@@ -233,7 +233,7 @@ async fn run_chat(resume: bool) -> Result<()> {
             let input = input.trim();
             if let Ok(n) = input.parse::<usize>() {
                 if let Ok(meta) = session_store.get_by_number(n) {
-                    repl.load_session(&meta.id)?;
+                    repl.load_session(&meta.id).await?;
                 } else {
                     eprintln!("{}", "Invalid session number, starting fresh.".yellow());
                 }

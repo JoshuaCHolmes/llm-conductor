@@ -145,7 +145,10 @@ impl SessionStore {
             compacted_summary: compacted_summary.map(|s| s.to_string()),
         };
 
-        fs::write(&path, serde_json::to_string_pretty(&session)?)?;
+        // Atomic write: serialize to a temp file then rename
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, serde_json::to_string_pretty(&session)?)?;
+        fs::rename(&tmp_path, &path)?;
 
         // Update index
         self.update_index(&SessionMeta {
@@ -230,7 +233,10 @@ impl SessionStore {
         } else {
             index.push(meta.clone());
         }
-        fs::write(self.index_path(), serde_json::to_string_pretty(&index)?)?;
+        let idx_path = self.index_path();
+        let tmp_idx = idx_path.with_extension("json.tmp");
+        fs::write(&tmp_idx, serde_json::to_string_pretty(&index)?)?;
+        fs::rename(&tmp_idx, &idx_path)?;
         Ok(())
     }
 

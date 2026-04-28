@@ -50,7 +50,11 @@ struct GitHubStreamChunk {
 impl GitHubProvider {
     pub fn new(token: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("Failed to build HTTP client"),
             token,
         }
     }

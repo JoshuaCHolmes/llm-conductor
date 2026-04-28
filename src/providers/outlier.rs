@@ -371,9 +371,6 @@ impl Provider for OutlierProvider {
         
         let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
         
-        // Update last seen index to after assistant response
-        *self.last_seen_message_index.lock().await = messages.len() + 1;  // +1 for assistant response added by REPL
-        
         // Always send the turn request to get the AI response
         let url = format!(
             "{}/internal/experts/assistant/conversations/{}/turn-streaming",
@@ -442,6 +439,10 @@ impl Provider for OutlierProvider {
             }
         }
 
+        // Advance index only after confirmed successful response.
+        // +1 accounts for the assistant response that the REPL will append.
+        *self.last_seen_message_index.lock().await = messages.len() + 1;
+
         Ok(result)
     }
 
@@ -499,9 +500,6 @@ impl Provider for OutlierProvider {
         let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
         
         let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
-        
-        // Update last seen index to after assistant response
-        *self.last_seen_message_index.lock().await = messages.len() + 1;  // +1 for assistant response added by REPL
         
         // Always send the turn request to get the AI response
         let url = format!(
@@ -571,6 +569,9 @@ impl Provider for OutlierProvider {
                 }
             }
         }
+
+        // Advance index only after confirmed successful response.
+        *self.last_seen_message_index.lock().await = messages.len() + 1;
 
         Ok((full_content, None))
     }
