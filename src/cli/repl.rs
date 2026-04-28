@@ -405,11 +405,23 @@ impl ReplyStreamState {
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     Some((3, pos)) => {
+                        let after_start = pos + "```bash".len();
+                        let remaining = self.pending[after_start..].to_string();
+                        // Guard: need enough lookahead to rule out -long/-parallel suffix.
+                        // If remaining is empty or starts with '-' with < 9 chars, wait.
+                        if remaining.is_empty() || (remaining.starts_with('-') && remaining.len() < "-parallel".len()) {
+                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(16));
+                            if safe > 0 {
+                                let to_print = self.pending[..safe].to_string();
+                                self.print_normal(&to_print);
+                                self.pending = self.pending[safe..].to_string();
+                            }
+                            break;
+                        }
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
                         self.in_bash = true;
-                        let rest = &self.pending[pos + "```bash".len()..];
-                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+                        self.pending = if remaining.starts_with('\n') { remaining[1..].to_string() } else { remaining };
                     }
                     Some((4, pos)) => {
                         let before = self.pending[..pos].to_string();
@@ -978,6 +990,9 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             return Ok(false);
         }
 
+        let compact_tokens = (summary_buf.len() / 4) as u64;
+        self.usage_tracker.record_usage(m.provider.clone(), 1, compact_tokens, 0.0);
+
         // Replace previous summary with the new re-summarized version (bounded growth).
         self.compacted_summary = Some(summary_buf);
         self.history.drain(0..boundary);
@@ -1081,7 +1096,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             }
             Some("/compact") => {
                 match self.compact_history(true).await {
-                    Ok(_) => {}
+                    Ok(_) => { self.save_session(); }
                     Err(e) => eprintln!("{} Compaction error: {}", "⚠".yellow(), e),
                 }
                 Ok(true)
@@ -1196,7 +1211,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 match model {
                     None => eprintln!("{}", "No model available for think call".yellow()),
                     Some(m) => {
-                        let result = Self::do_think_call(&mut self.is_thinking, &self.router, &m, &query).await;
+                        let result = Self::do_think_call(&mut self.is_thinking, &self.router, &m, &query, &mut self.usage_tracker).await;
                         println!("\n{}", "🧠 Think result:".cyan().bold());
                         for line in result.lines() {
                             println!("  {}", render_markdown_line(line));
@@ -1359,6 +1374,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                 let tc_id = tc.id.clone();
                                 let result = Self::do_think_call(
                                     &mut self.is_thinking, &self.router, &model, &query,
+                                    &mut self.usage_tracker,
                                 ).await;
                                 if !result.starts_with("[Think") {
                                     println!("\n{}", "🧠 Think result:".cyan().bold());
@@ -1481,6 +1497,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         Action::Think(query) => {
                             let result = Self::do_think_call(
                                 &mut self.is_thinking, &self.router, &model, query,
+                                &mut self.usage_tracker,
                             ).await;
                             if !result.starts_with("[Think") {
                                 println!("\n{}", "🧠 Think result:".cyan().bold());
@@ -1587,6 +1604,7 @@ Be concise — short paragraphs or bullet points. No preamble.";
         router: &crate::router::Router,
         model: &crate::types::ModelInfo,
         query: &str,
+        usage_tracker: &mut UsageTracker,
     ) -> String {
         if *is_thinking {
             return "[Think skipped — already thinking]".to_string();
@@ -1607,7 +1625,11 @@ Be concise — short paragraphs or bullet points. No preamble.";
 
         *is_thinking = false;
         match result {
-            Ok(text) => text,
+            Ok(text) => {
+                let tokens = (text.len() / 4) as u64;
+                usage_tracker.record_usage(model.provider.clone(), 1, tokens, 0.0);
+                text
+            }
             Err(e) => format!("[Think error: {}]", e),
         }
     }

@@ -145,10 +145,15 @@ impl OutlierProvider {
                     *conv_id = Some(id.clone());
                     return Ok(id);
                 }
+                return Err(anyhow::anyhow!("Conversation created but no ID in response"));
             }
+            return Err(anyhow::anyhow!(
+                "Failed to create Outlier conversation: {}",
+                response.status()
+            ));
         }
 
-        // Fallback: fetch latest conversation
+        // Fallback: fetch latest conversation (only when no first_message provided)
         let url = format!("{}/internal/experts/assistant/conversations/", BASE_URL);
         let response = self
             .client
@@ -413,12 +418,16 @@ impl Provider for OutlierProvider {
 
         let mut result = String::new();
         let mut stream = response.bytes_stream();
+        let mut sse_buf = String::new();
 
         while let Some(chunk_result) = stream.next().await {
             let bytes = chunk_result?;
-            let text = String::from_utf8_lossy(&bytes);
+            sse_buf.push_str(&String::from_utf8_lossy(&bytes));
 
-            for line in text.lines() {
+            while let Some(nl) = sse_buf.find('\n') {
+                let line = sse_buf[..nl].trim_end_matches('\r').to_string();
+                sse_buf = sse_buf[nl + 1..].to_string();
+
                 if line.starts_with("data: ") {
                     let data = &line[6..];
                     if data == "[DONE]" {
@@ -543,12 +552,16 @@ impl Provider for OutlierProvider {
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
+        let mut sse_buf = String::new();
 
         while let Some(chunk_result) = stream.next().await {
             let bytes = chunk_result?;
-            let text = String::from_utf8_lossy(&bytes);
+            sse_buf.push_str(&String::from_utf8_lossy(&bytes));
 
-            for line in text.lines() {
+            while let Some(nl) = sse_buf.find('\n') {
+                let line = sse_buf[..nl].trim_end_matches('\r').to_string();
+                sse_buf = sse_buf[nl + 1..].to_string();
+
                 if line.starts_with("data: ") {
                     let data = &line[6..];
                     if data == "[DONE]" {
