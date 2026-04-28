@@ -177,7 +177,7 @@ pub fn classify_timeout(cmd: &str) -> Duration {
 }
 
 /// Run a command in a fresh subshell with no persistent state (used for
-/// bash-parallel blocks). Returns `(output, exit_code)`.
+/// bash-sub blocks). Returns `(output, exit_code)`.
 pub async fn run_stateless(cmd: &str) -> (String, i32) {
     let result = timeout(
         DEFAULT_TIMEOUT,

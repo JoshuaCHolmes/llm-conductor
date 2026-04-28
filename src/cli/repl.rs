@@ -15,13 +15,13 @@ use crate::types::{Message, Task};
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
 
-/// Find the byte offset of a plain ` ```bash ` block — not bash-long or bash-parallel.
+/// Find the byte offset of a plain ` ```bash ` block — not bash-long or bash-sub.
 fn find_sync_bash(s: &str) -> Option<usize> {
     let mut start = 0;
     while let Some(rel) = s[start..].find("```bash") {
         let abs = start + rel;
         let tail = &s[abs..];
-        if !tail.starts_with("```bash-long") && !tail.starts_with("```bash-parallel") {
+        if !tail.starts_with("```bash-long") && !tail.starts_with("```bash-sub") {
             return Some(abs);
         }
         start = abs + 7;
@@ -37,7 +37,7 @@ pub enum Action {
     /// Sequential command, extended (300 s) timeout for builds/installs.
     BashLong(String),
     /// Stateless command run in a fresh subshell, independent of session.
-    BashParallel(String),
+    BashSub(String),
     /// JSON tool invocation (todo operations).
     Tool(String),
     /// Adversarial think request — spawns a critic model call.
@@ -130,7 +130,7 @@ fn render_markdown_line(line: &str) -> String {
 /// - `<think>...</think>` — printed dimmed, excluded from `clean_text`
 /// - ` ```bash...``` ` (sync) — silently captured; blank gap suppressed
 /// - ` ```bash-long...``` ` — same as bash but uses extended timeout on run
-/// - ` ```bash-parallel...``` ` — runs in stateless subshell (not persistent)
+/// - ` ```bash-sub...``` ` — runs in stateless subshell (not persistent)
 /// - ` ```tool...``` ` — silently captured as JSON tool calls
 /// - ` ```think...``` ` — silently captured as adversarial review requests
 ///
@@ -141,14 +141,14 @@ struct ReplyStreamState {
     in_think: bool,
     in_bash: bool,
     in_bash_long: bool,
-    in_bash_parallel: bool,
+    in_bash_sub: bool,
     in_tool: bool,
     in_think_fence: bool,
     showed_thinking: bool,
     pending: String,
     bash_block_buf: String,
     bash_long_block_buf: String,
-    bash_parallel_block_buf: String,
+    bash_sub_block_buf: String,
     tool_block_buf: String,
     think_fence_buf: String,
     /// Accumulates the current incomplete line until a newline arrives.
@@ -264,10 +264,10 @@ impl ReplyStreamState {
                     }
                     break;
                 }
-            } else if self.in_bash_parallel {
+            } else if self.in_bash_sub {
                 if let Some(pos) = self.pending.find("```") {
-                    self.bash_parallel_block_buf.push_str(&self.pending[..pos]);
-                    let cmd = self.bash_parallel_block_buf.trim().to_string();
+                    self.bash_sub_block_buf.push_str(&self.pending[..pos]);
+                    let cmd = self.bash_sub_block_buf.trim().to_string();
                     if !cmd.is_empty() {
                         let preview: String = cmd.lines().next().unwrap_or("").chars().take(40).collect();
                         self.flush_deferred();
@@ -275,15 +275,15 @@ impl ReplyStreamState {
                         print!("{}", ph.yellow().dimmed());
                         std::io::stdout().flush().unwrap();
                         self.clean_text.push_str(&ph);
-                        self.actions.push(Action::BashParallel(cmd));
+                        self.actions.push(Action::BashSub(cmd));
                     }
-                    self.bash_parallel_block_buf.clear();
-                    self.in_bash_parallel = false;
+                    self.bash_sub_block_buf.clear();
+                    self.in_bash_sub = false;
                     self.pending = self.pending[pos + 3..].to_string();
                 } else {
                     let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
                     if safe > 0 {
-                        self.bash_parallel_block_buf.push_str(&self.pending[..safe]);
+                        self.bash_sub_block_buf.push_str(&self.pending[..safe]);
                         self.pending = self.pending[safe..].to_string();
                     }
                     break;
@@ -358,7 +358,7 @@ impl ReplyStreamState {
                 }
             } else {
                 let think_pos    = self.pending.find("<think>");
-                let parallel_pos = self.pending.find("```bash-parallel");
+                let sub_pos      = self.pending.find("```bash-sub");
                 let long_pos     = self.pending.find("```bash-long");
                 let sync_pos     = find_sync_bash(&self.pending);
                 let tool_pos     = self.pending.find("```tool")
@@ -368,7 +368,7 @@ impl ReplyStreamState {
 
                 let first = [
                     think_pos       .map(|p| (0u8, p)),
-                    parallel_pos    .map(|p| (1u8, p)),
+                    sub_pos         .map(|p| (1u8, p)),
                     long_pos        .map(|p| (2u8, p)),
                     sync_pos        .map(|p| (3u8, p)),
                     tool_pos        .map(|p| (4u8, p)),
@@ -393,8 +393,8 @@ impl ReplyStreamState {
                     Some((1, pos)) => {
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
-                        self.in_bash_parallel = true;
-                        let rest = &self.pending[pos + "```bash-parallel".len()..];
+                        self.in_bash_sub = true;
+                        let rest = &self.pending[pos + "```bash-sub".len()..];
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     Some((2, pos)) => {
@@ -407,10 +407,10 @@ impl ReplyStreamState {
                     Some((3, pos)) => {
                         let after_start = pos + "```bash".len();
                         let remaining = self.pending[after_start..].to_string();
-                        // Guard: need enough lookahead to rule out -long/-parallel suffix.
-                        // If remaining is empty or starts with '-' with < 9 chars, wait.
-                        if remaining.is_empty() || (remaining.starts_with('-') && remaining.len() < "-parallel".len()) {
-                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(16));
+                        // Guard: need enough lookahead to rule out -long/-sub suffix.
+                        // If remaining is empty or starts with '-' with < 5 chars, wait.
+                        if remaining.is_empty() || (remaining.starts_with('-') && remaining.len() < "-sub".len()) {
+                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(12));
                             if safe > 0 {
                                 let to_print = self.pending[..safe].to_string();
                                 self.print_normal(&to_print);
@@ -438,8 +438,8 @@ impl ReplyStreamState {
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     _ => {
-                        // Keep enough bytes to detect the longest marker ("```bash-parallel" = 16)
-                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(16));
+                        // Keep enough bytes to detect the longest marker ("```bash-long" = 12)
+                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(12));
                         if safe > 0 {
                             let to_print = self.pending[..safe].to_string();
                             self.print_normal(&to_print);
@@ -462,7 +462,7 @@ impl ReplyStreamState {
         }
         self.deferred_newlines = 0;
         if !self.pending.is_empty() {
-            let in_any_block = self.in_bash || self.in_bash_long || self.in_bash_parallel
+            let in_any_block = self.in_bash || self.in_bash_long || self.in_bash_sub
                 || self.in_tool || self.in_think_fence;
             if in_any_block {
                 // Truncated/unclosed block — discard silently
@@ -482,7 +482,7 @@ impl ReplyStreamState {
         }
         self.bash_block_buf.clear();
         self.bash_long_block_buf.clear();
-        self.bash_parallel_block_buf.clear();
+        self.bash_sub_block_buf.clear();
         self.tool_block_buf.clear();
         self.think_fence_buf.clear();
     }
@@ -694,10 +694,10 @@ The turn ends there, all blocks execute in the persistent shell, and results ret
 **Bash — extended timeout (`bash-long` block):** Identical to `bash` but uses a 300-second timeout. \
 Use for builds, package installs, nixos-rebuild, and other long-running commands.
 
-**Bash — parallel (`bash-parallel` block):** May appear inline anywhere in your response; \
+**Bash — subshell (`bash-sub` block):** May appear inline anywhere in your response; \
 a placeholder is shown when encountered. Each block runs in an independent subshell with no \
 persistent state — use only for stateless, independent reads (e.g., checking multiple files). \
-All parallel blocks run after your full response and results return together.
+All subshell blocks run after your full response and results return together.
 
 Read-only commands (ls, cat, grep, etc.) run automatically. Commands that modify the system \
 require user approval. If denied, [Shell output] will include `[DENIED: <cmd>]` with any \
@@ -1478,20 +1478,18 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     break;
                 }
 
-                // Execute actions in source order
-                let mut shell_results: Vec<String> = Vec::new();
-                let mut tool_results: Vec<String> = Vec::new();
-                let mut think_results: Vec<String> = Vec::new();
+                // Execute actions in source order, collecting feedback in that same order
+                let mut feedback_items: Vec<String> = Vec::new();
 
                 for action in &actions {
                     let (cmd, timeout, is_parallel) = match action {
                         Action::Bash(c)         => (c, None, false),
                         Action::BashLong(c)     => (c, Some(executor::LONG_TIMEOUT), false),
-                        Action::BashParallel(c) => (c, None, true),
+                        Action::BashSub(c) => (c, None, true),
                         Action::Tool(json) => {
                             let result_text = self.apply_todo_action(json);
                             println!("{}", result_text.dimmed());
-                            tool_results.push(result_text);
+                            feedback_items.push(format!("[Tool output]\n{}\n[End of tool output]", result_text));
                             continue;
                         }
                         Action::Think(query) => {
@@ -1506,7 +1504,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                 }
                                 println!();
                             }
-                            think_results.push(result);
+                            feedback_items.push(format!("[Think result]\n{}\n[End of think result]", result));
                             continue;
                         }
                     };
@@ -1530,7 +1528,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                             print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
                             self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
                             let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                            shell_results.push(format!("$ {}{}\n{}", cmd, exit_note, output));
+                            feedback_items.push(format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output));
                         }
                         CommandDecision::Accept => {
                             let (output, exit_code) = if is_parallel {
@@ -1542,7 +1540,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                             print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
                             self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
                             let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                            shell_results.push(format!("$ {}{}\n{}", cmd, exit_note, output));
+                            feedback_items.push(format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output));
                         }
                         CommandDecision::Deny(reason) => {
                             let entry = if reason.is_empty() {
@@ -1551,7 +1549,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                 format!("[DENIED: {}]\nUser correction: {}", cmd, reason)
                             };
                             println!("{}", "  (denied)".dimmed());
-                            shell_results.push(entry);
+                            feedback_items.push(format!("[Shell output]\n{}\n[End of shell output]", entry));
                         }
                     }
                 }
@@ -1560,23 +1558,12 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     println!(); // blank line after action batch
                 }
 
-                // Build feedback message
-                let mut feedback_parts = Vec::new();
-                if !shell_results.is_empty() {
-                    feedback_parts.push(format!("[Shell output]\n{}\n[End of shell output]", shell_results.join("\n---\n")));
-                }
-                if !tool_results.is_empty() {
-                    feedback_parts.push(format!("[Tool output]\n{}\n[End of tool output]", tool_results.join("\n---\n")));
-                }
-                if !think_results.is_empty() {
-                    feedback_parts.push(format!("[Think result]\n{}\n[End of think result]", think_results.join("\n---\n")));
-                }
-
-                if feedback_parts.is_empty() {
+                // Build feedback message preserving source order
+                if feedback_items.is_empty() {
                     break;
                 }
 
-                self.history.push(Message::user(feedback_parts.join("\n\n")));
+                self.history.push(Message::user(feedback_items.join("\n\n")));
                 tool_rounds += 1;
             }
         }
