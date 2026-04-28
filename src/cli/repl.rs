@@ -411,6 +411,78 @@ enum CommandDecision {
     Deny(String),
 }
 
+/// Estimated token count for a history slice (rough: 4 chars per token).
+fn estimated_tokens(history: &[Message]) -> usize {
+    history.iter().map(|m| m.content.len() / 4 + 10).sum()
+}
+
+/// Find a clean compaction split point: the first Role::User at or after
+/// `history.len() - desired_keep`. This ensures we never split a
+/// tool-call / tool-result group.
+fn find_compact_boundary(history: &[Message], desired_keep: usize) -> usize {
+    if history.len() <= desired_keep {
+        return 0;
+    }
+    let split = history.len() - desired_keep;
+    for i in split..history.len() {
+        if matches!(history[i].role, crate::types::Role::User) {
+            return i;
+        }
+    }
+    split
+}
+
+/// UTF-8-safe head+tail truncation for compaction serialization.
+fn summarize_content(s: &str) -> String {
+    const MAX: usize = 1500;
+    const TAIL: usize = 300;
+    let n = s.chars().count();
+    if n <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(MAX - TAIL - 3).collect();
+    let tail: String = s.chars().skip(n - TAIL).collect();
+    format!("{}…[…]…{}", head, tail)
+}
+
+/// Serialize a history slice to plain text for summarization.
+/// Handles tool calls and tool results explicitly.
+fn serialize_for_compaction(messages: &[Message]) -> String {
+    use crate::types::Role;
+    let mut parts = Vec::new();
+    for msg in messages {
+        match msg.role {
+            Role::System => continue,
+            Role::User => {
+                let content = summarize_content(&msg.content);
+                if !content.is_empty() {
+                    parts.push(format!("[User]: {}", content));
+                }
+            }
+            Role::Assistant => {
+                let mut label = "[Assistant]".to_string();
+                if let Some(ref calls) = msg.tool_calls {
+                    let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                    if !names.is_empty() {
+                        label = format!("[Assistant — called: {}]", names.join(", "));
+                    }
+                }
+                let content = summarize_content(&msg.content);
+                if !content.is_empty() {
+                    parts.push(format!("{}: {}", label, content));
+                } else {
+                    parts.push(label);
+                }
+            }
+            Role::Tool => {
+                let content = summarize_content(&msg.content);
+                parts.push(format!("[Tool result]: {}", content));
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
 pub struct Repl {
     router: Router,
     history: Vec<Message>,
@@ -424,6 +496,8 @@ pub struct Repl {
     session_auto_accepts: HashSet<String>,
     /// Todo list, persisted with the session.
     todos: Vec<Todo>,
+    /// Summary of compacted conversation history, injected into system prompt.
+    compacted_summary: Option<String>,
 }
 
 impl Repl {
@@ -442,14 +516,20 @@ impl Repl {
             shell_turns: Vec::new(),
             session_auto_accepts: HashSet::new(),
             todos: Vec::new(),
+            compacted_summary: None,
         })
     }
 
     /// Build a capability-aware system prompt.
-    fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo]) -> Message {
+    fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo], compacted_summary: Option<&str>) -> Message {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
+
+        let summary_section = match compacted_summary {
+            Some(s) if !s.is_empty() => format!("\n\n## Earlier Conversation Summary\n{}", s),
+            _ => String::new(),
+        };
 
         let todo_section = if todos.is_empty() {
             String::new()
@@ -490,7 +570,7 @@ If a command fails, report the error output and ask the user how to proceed; don
 
 Todo list: todos persist with the session across saves and loads. Use them to track multi-step work. \
 Three operations — todo_add (title, optional description), todo_update (id and new status: \
-pending/in_progress/done/blocked), todo_list. The id is the full UUID from todo_list output.{todo_section}")
+pending/in_progress/done/blocked), todo_list. The id is the full UUID from todo_list output.{summary_section}{todo_section}")
         } else {
             format!("\
 Environment: NixOS, WSL2, ARM64 (aarch64). Working directory: `{cwd}`. \
@@ -531,7 +611,7 @@ Once you have what you need, give your final answer without any bash blocks.
   todo_update: {{\"function\":\"todo_update\",\"args\":{{\"id\":\"<uuid>\",\"status\":\"done\"}}}}
   todo_list:   {{\"function\":\"todo_list\",\"args\":{{}}}}
 description is optional. Tool blocks execute immediately; results return in [Tool output] messages. \
-Todos persist with the session across saves and loads.{todo_section}")
+Todos persist with the session across saves and loads.{summary_section}{todo_section}")
         };
         Message::system(instructions)
     }
@@ -562,6 +642,7 @@ Todos persist with the session across saves and loads.{todo_section}")
         self.shell_turns.clear();
         self.session_auto_accepts.clear();
         self.todos.clear();
+        self.compacted_summary = None;
     }
 
     /// Load an existing session by ID, restoring conversation history and todos.
@@ -570,6 +651,7 @@ Todos persist with the session across saves and loads.{todo_section}")
         self.reset_session_state();
         self.history = session.messages;
         self.todos = session.todos;
+        self.compacted_summary = session.compacted_summary;
         self.session_id = Some(session_id.to_string());
         let todo_note = if self.todos.is_empty() {
             String::new()
@@ -586,7 +668,7 @@ Todos persist with the session across saves and loads.{todo_section}")
 
     /// Save current session state (history + todos).
     fn save_session(&mut self) {
-        match self.session_store.save(self.session_id.as_deref(), &self.history, &self.todos) {
+        match self.session_store.save(self.session_id.as_deref(), &self.history, &self.todos, self.compacted_summary.as_deref()) {
             Ok(id) => { self.session_id = Some(id); }
             Err(e) => eprintln!("{} Failed to save session: {}", "⚠".yellow(), e),
         }
@@ -718,7 +800,95 @@ Todos persist with the session across saves and loads.{todo_section}")
         
         Ok(())
     }
-    
+
+    /// Compact conversation history by summarizing old turns.
+    /// Returns true if compaction occurred.
+    async fn compact_history(&mut self, force: bool) -> Result<bool> {
+        const COMPACT_THRESHOLD_TOKENS: usize = 6_000;
+        const COMPACT_KEEP_RECENT: usize = 20;
+
+        let tokens = estimated_tokens(&self.history);
+        let should_compact = force || tokens > COMPACT_THRESHOLD_TOKENS || self.history.len() > 40;
+
+        if !should_compact {
+            return Ok(false);
+        }
+
+        let boundary = find_compact_boundary(&self.history, COMPACT_KEEP_RECENT);
+        if boundary == 0 && !force {
+            return Ok(false);
+        }
+
+        let to_summarize = &self.history[..boundary];
+        if to_summarize.is_empty() {
+            if force {
+                println!("{} Nothing to compact.", "ℹ".cyan());
+            }
+            return Ok(false);
+        }
+
+        let serialized = serialize_for_compaction(to_summarize);
+        let prompt = format!(
+            "Summarize the following conversation history concisely, preserving key decisions, \
+findings, and context that would be needed to continue. Omit pleasantries and filler:\n\n{}",
+            serialized
+        );
+
+        // Grab model selection before the async borrow
+        let task = Task::new("Compact history", &prompt);
+        let model_opt = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker).cloned();
+
+        let m = match model_opt {
+            None => {
+                eprintln!("{} No model available for compaction; skipping.", "⚠".yellow());
+                return Ok(false);
+            }
+            Some(m) => m,
+        };
+
+        // For Outlier: reset server-side session before sending the summary request.
+        self.router.reset_all_sessions().await;
+
+        let summary_msg = Message::user(&prompt);
+
+        let provider = self.router.find_provider_for_model(&m);
+        let stream_result = match provider {
+            None => {
+                eprintln!("{} Provider not found for compaction; skipping.", "⚠".yellow());
+                return Ok(false);
+            }
+            Some(p) => p.chat(&m, &[summary_msg]).await,
+        };
+
+        let summary_buf = match stream_result {
+            Err(e) => {
+                eprintln!("{} Compaction summary failed: {}; keeping full history.", "⚠".yellow(), e);
+                return Ok(false);
+            }
+            Ok(text) => text,
+        };
+
+        if summary_buf.is_empty() {
+            eprintln!("{} Compaction produced empty summary; keeping full history.", "⚠".yellow());
+            return Ok(false);
+        }
+
+        // Prepend any previous summary so history is never lost across multiple compactions.
+        let new_summary = match &self.compacted_summary {
+            Some(prev) => format!("{}\n\n{}", prev, summary_buf),
+            None => summary_buf,
+        };
+        self.compacted_summary = Some(new_summary);
+        self.history.drain(0..boundary);
+
+        // Reset again so future Outlier turns start with a clean server session.
+        self.router.reset_all_sessions().await;
+
+        println!("{} Compacted {} messages into summary ({} kept).",
+            "✓".bright_green(), boundary, self.history.len());
+        Ok(true)
+    }
+
     async fn handle_command(&mut self, command: &str) -> Result<bool> {
         let parts: Vec<&str> = command.split_whitespace().collect();
         
@@ -769,6 +939,7 @@ Todos persist with the session across saves and loads.{todo_section}")
                 Ok(true)
             }
             Some("/new") | Some("/session") if parts.get(1).map_or(true, |s| *s == "new") => {
+                self.router.reset_all_sessions().await;
                 self.reset_session_state();
                 println!("{}", "✓ Started new conversation".green());
                 Ok(true)
@@ -798,11 +969,19 @@ Todos persist with the session across saves and loads.{todo_section}")
                 match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
                     Some(n) => {
                         let meta = self.session_store.get_by_number(n)?;
+                        self.router.reset_all_sessions().await;
                         self.load_session(&meta.id)?;
                     }
                     None => {
                         eprintln!("{}", "Usage: /load N  (use /sessions to see numbers)".yellow());
                     }
+                }
+                Ok(true)
+            }
+            Some("/compact") => {
+                match self.compact_history(true).await {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{} Compaction error: {}", "⚠".yellow(), e),
                 }
                 Ok(true)
             }
@@ -912,6 +1091,11 @@ Todos persist with the session across saves and loads.{todo_section}")
         // Add user message to history
         self.history.push(Message::user(content));
 
+        // Auto-compact if history has grown large
+        if let Err(e) = self.compact_history(false).await {
+            eprintln!("{} Auto-compaction error: {}", "⚠".yellow(), e);
+        }
+
         const MAX_TOOL_ROUNDS: usize = 30; // safety limit; user confirmation is the primary gate
         let mut tool_rounds = 0;
 
@@ -948,7 +1132,7 @@ Todos persist with the session across saves and loads.{todo_section}")
             }
 
             // Build messages: dynamic system prompt + history
-            let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos);
+            let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos, self.compacted_summary.as_deref());
             let mut messages = vec![system_msg];
             messages.extend(self.history.clone());
 
@@ -1316,6 +1500,7 @@ Todos persist with the session across saves and loads.{todo_section}")
         println!("  {} - List saved sessions (> / < to page)", "/sessions".bright_white());
         println!("  {} - Start a new conversation", "/new or /session new".bright_white());
         println!("  {} - Clear conversation history", "/clear".bright_white());
+        println!("  {} - Summarize and compact old history", "/compact".bright_white());
         println!("  {} - Show/add/update todos", "/todo [add|done|start|block|rm]".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();

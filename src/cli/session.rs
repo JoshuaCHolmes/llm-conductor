@@ -84,6 +84,9 @@ pub struct SessionFile {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// Summary of history that was compacted away. Injected into system prompt on resume.
+    #[serde(default)]
+    pub compacted_summary: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -108,7 +111,7 @@ impl SessionStore {
     }
 
     /// Save or update a session. Returns the session ID (created on first save).
-    pub fn save(&self, session_id: Option<&str>, messages: &[Message], todos: &[Todo]) -> Result<String> {
+    pub fn save(&self, session_id: Option<&str>, messages: &[Message], todos: &[Todo], compacted_summary: Option<&str>) -> Result<String> {
         let id = session_id
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -139,6 +142,7 @@ impl SessionStore {
             updated_at: Utc::now(),
             messages: messages.to_vec(),
             todos: todos.to_vec(),
+            compacted_summary: compacted_summary.map(|s| s.to_string()),
         };
 
         fs::write(&path, serde_json::to_string_pretty(&session)?)?;
@@ -259,7 +263,7 @@ mod tests {
 
         // First save — no id yet, should create a new slot
         let msgs1 = vec![msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
-        let id = store.save(None, &msgs1, &[]).unwrap();
+        let id = store.save(None, &msgs1, &[], None).unwrap();
 
         // Verify single entry in index
         assert_eq!(store.list().unwrap().len(), 1);
@@ -271,7 +275,7 @@ mod tests {
             msg(Role::User, "second turn"),
             msg(Role::Assistant, "still here"),
         ];
-        let id2 = store.save(Some(&id), &msgs2, &[]).unwrap();
+        let id2 = store.save(Some(&id), &msgs2, &[], None).unwrap();
 
         // Must reuse the same id and not create a new slot
         assert_eq!(id, id2, "resumed save should reuse the same session id");
@@ -288,7 +292,7 @@ mod tests {
         let store = make_store(&dir);
 
         let todos = vec![Todo::new("Task A", None), Todo::new("Task B", Some("do the thing"))];
-        let id = store.save(None, &[], &todos).unwrap();
+        let id = store.save(None, &[], &todos, None).unwrap();
 
         let loaded = store.load(&id).unwrap();
         assert_eq!(loaded.todos.len(), 2);
@@ -322,10 +326,10 @@ mod tests {
         let store = make_store(&dir);
 
         let msgs = vec![msg(Role::User, "turn 1"), msg(Role::Assistant, "a")];
-        store.save(None, &msgs, &[]).unwrap();
+        store.save(None, &msgs, &[], None).unwrap();
 
         let msgs2 = vec![msg(Role::User, "turn 2"), msg(Role::Assistant, "b")];
-        store.save(None, &msgs2, &[]).unwrap();
+        store.save(None, &msgs2, &[], None).unwrap();
 
         assert_eq!(store.list().unwrap().len(), 2, "two fresh sessions should produce two slots");
     }

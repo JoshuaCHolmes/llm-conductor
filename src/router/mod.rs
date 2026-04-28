@@ -104,12 +104,10 @@ impl Router {
         self.available_models.iter().find(|m| m.name == name)
     }
     
-    /// Clear any cached state in providers (like Outlier conversations)
-    pub async fn clear_provider_state(&self) {
+    /// Reset server-side session state in all providers (e.g. Outlier conversation IDs).
+    pub async fn reset_all_sessions(&self) {
         for provider in &self.providers {
-            // Check if this is an OutlierProvider - we need downcasting
-            // For now, we'll just handle this via a trait method
-            // TODO: Add clear_state() to Provider trait
+            provider.reset_session().await;
         }
     }
     

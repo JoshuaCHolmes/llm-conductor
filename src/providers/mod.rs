@@ -126,4 +126,8 @@ pub trait Provider: Send + Sync {
 
     /// Check if provider is available/healthy
     async fn health_check(&self) -> Result<bool>;
+
+    /// Reset any server-side session state (e.g. Outlier conversation ID).
+    /// Default is a no-op; only providers with server-side sessions need to override.
+    async fn reset_session(&self) {}
 }

@@ -588,4 +588,8 @@ impl Provider for OutlierProvider {
 
         Ok(response.status().is_success())
     }
+
+    async fn reset_session(&self) {
+        self.clear_conversation().await;
+    }
 }
