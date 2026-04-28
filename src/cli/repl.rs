@@ -259,6 +259,16 @@ impl ReplyStreamState {
                     self.tool_block_buf.push_str(&self.pending[..pos]);
                     let content = self.tool_block_buf.trim().to_string();
                     if !content.is_empty() {
+                        // Print inline placeholder showing which function was called
+                        let fn_name = serde_json::from_str::<serde_json::Value>(&content)
+                            .ok()
+                            .and_then(|v| v["function"].as_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "tool".to_string());
+                        self.flush_deferred();
+                        let ph = format!("[🔧 {}]", fn_name);
+                        print!("{}", ph.yellow().dimmed());
+                        std::io::stdout().flush().unwrap();
+                        self.clean_text.push_str(&ph);
                         self.tool_blocks.push(content);
                     }
                     self.tool_block_buf.clear();
@@ -438,8 +448,11 @@ impl Repl {
     fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo]) -> Message {
         let env_context = "\
 You are running on NixOS inside WSL2 on an ARM64 (aarch64) machine. \
-If a program is missing, it can be installed with `nix-shell -p <package>`. \
-Write concise code and direct answers. Avoid verbose explanations unless the user asks for them.";
+If a required program is missing, it can be installed temporarily with `nix-shell -p <package>`. \
+Write concise code and direct answers. Avoid verbose explanations unless asked. \
+When writing code or answering questions, do not mention or attribute AI, Copilot, or LLM assistance \
+in source code comments, commit messages, documentation, or any other output. \
+Similarly, do not add co-authorship lines for AI tools to git commits.";
 
         let todo_section = if todos.is_empty() {
             String::new()
@@ -487,8 +500,9 @@ message will say `[DENIED: <cmd>]` with the user's correction — adjust your ap
 A bare refusal with no text means the user does not want that command run.\n\n\
 When you receive `[Shell output]` messages, use them to continue. Once you have \
 what you need, give your final answer with no bash blocks.\n\n\
-**Todo list (```tool):** To manage tasks, emit a ```tool block containing JSON like:\n\
-```tool\n{{\"function\": \"todo_add\", \"args\": {{\"title\": \"my task\"}}}}\n```\n\
+**Todo list (tool block):** To manage tasks, emit a tool block (triple backtick + \"tool\") \
+containing JSON like:\n\
+```\n{{\"function\": \"todo_add\", \"args\": {{\"title\": \"my task\"}}}}\n```\n\
 or: `todo_update(id, status)`, `todo_list()`. Tool blocks are silently executed and \
 results are returned in `[Tool output]` messages.{}{}",
                 env_context, todo_tool_desc, todo_section)
@@ -664,7 +678,13 @@ results are returned in `[Tool output]` messages.{}{}",
                         eprintln!("{} {}", "Error:".bright_red(), e);
                     }
                 }
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    // Ctrl+C — cancel current line, stay in the loop
+                    println!();
+                    continue;
+                }
                 Err(_) => {
+                    // Ctrl+D / EOF — exit
                     break;
                 }
             }
@@ -966,14 +986,14 @@ results are returned in `[Tool output]` messages.{}{}",
                                         self.session_auto_accepts.insert(cmd.clone());
                                         let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
                                         let turn_num = self.shell_turns.len() + 1;
-                                        print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output));
                                         self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
                                         self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
                                     }
                                     CommandDecision::Accept => {
                                         let output = executor::execute(&cmd).unwrap_or_else(|e| format!("Error: {}", e));
                                         let turn_num = self.shell_turns.len() + 1;
-                                        print!("{}", executor::format_shell_display(turn_num, &cmd, &output));
+                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output));
                                         self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
                                         self.history.push(Message::tool_result(&tc.id, format!("$ {}\n{}", cmd, output)));
                                     }
@@ -1066,14 +1086,14 @@ results are returned in `[Tool output]` messages.{}{}",
                             self.session_auto_accepts.insert(cmd.clone());
                             let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
                             let turn_num = self.shell_turns.len() + 1;
-                            print!("{}", executor::format_shell_display(turn_num, cmd, &output));
+                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output));
                             self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
                             shell_results.push(format!("$ {}\n{}", cmd, output));
                         }
                         CommandDecision::Accept => {
                             let output = executor::execute(cmd).unwrap_or_else(|e| format!("Error: {}", e));
                             let turn_num = self.shell_turns.len() + 1;
-                            print!("{}", executor::format_shell_display(turn_num, cmd, &output));
+                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output));
                             self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone() });
                             shell_results.push(format!("$ {}\n{}", cmd, output));
                         }
@@ -1261,13 +1281,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_block_captured_silently() {
+    fn tool_block_captured_with_inline_placeholder() {
         let mut s = ReplyStreamState::default();
         feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nAfter");
         assert_eq!(s.tool_blocks.len(), 1);
         assert!(s.tool_blocks[0].contains("todo_list"));
-        // tool block content must not appear in clean_text
-        assert!(!s.clean_text.contains("todo_list"));
+        // The raw JSON should not appear in clean_text, but the placeholder should
+        assert!(!s.clean_text.contains("\"function\""));
+        assert!(s.clean_text.contains("[🔧 todo_list]"));
         assert!(s.clean_text.contains("Before"));
         assert!(s.clean_text.contains("After"));
     }
