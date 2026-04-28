@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::session::{SessionStore, Todo, TodoStatus};
 use crate::cli::executor::{self, ShellTurn};
@@ -446,13 +447,20 @@ impl Repl {
 
     /// Build a capability-aware system prompt.
     fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo]) -> Message {
-        let env_context = "\
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let env_context = format!("\
 You are running on NixOS inside WSL2 on an ARM64 (aarch64) machine. \
+Current working directory: `{}`. \
 If a required program is missing, it can be installed temporarily with `nix-shell -p <package>`. \
 Write concise code and direct answers. Avoid verbose explanations unless asked. \
-When writing code or answering questions, do not mention or attribute AI, Copilot, or LLM assistance \
-in source code comments, commit messages, documentation, or any other output. \
-Similarly, do not add co-authorship lines for AI tools to git commits.";
+Do not mention or attribute AI, Copilot, or LLM assistance in source code comments, \
+commit messages, documentation, or any other output. \
+Do not add co-authorship lines for AI tools to git commits.\n\n\
+When a shell command fails or returns an error, report the error output and ask the user \
+how to proceed rather than retrying silently or guessing at a fix.", cwd);
 
         let todo_section = if todos.is_empty() {
             String::new()
@@ -471,11 +479,12 @@ Similarly, do not add co-authorship lines for AI tools to git commits.";
         };
 
         let todo_tool_desc = "\n\n\
-You have access to a todo list tool to track tasks for this session. \
-Use it to organize multi-step work. Available functions:\n\
+You have access to a todo list tool. Todos persist with the session across saves and loads. \
+Use it to track multi-step work. Available operations:\n\
 - `todo_add(title, description?)` — create a new task\n\
-- `todo_update(id, status)` — set status to pending/in_progress/done/blocked\n\
-- `todo_list()` — get the current list";
+- `todo_update(id, status)` — update status: pending / in_progress / done / blocked\n\
+- `todo_list()` — get current list\n\
+The `id` field is the full UUID from todo_list output. All operations use JSON (see below).";
 
         let instructions = if supports_tool_calling {
             format!("{}\n\n\
@@ -500,11 +509,13 @@ message will say `[DENIED: <cmd>]` with the user's correction — adjust your ap
 A bare refusal with no text means the user does not want that command run.\n\n\
 When you receive `[Shell output]` messages, use them to continue. Once you have \
 what you need, give your final answer with no bash blocks.\n\n\
-**Todo list (tool block):** To manage tasks, emit a tool block (triple backtick + \"tool\") \
-containing JSON like:\n\
-```\n{{\"function\": \"todo_add\", \"args\": {{\"title\": \"my task\"}}}}\n```\n\
-or: `todo_update(id, status)`, `todo_list()`. Tool blocks are silently executed and \
-results are returned in `[Tool output]` messages.{}{}",
+**Todo list (tool block):** Emit a fenced code block with language tag \"tool\" containing \
+a single JSON object. All three operations use this format:\n\
+  todo_add:    {{\"function\":\"todo_add\",\"args\":{{\"title\":\"...\",\"description\":\"...\"}}}}\n\
+  todo_update: {{\"function\":\"todo_update\",\"args\":{{\"id\":\"<uuid>\",\"status\":\"done\"}}}}\n\
+  todo_list:   {{\"function\":\"todo_list\",\"args\":{{}}}}\n\
+The description field is optional. Tool blocks are executed immediately and results are \
+returned in `[Tool output]` messages. Todos persist with the session.{}{}",
                 env_context, todo_tool_desc, todo_section)
         };
         Message::system(instructions)
@@ -1042,12 +1053,40 @@ results are returned in `[Tool output]` messages.{}{}",
                     state_cb.lock().unwrap().process_chunk(&chunk);
                 };
 
-                let (raw_response, token_count) = provider.chat_stream(&model, &messages, Box::new(callback)).await?;
+                // Watch for Escape key to cancel the stream
+                let stop_watcher = Arc::new(AtomicBool::new(false));
+                let cancel_rx = crate::cli::tty::spawn_esc_watcher(stop_watcher.clone());
+
+                enum StreamOutcome {
+                    Completed(String, Option<u64>),
+                    Cancelled,
+                }
+
+                let outcome = tokio::select! {
+                    result = provider.chat_stream(&model, &messages, Box::new(callback)) => {
+                        stop_watcher.store(true, Ordering::Relaxed);
+                        let (raw, tokens) = result?;
+                        StreamOutcome::Completed(raw, tokens)
+                    }
+                    _ = cancel_rx => {
+                        stop_watcher.store(true, Ordering::Relaxed);
+                        StreamOutcome::Cancelled
+                    }
+                };
+
                 {
                     let mut s = state.lock().unwrap();
                     s.flush();
                 }
                 println!();
+
+                let (raw_response, token_count) = match outcome {
+                    StreamOutcome::Cancelled => {
+                        println!("{}", "(interrupted)".dimmed().italic());
+                        break;
+                    }
+                    StreamOutcome::Completed(raw, tokens) => (raw, tokens),
+                };
 
                 let (clean_response, bash_blocks, bash_async_blocks, tool_blocks) = {
                     let s = state.lock().unwrap();

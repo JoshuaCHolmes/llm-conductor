@@ -877,6 +877,7 @@ dependencies = [
  "futures",
  "futures-util",
  "indicatif",
+ "libc",
  "parking_lot",
  "reqwest",
  "rustyline",
