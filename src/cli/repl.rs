@@ -90,6 +90,39 @@ fn render_inline(s: &str) -> String {
     out
 }
 
+/// Strip raw action fence blocks from a stored assistant message for display.
+/// Removes ```bash, ```bash-long, ```bash-sub, ```tool, ```rubberduck blocks entirely.
+fn strip_action_fences(text: &str) -> String {
+    let fences = ["```bash-long", "```bash-sub", "```bash", "```tool", "```rubberduck"];
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text;
+    'outer: while !chars.is_empty() {
+        for fence in &fences {
+            if chars.starts_with(fence) {
+                // Skip to closing ```
+                if let Some(end) = chars[fence.len()..].find("\n```") {
+                    chars = &chars[fence.len() + end + 4..]; // skip past closing ```
+                    // eat leading newline if present
+                    chars = chars.strip_prefix('\n').unwrap_or(chars);
+                } else {
+                    // No closing fence — drop the rest
+                    chars = "";
+                }
+                continue 'outer;
+            }
+        }
+        // Emit up to next newline (or end)
+        if let Some(nl) = chars.find('\n') {
+            out.push_str(&chars[..nl + 1]);
+            chars = &chars[nl + 1..];
+        } else {
+            out.push_str(chars);
+            break;
+        }
+    }
+    out
+}
+
 /// Render a complete buffered line with markdown formatting to a display string.
 fn render_markdown_line(line: &str) -> String {
     // Headings: strip markers, apply bold+bright_white
@@ -776,37 +809,38 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         );
         println!();
 
-        // Print the last few turns so the user can re-orient
+        // Print the last 3 User+Assistant turns fully, styled like live output
         let display_msgs: Vec<&Message> = self.history.iter()
             .filter(|m| matches!(m.role, Role::User | Role::Assistant))
             .filter(|m| m.source.as_deref().map(|s| !s.starts_with("conductor/")).unwrap_or(true))
             .collect();
-        let start = display_msgs.len().saturating_sub(6);
+        let start = display_msgs.len().saturating_sub(6); // up to 3 turns (user+assistant each)
         let recent = &display_msgs[start..];
         if !recent.is_empty() {
-            println!("{}", "── Recent conversation ──────────────────────".dimmed());
+            println!("{}", "── Resuming conversation ────────────────────".dimmed());
+            println!();
             for msg in recent {
                 match msg.role {
                     Role::User => {
-                        let preview = if msg.content.len() > 400 {
-                            format!("{}…", &msg.content[..400])
-                        } else {
-                            msg.content.clone()
-                        };
-                        println!("{} {}", "You:".bright_white().bold(), preview.trim());
+                        print!("{} ", "❯".bright_blue().bold());
+                        println!("{}", msg.content.trim());
+                        println!();
                     }
                     Role::Assistant => {
-                        let source_label = msg.source.as_deref().unwrap_or("assistant");
-                        let preview = if msg.content.len() > 600 {
-                            format!("{}…", &msg.content[..600])
-                        } else {
-                            msg.content.clone()
-                        };
-                        println!("{} {}", format!("{}:", source_label).cyan().bold(), preview.trim());
+                        print!("{} ", "❯".bright_green().bold());
+                        // Strip raw code fence blocks (bash/tool/rubberduck) — noise on replay
+                        let content = strip_action_fences(&msg.content);
+                        let mut lines = content.trim().lines();
+                        if let Some(first_line) = lines.next() {
+                            println!("{}", render_markdown_line(first_line));
+                        }
+                        for line in lines {
+                            println!("{}", render_markdown_line(line));
+                        }
+                        println!();
                     }
                     _ => {}
                 }
-                println!();
             }
             println!("{}", "─────────────────────────────────────────────".dimmed());
             println!();
