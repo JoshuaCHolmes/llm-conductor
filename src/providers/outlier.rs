@@ -606,4 +606,25 @@ impl Provider for OutlierProvider {
     async fn reset_session(&self) {
         self.clear_conversation().await;
     }
+
+    /// Isolated single-shot chat: saves conversation state, forces a fresh conversation,
+    /// calls chat(), then restores the original conversation state.
+    /// This ensures critic/think calls don't corrupt last_seen or bleed into the main session.
+    async fn isolated_chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
+        // Save current state
+        let saved_conv_id = self.conversation_id.lock().await.clone();
+        let saved_last_seen = *self.last_seen_message_index.lock().await;
+
+        // Force fresh conversation for this isolated call
+        *self.conversation_id.lock().await = None;
+        *self.last_seen_message_index.lock().await = 0;
+
+        let result = self.chat(model, messages).await;
+
+        // Restore original state regardless of outcome
+        *self.conversation_id.lock().await = saved_conv_id;
+        *self.last_seen_message_index.lock().await = saved_last_seen;
+
+        result
+    }
 }

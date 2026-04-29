@@ -22,6 +22,10 @@ pub struct Message {
     /// Ties a Role::Tool message back to the assistant tool call that triggered it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Provenance: who/what produced this message.
+    /// E.g. "user", "outlier/claude-opus-4.6", "github/gpt-4o", "conductor/feedback", "conductor/rubberduck-result"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Role of a message sender
@@ -52,6 +56,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            source: None,
         }
     }
 
@@ -61,6 +66,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            source: None,
         }
     }
 
@@ -70,6 +76,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            source: None,
         }
     }
 
@@ -80,6 +87,7 @@ impl Message {
             content: content.into(),
             tool_calls: Some(tool_calls),
             tool_call_id: None,
+            source: None,
         }
     }
 
@@ -90,7 +98,14 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
+            source: None,
         }
+    }
+
+    /// Attach a source label to this message (builder pattern)
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     pub fn token_count(&self) -> usize {

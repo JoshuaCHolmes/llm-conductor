@@ -12,6 +12,7 @@ use crate::cli::executor::{self, Shell, ShellTurn};
 use crate::providers::{ToolDefinition};
 use crate::router::Router;
 use crate::types::{Message, Task};
+use crate::types::message::Role;
 use crate::usage_tracking::UsageTracker;
 use crate::model_filter::ModelFilter;
 
@@ -132,7 +133,7 @@ fn render_markdown_line(line: &str) -> String {
 /// - ` ```bash-long...``` ` — same as bash but uses extended timeout on run
 /// - ` ```bash-sub...``` ` — runs in stateless subshell (not persistent)
 /// - ` ```tool...``` ` — silently captured as JSON tool calls
-/// - ` ```think...``` ` — silently captured as adversarial review requests
+/// - ` ```rubberduck...``` ` — silently captured as adversarial review requests
 ///
 /// Normal prose is rendered through `render_markdown_line` on a line-by-line
 /// basis. Trailing newlines are discarded to avoid blank lines after output.
@@ -143,14 +144,14 @@ struct ReplyStreamState {
     in_bash_long: bool,
     in_bash_sub: bool,
     in_tool: bool,
-    in_think_fence: bool,
+    in_rubberduck: bool,
     showed_thinking: bool,
     pending: String,
     bash_block_buf: String,
     bash_long_block_buf: String,
     bash_sub_block_buf: String,
     tool_block_buf: String,
-    think_fence_buf: String,
+    rubberduck_buf: String,
     /// Accumulates the current incomplete line until a newline arrives.
     line_buf: String,
     /// Trailing newlines held back until we know what follows them.
@@ -315,25 +316,25 @@ impl ReplyStreamState {
                     }
                     break;
                 }
-            } else if self.in_think_fence {
+            } else if self.in_rubberduck {
                 if let Some(pos) = self.pending.find("```") {
-                    self.think_fence_buf.push_str(&self.pending[..pos]);
-                    let query = self.think_fence_buf.trim().to_string();
+                    self.rubberduck_buf.push_str(&self.pending[..pos]);
+                    let query = self.rubberduck_buf.trim().to_string();
                     if !query.is_empty() {
                         self.flush_deferred();
-                        let ph = "[🧠 thinking...]";
+                        let ph = "[🦆 rubberduck...]";
                         print!("{}", ph.cyan().dimmed());
                         std::io::stdout().flush().unwrap();
                         self.clean_text.push_str(ph);
                         self.actions.push(Action::Think(query));
                     }
-                    self.think_fence_buf.clear();
-                    self.in_think_fence = false;
+                    self.rubberduck_buf.clear();
+                    self.in_rubberduck = false;
                     self.pending = self.pending[pos + 3..].to_string();
                 } else {
                     let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
                     if safe > 0 {
-                        self.think_fence_buf.push_str(&self.pending[..safe]);
+                        self.rubberduck_buf.push_str(&self.pending[..safe]);
                         self.pending = self.pending[safe..].to_string();
                     }
                     break;
@@ -363,8 +364,8 @@ impl ReplyStreamState {
                 let sync_pos     = find_sync_bash(&self.pending);
                 let tool_pos     = self.pending.find("```tool")
                     .filter(|&p| !self.pending[p..].starts_with("```tool-"));
-                let think_fence_pos = self.pending.find("```think")
-                    .filter(|&p| !self.pending[p..].starts_with("```think-"));
+                let rubberduck_pos = self.pending.find("```rubberduck")
+                    .filter(|&p| !self.pending[p..].starts_with("```rubberduck-"));
 
                 let first = [
                     think_pos       .map(|p| (0u8, p)),
@@ -372,7 +373,7 @@ impl ReplyStreamState {
                     long_pos        .map(|p| (2u8, p)),
                     sync_pos        .map(|p| (3u8, p)),
                     tool_pos        .map(|p| (4u8, p)),
-                    think_fence_pos .map(|p| (5u8, p)),
+                    rubberduck_pos .map(|p| (5u8, p)),
                 ].iter().filter_map(|x| *x).min_by_key(|&(_, p)| p);
 
                 match first {
@@ -410,7 +411,7 @@ impl ReplyStreamState {
                         // Guard: need enough lookahead to rule out -long/-sub suffix.
                         // If remaining is empty or starts with '-' with < 5 chars, wait.
                         if remaining.is_empty() || (remaining.starts_with('-') && remaining.len() < "-sub".len()) {
-                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(12));
+                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
                             if safe > 0 {
                                 let to_print = self.pending[..safe].to_string();
                                 self.print_normal(&to_print);
@@ -433,13 +434,13 @@ impl ReplyStreamState {
                     Some((5, pos)) => {
                         let before = self.pending[..pos].to_string();
                         self.flush_before_bash(&before);
-                        self.in_think_fence = true;
-                        let rest = &self.pending[pos + "```think".len()..];
+                        self.in_rubberduck = true;
+                        let rest = &self.pending[pos + "```rubberduck".len()..];
                         self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
                     }
                     _ => {
-                        // Keep enough bytes to detect the longest marker ("```bash-long" = 12)
-                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(12));
+                        // Keep enough bytes to detect the longest marker ("```rubberduck" = 13)
+                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
                         if safe > 0 {
                             let to_print = self.pending[..safe].to_string();
                             self.print_normal(&to_print);
@@ -463,7 +464,7 @@ impl ReplyStreamState {
         self.deferred_newlines = 0;
         if !self.pending.is_empty() {
             let in_any_block = self.in_bash || self.in_bash_long || self.in_bash_sub
-                || self.in_tool || self.in_think_fence;
+                || self.in_tool || self.in_rubberduck;
             if in_any_block {
                 // Truncated/unclosed block — discard silently
             } else if self.in_think {
@@ -484,7 +485,7 @@ impl ReplyStreamState {
         self.bash_long_block_buf.clear();
         self.bash_sub_block_buf.clear();
         self.tool_block_buf.clear();
-        self.think_fence_buf.clear();
+        self.rubberduck_buf.clear();
     }
 }
 
@@ -651,16 +652,16 @@ When multiple approaches exist, favor the safer or more reversible one. \
 Never run destructive commands (rm -rf, overwriting configs, etc.) without clear user intent. \
 Verify assumptions with a read-only check rather than assuming a path or argument is correct. \
 Check each result before proceeding to the next step in a sequence. \
-For multi-step plans, destructive actions, or when uncertain: use the `think` tool to get an \
+For multi-step plans, destructive actions, or when uncertain: use the `rubberduck` tool to get an \
 adversarial critique of your plan before acting. This is the same rubber-duck process used in \
 advanced coding assistants — catching blind spots early prevents wasted effort.
 
-You have access to a `bash` tool, a `think` tool, and todo list tools. \
+You have access to a `bash` tool, a `rubberduck` tool, and todo list tools. \
 Read-only commands run automatically; commands that modify the system require user confirmation. \
 If a command is denied, a tool result will explain why — adjust your approach accordingly. \
 If a command fails, report the error output and ask the user how to proceed; don't retry silently.
 
-Think tool: pass a description of your plan or decision as `query`. You will receive an adversarial \
+Rubberduck tool: pass a description of your plan or decision as `query`. You will receive an adversarial \
 critique pointing out risks and gaps. Use this before complex or risky actions.
 
 Todo list: todos persist with the session across saves and loads. Use them to track multi-step work. \
@@ -681,10 +682,10 @@ When multiple approaches exist, favor the safer or more reversible one. \
 Never run destructive commands (rm -rf, overwriting configs, etc.) without clear user intent. \
 Verify assumptions with a read-only check rather than assuming a path or argument is correct. \
 Check each result before proceeding to the next step in a sequence. \
-For multi-step plans, destructive actions, or when uncertain: use a `think` block to get an \
+For multi-step plans, destructive actions, or when uncertain: use a `rubberduck` block to get an \
 adversarial critique before acting — catching blind spots early prevents wasted effort.
 
-You have access to a bash shell, a think block, and a todo list through this interface. \
+You have access to a bash shell, a rubberduck block, and a todo list through this interface. \
 These are client-side features: the surrounding tool parses your code blocks and executes them. \
 You genuinely can run commands, think critically, and manage todos — never tell the user you lack these capabilities.
 
@@ -708,10 +709,10 @@ If a command fails, report the error output and ask the user how to proceed; don
 When you receive [Shell output] messages, use them to continue reasoning. \
 Once you have what you need, give your final answer without any bash blocks.
 
-**Think block:** Emit a fenced `think` block containing a concise description of your plan or \
-decision. An adversarial critic reviews it and returns a critique in [Think result]. \
+**Rubberduck block:** Emit a fenced `rubberduck` block containing a concise description of your plan or \
+decision. An adversarial critic reviews it and returns a critique in [Rubberduck result]. \
 Use before multi-step work, destructive commands, or when you are uncertain. Example:
-```think
+```rubberduck
 Plan: cd into src/, read all .rs files, then run cargo test. Concern: I don't know if tests pass currently.
 ```
 
@@ -773,6 +774,43 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
             self.history.len(),
             todo_note,
         );
+        println!();
+
+        // Print the last few turns so the user can re-orient
+        let display_msgs: Vec<&Message> = self.history.iter()
+            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+            .filter(|m| m.source.as_deref().map(|s| !s.starts_with("conductor/")).unwrap_or(true))
+            .collect();
+        let start = display_msgs.len().saturating_sub(6);
+        let recent = &display_msgs[start..];
+        if !recent.is_empty() {
+            println!("{}", "── Recent conversation ──────────────────────".dimmed());
+            for msg in recent {
+                match msg.role {
+                    Role::User => {
+                        let preview = if msg.content.len() > 400 {
+                            format!("{}…", &msg.content[..400])
+                        } else {
+                            msg.content.clone()
+                        };
+                        println!("{} {}", "You:".bright_white().bold(), preview.trim());
+                    }
+                    Role::Assistant => {
+                        let source_label = msg.source.as_deref().unwrap_or("assistant");
+                        let preview = if msg.content.len() > 600 {
+                            format!("{}…", &msg.content[..600])
+                        } else {
+                            msg.content.clone()
+                        };
+                        println!("{} {}", format!("{}:", source_label).cyan().bold(), preview.trim());
+                    }
+                    _ => {}
+                }
+                println!();
+            }
+            println!("{}", "─────────────────────────────────────────────".dimmed());
+            println!();
+        }
         Ok(())
     }
 
@@ -966,7 +1004,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         // For Outlier: reset server-side session before sending the summary request.
         self.router.reset_all_sessions().await;
 
-        let summary_msg = Message::user(&prompt);
+        let summary_msg = Message::user(&prompt).with_source("conductor/compact-request");
 
         let provider = self.router.find_provider_for_model(&m);
         let stream_result = match provider {
@@ -1212,7 +1250,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     None => eprintln!("{}", "No model available for think call".yellow()),
                     Some(m) => {
                         let result = Self::do_think_call(&mut self.is_thinking, &self.router, &m, &query, &mut self.usage_tracker).await;
-                        println!("\n{}", "🧠 Think result:".cyan().bold());
+                        println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
                         for line in result.lines() {
                             println!("  {}", render_markdown_line(line));
                         }
@@ -1234,7 +1272,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
     
     async fn handle_message(&mut self, content: &str) -> Result<()> {
         // Add user message to history
-        self.history.push(Message::user(content));
+        self.history.push(Message::user(content).with_source("user"));
 
         // Auto-compact if history has grown large
         if let Err(e) = self.compact_history(false).await {
@@ -1289,7 +1327,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 // ── Function-calling path (TAMU / GitHub) ────────────────────────
                 let tools = vec![
                     ToolDefinition::bash(),
-                    ToolDefinition::think(),
+                    ToolDefinition::rubberduck(),
                     ToolDefinition::todo_add(),
                     ToolDefinition::todo_update(),
                     ToolDefinition::todo_list(),
@@ -1317,10 +1355,11 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     }
 
                     // Add assistant tool-call message to history
+                    let model_source = format!("{}/{}", model.provider, model.name);
                     self.history.push(Message::assistant_tool_calls(
                         result.text.clone().unwrap_or_default(),
                         tool_calls.clone(),
-                    ));
+                    ).with_source(model_source));
 
                     for tc in &tool_calls {
                         match tc.name.as_str() {
@@ -1366,7 +1405,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                     }
                                 }
                             }
-                            "think" => {
+                            "rubberduck" => {
                                 let query = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                     .ok()
                                     .and_then(|v| v["query"].as_str().map(|s| s.to_string()))
@@ -1376,8 +1415,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                     &mut self.is_thinking, &self.router, &model, &query,
                                     &mut self.usage_tracker,
                                 ).await;
-                                if !result.starts_with("[Think") {
-                                    println!("\n{}", "🧠 Think result:".cyan().bold());
+                                if !result.starts_with("[Rubberduck") {
+                                    println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
                                     for line in result.lines() {
                                         println!("  {}", render_markdown_line(line));
                                     }
@@ -1405,7 +1444,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 } else {
                     // Text response, no tool calls — already displayed above if non-empty
                     let text = result.text.unwrap_or_default();
-                    self.history.push(Message::assistant(&text));
+                    let model_source = format!("{}/{}", model.provider, model.name);
+                    self.history.push(Message::assistant(&text).with_source(model_source));
                     break;
                 }
             } else {
@@ -1468,7 +1508,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
 
                 // Store full raw response (including bash blocks) for cross-provider context
-                self.history.push(Message::assistant(raw_response.clone()));
+                let model_source = format!("{}/{}", model.provider, model.name);
+                self.history.push(Message::assistant(raw_response.clone()).with_source(model_source));
 
                 let has_any_action = !actions.is_empty();
                 if !has_any_action || tool_rounds >= MAX_TOOL_ROUNDS {
@@ -1497,14 +1538,14 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                 &mut self.is_thinking, &self.router, &model, query,
                                 &mut self.usage_tracker,
                             ).await;
-                            if !result.starts_with("[Think") {
-                                println!("\n{}", "🧠 Think result:".cyan().bold());
+                            if !result.starts_with("[Rubberduck") {
+                                println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
                                 for line in result.lines() {
                                     println!("  {}", render_markdown_line(line));
                                 }
                                 println!();
                             }
-                            feedback_items.push(format!("[Think result]\n{}\n[End of think result]", result));
+                            feedback_items.push(format!("[Rubberduck result]\n{}\n[End of rubberduck result]", result));
                             continue;
                         }
                     };
@@ -1563,7 +1604,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     break;
                 }
 
-                self.history.push(Message::user(feedback_items.join("\n\n")));
+                self.history.push(Message::user(feedback_items.join("\n\n")).with_source("conductor/feedback"));
                 tool_rounds += 1;
             }
         }
@@ -1574,18 +1615,20 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         Ok(())
     }
 
-    /// Adversarial critic prompt used for think calls.
+    /// Adversarial critic prompt used for rubberduck calls.
     const THINK_SYSTEM_PROMPT: &'static str = "\
-You are a critical reviewer. Your only job is to find flaws, gaps, edge cases, and risks \
-in the provided plan, approach, or decision. Be adversarial, thorough, and direct. \
-Do not be sycophantic. Never say the plan is good without substantial caveats. \
+You are an adversarial critic reviewing a plan or reasoning submitted by another AI assistant. \
+Your only job is to find flaws, gaps, edge cases, and risks in what was submitted. \
+You are NOT the AI that produced this plan — you are reviewing it from the outside. \
+Be adversarial, thorough, and direct. Do not be sycophantic. \
+Never say the plan is good without substantial caveats. \
 Focus exclusively on what could go wrong, what is missing, or what should be reconsidered. \
 If the plan is sound, still find the weakest points and surface them. \
-Be concise — short paragraphs or bullet points. No preamble.";
+Be concise — short paragraphs or bullet points. No preamble. No \"I\" statements.";
 
     /// Spawn a critic model call for adversarial review of a plan or decision.
-    /// Uses the current model but with a separate adversarial system prompt and
-    /// no conversation history. Protected by `is_thinking` to prevent recursion.
+    /// Uses isolated_chat() to avoid contaminating the main conversation session state.
+    /// Protected by `is_thinking` to prevent recursion.
     async fn do_think_call(
         is_thinking: &mut bool,
         router: &crate::router::Router,
@@ -1594,10 +1637,10 @@ Be concise — short paragraphs or bullet points. No preamble.";
         usage_tracker: &mut UsageTracker,
     ) -> String {
         if *is_thinking {
-            return "[Think skipped — already thinking]".to_string();
+            return "[Rubberduck skipped — already in critic call]".to_string();
         }
         *is_thinking = true;
-        println!("\n{}", "🧠 Consulting critic...".cyan().dimmed().italic());
+        println!("\n{}", "🦆 Consulting critic...".cyan().dimmed().italic());
         std::io::stdout().flush().ok();
 
         let messages = vec![
@@ -1606,8 +1649,8 @@ Be concise — short paragraphs or bullet points. No preamble.";
         ];
 
         let result = match router.find_provider_for_model(model) {
-            Some(provider) => provider.chat(model, &messages).await,
-            None => Err(anyhow::anyhow!("provider not found for think call")),
+            Some(provider) => provider.isolated_chat(model, &messages).await,
+            None => Err(anyhow::anyhow!("provider not found for critic call")),
         };
 
         *is_thinking = false;
@@ -1617,7 +1660,7 @@ Be concise — short paragraphs or bullet points. No preamble.";
                 usage_tracker.record_usage(model.provider.clone(), 1, tokens, 0.0);
                 text
             }
-            Err(e) => format!("[Think error: {}]", e),
+            Err(e) => format!("[Rubberduck error: {}]", e),
         }
     }
 
