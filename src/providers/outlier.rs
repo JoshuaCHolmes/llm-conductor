@@ -1,10 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::providers::Provider;
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId};
@@ -54,9 +52,6 @@ pub struct OutlierProvider {
     client: Client,
     cookie: String,
     csrf_token: String,
-    conversation_id: Arc<Mutex<Option<String>>>,
-    // Track the index of the last message this provider has seen
-    last_seen_message_index: Arc<Mutex<usize>>,
 }
 
 impl OutlierProvider {
@@ -69,17 +64,7 @@ impl OutlierProvider {
             client,
             cookie,
             csrf_token,
-            conversation_id: Arc::new(Mutex::new(None)),
-            last_seen_message_index: Arc::new(Mutex::new(0)),
         })
-    }
-    
-    /// Clear cached conversation ID to force using a different conversation next time
-    pub async fn clear_conversation(&self) {
-        let mut conv_id = self.conversation_id.lock().await;
-        *conv_id = None;
-        let mut last_seen = self.last_seen_message_index.lock().await;
-        *last_seen = 0;
     }
 
     fn get_api_model_name<'a>(&self, model_id: &'a ModelId) -> &'a str {
@@ -103,96 +88,67 @@ impl OutlierProvider {
         }
     }
 
-    async fn get_or_create_conversation(&self, first_message: Option<&str>, model_name: &str, model_id: &str) -> Result<String> {
-        let mut conv_id = self.conversation_id.lock().await;
-        
-        if let Some(ref id) = *conv_id {
-            return Ok(id.clone());
-        }
+    /// Always creates a fresh conversation with the given text as the initial message.
+    async fn create_conversation(&self, text: &str, model_name: &str, model_id: &str) -> Result<String> {
+        let url = format!("{}/internal/experts/assistant/conversations", BASE_URL);
+        let payload = serde_json::json!({
+            "prompt": {
+                "text": text,
+                "images": []
+            },
+            "model": model_name,
+            "modelId": model_id,
+            "challengeId": "",
+            "initialTurnMode": "Normal",
+            "initialTurnType": "Text",
+            "isMysteryModel": false
+        });
 
-        // If we have a first message, create a new conversation with it
-        if let Some(text) = first_message {
-            let url = format!("{}/internal/experts/assistant/conversations", BASE_URL); // No trailing slash!
-            let payload = serde_json::json!({
-                "prompt": {
-                    "text": text,
-                    "images": []
-                },
-                "model": model_name,
-                "modelId": model_id,
-                "challengeId": "",
-                "initialTurnMode": "Normal",
-                "initialTurnType": "Text",
-                "isMysteryModel": false
-            });
-
-            let response = self
-                .client
-                .post(&url)
-                .header("origin", BASE_URL)
-                .header("referer", format!("{}/chat", BASE_URL))
-                .header("content-type", "application/json")
-                .header("x-csrf-token", &self.csrf_token)
-                .header("cookie", &self.cookie)
-                .json(&payload)
-                .send()
-                .await?;
-
-            if response.status().is_success() {
-                let data: serde_json::Value = response.json().await?;
-                if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
-                    let id = id.to_string();
-                    *conv_id = Some(id.clone());
-                    return Ok(id);
-                }
-                return Err(anyhow::anyhow!("Conversation created but no ID in response"));
-            }
-            return Err(anyhow::anyhow!(
-                "Failed to create Outlier conversation: {}",
-                response.status()
-            ));
-        }
-
-        // Fallback: fetch latest conversation (only when no first_message provided)
-        let url = format!("{}/internal/experts/assistant/conversations/", BASE_URL);
         let response = self
             .client
-            .get(&url)
+            .post(&url)
+            .header("origin", BASE_URL)
+            .header("referer", format!("{}/chat", BASE_URL))
+            .header("content-type", "application/json")
+            .header("x-csrf-token", &self.csrf_token)
+            .header("cookie", &self.cookie)
+            .json(&payload)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: serde_json::Value = response.json().await?;
+            if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+                return Ok(id.to_string());
+            }
+            return Err(anyhow::anyhow!("Conversation created but no ID in response"));
+        }
+        Err(anyhow::anyhow!(
+            "Failed to create Outlier conversation: {}",
+            response.status()
+        ))
+    }
+
+    /// Delete a conversation by ID (best-effort; errors are swallowed).
+    async fn delete_conversation(&self, conv_id: &str) {
+        let url = format!("{}/internal/experts/assistant/conversations/{}", BASE_URL, conv_id);
+        match self
+            .client
+            .delete(&url)
             .header("origin", BASE_URL)
             .header("referer", format!("{}/conversation", BASE_URL))
             .header("x-csrf-token", &self.csrf_token)
             .header("cookie", &self.cookie)
             .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch conversations: {}",
-                response.status()
-            ));
+            .await
+        {
+            Ok(resp) => {
+                tracing::debug!("Deleted Outlier conversation {}: {}", conv_id, resp.status());
+            }
+            Err(e) => {
+                tracing::debug!("Failed to delete Outlier conversation {}: {}", conv_id, e);
+            }
         }
-
-        let data: serde_json::Value = response.json().await?;
-        let conversations = data
-            .as_array()
-            .or_else(|| data.get("conversations").and_then(|v| v.as_array()))
-            .or_else(|| data.get("data").and_then(|v| v.as_array()))
-            .context("No conversations found in response")?;
-
-        let conv = conversations
-            .get(0)
-            .context("No conversations available. Create one in Outlier Playground first")?;
-
-        let id = conv
-            .get("id")
-            .or_else(|| conv.get("_id"))
-            .and_then(|v| v.as_str())
-            .context("Conversation ID not found")?
-            .to_string();
-
-        eprintln!("⚠️  Using existing conversation: {}", &id[..12]);
-        *conv_id = Some(id.clone());
-        Ok(id)
     }
 
     fn messages_to_text(&self, messages: &[Message]) -> String {
@@ -329,54 +285,10 @@ impl Provider for OutlierProvider {
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id = self.get_outlier_model_id(model_name);
-        
-        // Determine what messages to send based on conversation state
-        let needs_new_conversation = self.conversation_id.lock().await.is_none();
-        let last_seen = *self.last_seen_message_index.lock().await;
-        
-        let text = if needs_new_conversation {
-            // New conversation: Send all messages with context wrapper if there's history
-            if last_seen > 0 && messages.len() > 1 {
-                // We have previous conversation history to catch up on
-                let history_text = self.messages_to_text(&messages[..messages.len() - 1]);
-                format!(
-                    "\n{}\n\n\n\n{}",
-                    history_text,
-                    messages.last().map(|m| m.content.as_str()).unwrap_or("")
-                )
-            } else {
-                // No previous history or this is the first message
-                self.messages_to_text(messages)
-            }
-        } else {
-            // Existing conversation: Send messages we haven't seen yet
-            if last_seen < messages.len() - 1 {
-                // There are messages between last_seen and current that we missed
-                let missed_messages = &messages[last_seen..messages.len() - 1];
-                let current_message = messages.last().map(|m| m.content.as_str()).unwrap_or("");
-                
-                if !missed_messages.is_empty() {
-                    let missed_text = self.messages_to_text(missed_messages);
-                    format!(
-                        "\n{}\n\n\n{}",
-                        missed_text,
-                        current_message
-                    )
-                } else {
-                    current_message.to_string()
-                }
-            } else {
-                // Just send the current message
-                messages.last().map(|m| m.content.clone()).unwrap_or_default()
-            }
-        };
 
-        // Get or create conversation - if creating new, pass the first message
-        let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
-        
-        let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
-        
-        // Always send the turn request to get the AI response
+        let text = self.messages_to_text(messages);
+        let conv_id = self.create_conversation(&text, model_name, model_id).await?;
+
         let url = format!(
             "{}/internal/experts/assistant/conversations/{}/turn-streaming",
             BASE_URL, conv_id
@@ -410,6 +322,7 @@ impl Provider for OutlierProvider {
             .await?;
 
         if !response.status().is_success() {
+            self.delete_conversation(&conv_id).await;
             return Err(anyhow::anyhow!(
                 "Outlier API error: {}",
                 response.status()
@@ -448,10 +361,7 @@ impl Provider for OutlierProvider {
             }
         }
 
-        // Advance index only after confirmed successful response.
-        // +1 accounts for the assistant response that the REPL will append.
-        *self.last_seen_message_index.lock().await = messages.len() + 1;
-
+        self.delete_conversation(&conv_id).await;
         Ok(result)
     }
 
@@ -463,54 +373,10 @@ impl Provider for OutlierProvider {
     ) -> Result<(String, Option<u64>)> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id = self.get_outlier_model_id(model_name);
-        
-        // Determine what messages to send based on conversation state
-        let needs_new_conversation = self.conversation_id.lock().await.is_none();
-        let last_seen = *self.last_seen_message_index.lock().await;
-        
-        let text = if needs_new_conversation {
-            // New conversation: Send all messages with context wrapper if there's history
-            if last_seen > 0 && messages.len() > 1 {
-                // We have previous conversation history to catch up on
-                let history_text = self.messages_to_text(&messages[..messages.len() - 1]);
-                format!(
-                    "\n{}\n\n\n\n{}",
-                    history_text,
-                    messages.last().map(|m| m.content.as_str()).unwrap_or("")
-                )
-            } else {
-                // No previous history or this is the first message
-                self.messages_to_text(messages)
-            }
-        } else {
-            // Existing conversation: Send messages we haven't seen yet
-            if last_seen < messages.len() - 1 {
-                // There are messages between last_seen and current that we missed
-                let missed_messages = &messages[last_seen..messages.len() - 1];
-                let current_message = messages.last().map(|m| m.content.as_str()).unwrap_or("");
-                
-                if !missed_messages.is_empty() {
-                    let missed_text = self.messages_to_text(missed_messages);
-                    format!(
-                        "\n{}\n\n\n{}",
-                        missed_text,
-                        current_message
-                    )
-                } else {
-                    current_message.to_string()
-                }
-            } else {
-                // Just send the current message
-                messages.last().map(|m| m.content.clone()).unwrap_or_default()
-            }
-        };
 
-        // Get or create conversation - if creating new, pass the first message
-        let first_message = if needs_new_conversation { Some(text.as_str()) } else { None };
-        
-        let conv_id = self.get_or_create_conversation(first_message, model_name, model_id).await?;
-        
-        // Always send the turn request to get the AI response
+        let text = self.messages_to_text(messages);
+        let conv_id = self.create_conversation(&text, model_name, model_id).await?;
+
         let url = format!(
             "{}/internal/experts/assistant/conversations/{}/turn-streaming",
             BASE_URL, conv_id
@@ -544,6 +410,7 @@ impl Provider for OutlierProvider {
             .await?;
 
         if !response.status().is_success() {
+            self.delete_conversation(&conv_id).await;
             return Err(anyhow::anyhow!(
                 "Outlier API error: {}",
                 response.status()
@@ -583,9 +450,7 @@ impl Provider for OutlierProvider {
             }
         }
 
-        // Advance index only after confirmed successful response.
-        *self.last_seen_message_index.lock().await = messages.len() + 1;
-
+        self.delete_conversation(&conv_id).await;
         Ok((full_content, None))
     }
 
@@ -601,30 +466,5 @@ impl Provider for OutlierProvider {
             .await?;
 
         Ok(response.status().is_success())
-    }
-
-    async fn reset_session(&self) {
-        self.clear_conversation().await;
-    }
-
-    /// Isolated single-shot chat: saves conversation state, forces a fresh conversation,
-    /// calls chat(), then restores the original conversation state.
-    /// This ensures critic/think calls don't corrupt last_seen or bleed into the main session.
-    async fn isolated_chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
-        // Save current state
-        let saved_conv_id = self.conversation_id.lock().await.clone();
-        let saved_last_seen = *self.last_seen_message_index.lock().await;
-
-        // Force fresh conversation for this isolated call
-        *self.conversation_id.lock().await = None;
-        *self.last_seen_message_index.lock().await = 0;
-
-        let result = self.chat(model, messages).await;
-
-        // Restore original state regardless of outcome
-        *self.conversation_id.lock().await = saved_conv_id;
-        *self.last_seen_message_index.lock().await = saved_last_seen;
-
-        result
     }
 }

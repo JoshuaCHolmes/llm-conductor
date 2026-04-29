@@ -140,6 +140,13 @@ fn render_markdown_line(line: &str) -> String {
     if t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '=')) {
         return "──────────────────────────────".dimmed().to_string();
     }
+    // Blockquote — render dimmed with a bar prefix
+    if let Some(rest) = line.strip_prefix("> ") {
+        return format!("▏ {}", render_inline(rest).dimmed());
+    }
+    if line == ">" {
+        return "▏".dimmed().to_string();
+    }
     // List items (with optional indentation)
     let leading = line.len() - line.trim_start().len();
     let indent = &line[..leading];
@@ -190,6 +197,8 @@ struct ReplyStreamState {
     /// Trailing newlines held back until we know what follows them.
     /// Discarded if a bash/tool block comes next; flushed before any content.
     deferred_newlines: usize,
+    /// Suppresses leading whitespace/newlines before the first real content.
+    has_started: bool,
     /// Ordered list of actions to execute after the response completes.
     pub actions: Vec<Action>,
     pub clean_text: String,
@@ -261,6 +270,19 @@ impl ReplyStreamState {
 
     pub fn process_chunk(&mut self, chunk: &str) {
         self.pending.push_str(chunk);
+
+        // Suppress leading whitespace/newlines before the first real content
+        if !self.has_started {
+            let trimmed = self.pending.trim_start_matches(|c: char| c == '\n' || c == '\r' || c == ' ');
+            if !trimmed.is_empty() {
+                self.has_started = true;
+                self.pending = trimmed.to_string();
+            } else {
+                self.pending.clear();
+                return;
+            }
+        }
+
         loop {
             if self.in_bash {
                 if let Some(pos) = self.pending.find("```") {
@@ -604,6 +626,33 @@ fn serialize_for_compaction(messages: &[Message]) -> String {
     parts.join("\n\n")
 }
 
+/// Display a single message for session resume history, styled like live output.
+fn print_message_replay(msg: &Message) {
+    match msg.role {
+        Role::User => {
+            if msg.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false) {
+                return;
+            }
+            print!("{} ", "❯".bright_blue().bold());
+            println!("{}", msg.content.trim());
+            println!();
+        }
+        Role::Assistant => {
+            print!("{} ", "❯".bright_green().bold());
+            let content = strip_action_fences(&msg.content);
+            let mut lines = content.trim().lines();
+            if let Some(first_line) = lines.next() {
+                println!("{}", render_markdown_line(first_line));
+            }
+            for line in lines {
+                println!("{}", render_markdown_line(line));
+            }
+            println!();
+        }
+        _ => {}
+    }
+}
+
 pub struct Repl {
     router: Router,
     history: Vec<Message>,
@@ -820,27 +869,7 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
             println!("{}", "── Resuming conversation ────────────────────".dimmed());
             println!();
             for msg in recent {
-                match msg.role {
-                    Role::User => {
-                        print!("{} ", "❯".bright_blue().bold());
-                        println!("{}", msg.content.trim());
-                        println!();
-                    }
-                    Role::Assistant => {
-                        print!("{} ", "❯".bright_green().bold());
-                        // Strip raw code fence blocks (bash/tool/rubberduck) — noise on replay
-                        let content = strip_action_fences(&msg.content);
-                        let mut lines = content.trim().lines();
-                        if let Some(first_line) = lines.next() {
-                            println!("{}", render_markdown_line(first_line));
-                        }
-                        for line in lines {
-                            println!("{}", render_markdown_line(line));
-                        }
-                        println!();
-                    }
-                    _ => {}
-                }
+                print_message_replay(msg);
             }
             println!("{}", "─────────────────────────────────────────────".dimmed());
             println!();
@@ -973,9 +1002,15 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                     println!();
                     continue;
                 }
-                Err(_) => {
-                    // Ctrl+D / EOF — exit
+                Err(rustyline::error::ReadlineError::Eof) => {
+                    // Ctrl+D or stdin closed — clean exit
+                    println!("{}", "Goodbye!".bright_cyan());
                     break;
+                }
+                Err(e) => {
+                    // Transient input error (terminal resize, interrupt from sleep, etc.)
+                    eprintln!("{} Input error: {}", "⚠".yellow(), e);
+                    continue; // Don't exit — user can try again
                 }
             }
         }
@@ -1035,10 +1070,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             Some(m) => m,
         };
 
-        // For Outlier: reset server-side session before sending the summary request.
-        self.router.reset_all_sessions().await;
-
         let summary_msg = Message::user(&prompt).with_source("conductor/compact-request");
+        let system_msg = Message::system("You are a conversation summarizer. Return only the requested summary with no preamble, commentary, or meta-text. Do not say 'Here is a summary' or similar. Just output the summary content directly.");
 
         let provider = self.router.find_provider_for_model(&m);
         let stream_result = match provider {
@@ -1046,7 +1079,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 eprintln!("{} Provider not found for compaction; skipping.", "⚠".yellow());
                 return Ok(false);
             }
-            Some(p) => p.chat(&m, &[summary_msg]).await,
+            Some(p) => p.chat(&m, &[system_msg, summary_msg]).await,
         };
 
         let summary_buf = match stream_result {
@@ -1068,9 +1101,6 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         // Replace previous summary with the new re-summarized version (bounded growth).
         self.compacted_summary = Some(summary_buf);
         self.history.drain(0..boundary);
-
-        // Reset again so future Outlier turns start with a clean server session.
-        self.router.reset_all_sessions().await;
 
         println!("{} Compacted {} messages into summary ({} kept).",
             "✓".bright_green(), boundary, self.history.len());
@@ -1661,7 +1691,6 @@ If the plan is sound, still find the weakest points and surface them. \
 Be concise — short paragraphs or bullet points. No preamble. No \"I\" statements.";
 
     /// Spawn a critic model call for adversarial review of a plan or decision.
-    /// Uses isolated_chat() to avoid contaminating the main conversation session state.
     /// Protected by `is_thinking` to prevent recursion.
     async fn do_think_call(
         is_thinking: &mut bool,
@@ -1683,7 +1712,7 @@ Be concise — short paragraphs or bullet points. No preamble. No \"I\" statemen
         ];
 
         let result = match router.find_provider_for_model(model) {
-            Some(provider) => provider.isolated_chat(model, &messages).await,
+            Some(provider) => provider.chat(model, &messages).await,
             None => Err(anyhow::anyhow!("provider not found for critic call")),
         };
 

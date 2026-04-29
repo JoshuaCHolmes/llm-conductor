@@ -149,11 +149,4 @@ pub trait Provider: Send + Sync {
     /// Reset any server-side session state (e.g. Outlier conversation ID).
     /// Default is a no-op; only providers with server-side sessions need to override.
     async fn reset_session(&self) {}
-
-    /// Stateless single-shot chat that doesn't affect the provider's ongoing session state.
-    /// Used for critic/think calls so they don't corrupt last_seen or conversation tracking.
-    /// Default: delegates to chat(). Session-based providers (Outlier) must override.
-    async fn isolated_chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
-        self.chat(model, messages).await
-    }
 }
