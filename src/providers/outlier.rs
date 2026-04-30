@@ -127,13 +127,17 @@ impl OutlierProvider {
             .send().await?;
 
         if response.status().is_success() {
-            let data: serde_json::Value = response.json().await?;
+            let body = response.text().await?;
+            let data: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("Outlier create_conversation: invalid JSON: {e}\nBody: {body}"))?;
             if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
                 return Ok(id.to_string());
             }
-            return Err(anyhow::anyhow!("Conversation created but no ID in response"));
+            return Err(anyhow::anyhow!("Conversation created but no ID in response: {body}"));
         }
-        Err(anyhow::anyhow!("Failed to create Outlier conversation: {}", response.status()))
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow::anyhow!("Failed to create Outlier conversation: {status}\nBody: {body}"))
     }
 
     /// Delete a conversation by ID. Best-effort — errors are logged and swallowed.
@@ -189,12 +193,13 @@ impl OutlierProvider {
                 Ok(Some(Ok(bytes))) => {
                     first_chunk = false;
                     sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+                    let mut done = false;
                     while let Some(nl) = sse_buf.find('\n') {
                         let line = sse_buf[..nl].trim_end_matches('\r').to_string();
                         sse_buf = sse_buf[nl + 1..].to_string();
                         if line.starts_with("data: ") {
                             let data = &line[6..];
-                            if data == "[DONE]" { break; }
+                            if data == "[DONE]" { done = true; break; }
                             if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                                 if let Some(content) = chunk.choices.first()
                                     .and_then(|c| c.delta.as_ref())
@@ -205,6 +210,7 @@ impl OutlierProvider {
                             }
                         }
                     }
+                    if done { break; }
                 }
             }
         }
@@ -411,12 +417,13 @@ impl Provider for OutlierProvider {
                     Ok(Some(Ok(bytes))) => {
                         first_chunk = false;
                         sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+                        let mut done = false;
                         while let Some(nl) = sse_buf.find('\n') {
                             let line = sse_buf[..nl].trim_end_matches('\r').to_string();
                             sse_buf = sse_buf[nl + 1..].to_string();
                             if line.starts_with("data: ") {
                                 let data = &line[6..];
-                                if data == "[DONE]" { break; }
+                                if data == "[DONE]" { done = true; break; }
                                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                                     if let Some(content) = chunk.choices.first()
                                         .and_then(|c| c.delta.as_ref())
@@ -428,6 +435,7 @@ impl Provider for OutlierProvider {
                                 }
                             }
                         }
+                        if done { break 'sse; }
                     }
                 }
             }

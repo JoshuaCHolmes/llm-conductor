@@ -552,6 +552,8 @@ enum CommandDecision {
     AcceptForSession,
     /// Deny — the string is the user's correction text (may be empty).
     Deny(String),
+    /// User pressed Ctrl+C or Ctrl+D — abort the entire action round.
+    Cancel,
 }
 
 /// Estimated token count for a history slice (rough: 4 chars per token).
@@ -820,17 +822,7 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         Message::system(instructions)
     }
 
-    /// Prompt the user about a command that requires confirmation.
-    /// Returns immediately (Accept) if the command was session-accepted previously.
-    /// Uses the shared rustyline editor so we never have two competing readers on the tty.
-    fn prompt_command_decision(cmd: &str, auto_accepts: &HashSet<String>, rl: &mut DefaultEditor) -> Result<CommandDecision> {
-        if auto_accepts.contains(cmd) {
-            return Ok(CommandDecision::Accept);
-        }
-        Self::readline_command_decision(cmd, rl)
-    }
-
-    /// Inner: show prompt and read one line via rustyline. No auto-accept check.
+    /// Show prompt and read one line via rustyline. No auto-accept check.
     fn readline_command_decision(cmd: &str, rl: &mut DefaultEditor) -> Result<CommandDecision> {
         println!("{} {} {}", "⚡".yellow(), "Run:".bright_white(), cmd.bright_yellow());
         let prompt = format!("  {} ", "[y] accept · [Y] session accept · [text] correct:".dimmed());
@@ -843,10 +835,16 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                     _ => CommandDecision::Deny(ans),
                 })
             }
-            // Ctrl+D / EOF on the approval prompt → treat as denial
-            Err(rustyline::error::ReadlineError::Eof) => Ok(CommandDecision::Deny(String::new())),
-            // Ctrl+C → denial
-            Err(rustyline::error::ReadlineError::Interrupted) => Ok(CommandDecision::Deny(String::new())),
+            // Ctrl+D / EOF on the approval prompt → cancel the action round
+            Err(rustyline::error::ReadlineError::Eof) => {
+                eprintln!("{}", "  (action round cancelled)".dimmed());
+                Ok(CommandDecision::Cancel)
+            }
+            // Ctrl+C → cancel the action round
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                eprintln!("{}", "  (action round cancelled)".dimmed());
+                Ok(CommandDecision::Cancel)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -1473,6 +1471,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                 };
 
                                 match decision {
+                                    CommandDecision::Cancel => break,
                                     CommandDecision::AcceptForSession => {
                                         self.session_auto_accepts.insert(cmd.clone());
                                         let (output, exit_code) = self.shell.run(&cmd, None).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
@@ -1554,9 +1553,11 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     state_cb.lock().unwrap().process_chunk(&chunk);
                 };
 
-                // Watch for Escape key to cancel the stream
+                // Watch for Escape key to cancel the stream.
+                // done_rx fires only after the watcher thread has fully restored
+                // terminal state — we must await it before any readline() call.
                 let stop_watcher = Arc::new(AtomicBool::new(false));
-                let cancel_rx = crate::cli::tty::spawn_esc_watcher(stop_watcher.clone());
+                let (cancel_rx, watcher_done_rx) = crate::cli::tty::spawn_esc_watcher(stop_watcher.clone());
 
                 enum StreamOutcome {
                     Completed(String, Option<u64>),
@@ -1574,6 +1575,13 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         StreamOutcome::Cancelled
                     }
                 };
+
+                // Wait for the ESC watcher to finish restoring terminal state
+                // before we attempt any rustyline readline() calls.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    watcher_done_rx,
+                ).await;
 
                 {
                     let mut s = state.lock().unwrap();
@@ -1654,6 +1662,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     };
 
                     match decision {
+                        CommandDecision::Cancel => break,
                         CommandDecision::AcceptForSession => {
                             self.session_auto_accepts.insert(cmd.clone());
                             let (output, exit_code) = if is_parallel {
