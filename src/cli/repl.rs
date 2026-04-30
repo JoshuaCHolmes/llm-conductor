@@ -671,6 +671,8 @@ pub struct Repl {
     compacted_summary: Option<String>,
     /// Prevents recursive think invocations.
     is_thinking: bool,
+    /// Shared readline editor — single owner of the terminal input stream.
+    rl: DefaultEditor,
 }
 
 impl Repl {
@@ -678,6 +680,7 @@ impl Repl {
         let usage_tracker = UsageTracker::new(&config_dir)?;
         let session_store = SessionStore::new(&config_dir)?;
         let shell = Shell::new().await?;
+        let rl = DefaultEditor::new()?;
         
         Ok(Self {
             router,
@@ -693,6 +696,7 @@ impl Repl {
             todos: Vec::new(),
             compacted_summary: None,
             is_thinking: false,
+            rl,
         })
     }
 
@@ -818,26 +822,33 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
 
     /// Prompt the user about a command that requires confirmation.
     /// Returns immediately (Accept) if the command was session-accepted previously.
-    fn prompt_command_decision(cmd: &str, auto_accepts: &HashSet<String>) -> Result<CommandDecision> {
+    /// Uses the shared rustyline editor so we never have two competing readers on the tty.
+    fn prompt_command_decision(cmd: &str, auto_accepts: &HashSet<String>, rl: &mut DefaultEditor) -> Result<CommandDecision> {
         if auto_accepts.contains(cmd) {
             return Ok(CommandDecision::Accept);
         }
-        println!("{} {} {}", "⚡".yellow(), "Run:".bright_white(), cmd.bright_yellow());
-        print!("{}", "  [y] accept · [Y] session accept · [text] correct: ".dimmed());
-        std::io::stdout().flush()?;
+        Self::readline_command_decision(cmd, rl)
+    }
 
-        // Read from /dev/tty directly rather than stdin — rustyline manages the stdin fd
-        // between readline() calls, so plain read_line(&mut stdin()) gets immediate EOF.
-        // /dev/tty always refers to the controlling terminal, regardless of stdin state.
-        let mut ans = String::new();
-        let tty = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(tty), &mut ans)?;
-        let ans = ans.trim().to_string();
-        Ok(match ans.as_str() {
-            "y" => CommandDecision::Accept,
-            "Y" => CommandDecision::AcceptForSession,
-            _ => CommandDecision::Deny(ans),
-        })
+    /// Inner: show prompt and read one line via rustyline. No auto-accept check.
+    fn readline_command_decision(cmd: &str, rl: &mut DefaultEditor) -> Result<CommandDecision> {
+        println!("{} {} {}", "⚡".yellow(), "Run:".bright_white(), cmd.bright_yellow());
+        let prompt = format!("  {} ", "[y] accept · [Y] session accept · [text] correct:".dimmed());
+        match rl.readline(&prompt) {
+            Ok(ans) => {
+                let ans = ans.trim().to_string();
+                Ok(match ans.as_str() {
+                    "y" => CommandDecision::Accept,
+                    "Y" => CommandDecision::AcceptForSession,
+                    _ => CommandDecision::Deny(ans),
+                })
+            }
+            // Ctrl+D / EOF on the approval prompt → treat as denial
+            Err(rustyline::error::ReadlineError::Eof) => Ok(CommandDecision::Deny(String::new())),
+            // Ctrl+C → denial
+            Err(rustyline::error::ReadlineError::Interrupted) => Ok(CommandDecision::Deny(String::new())),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Reset all per-session state to a clean baseline.
@@ -976,12 +987,11 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         }
         println!();
         
-        // REPL loop
-        let mut rl = DefaultEditor::new()?;
+        // REPL loop — uses self.rl (shared editor) so all input goes through one tty reader
         let mut consecutive_eof = 0u8;
         
         loop {
-            let readline = rl.readline(&format!("{} ", "❯".bright_blue().bold()));
+            let readline = self.rl.readline(&format!("{} ", "❯".bright_blue().bold()));
             
             match readline {
                 Ok(line) => {
@@ -1456,10 +1466,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                                     .unwrap_or_else(|| tc.arguments.clone());
 
                                 let kind = executor::classify(&cmd);
-                                let decision = if kind == executor::CommandKind::ReadOnly {
+                                let decision = if kind == executor::CommandKind::ReadOnly || self.session_auto_accepts.contains(&cmd) {
                                     CommandDecision::Accept
                                 } else {
-                                    Self::prompt_command_decision(&cmd, &self.session_auto_accepts)?
+                                    Self::readline_command_decision(&cmd, &mut self.rl)?
                                 };
 
                                 match decision {
@@ -1637,10 +1647,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     };
 
                     let kind = executor::classify(cmd);
-                    let decision = if kind == executor::CommandKind::ReadOnly {
+                    let decision = if kind == executor::CommandKind::ReadOnly || self.session_auto_accepts.contains(cmd) {
                         CommandDecision::Accept
                     } else {
-                        Self::prompt_command_decision(cmd, &self.session_auto_accepts)?
+                        Self::readline_command_decision(cmd, &mut self.rl)?
                     };
 
                     match decision {
