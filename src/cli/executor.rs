@@ -279,25 +279,38 @@ const DENY_PROGRAMS: &[&str] = &[
 ];
 
 /// Check for shell metacharacters that imply side-effects even for safe programs.
-fn has_metacharacters(raw: &str) -> bool {
-    let danger_patterns = [">", ">>", "|", ";", "&&", "||", "`", "$(", "${", "\\"];
+/// Pipes and sequential operators are handled separately in classify_line so that
+/// fully read-only pipelines (e.g. `find . | head -20 | grep foo`) don't require confirmation.
+fn has_dangerous_metacharacters(raw: &str) -> bool {
+    let danger_patterns = [">", ">>", "`", "$(", "${", "\\"];
     danger_patterns.iter().any(|p| raw.contains(p))
 }
 
-/// Classify a single (already-split) command line.
+/// Classify a single (already-split) command line, handling `|`, `;`, `&&`, `||`.
 fn classify_line(raw: &str) -> CommandKind {
-    if has_metacharacters(raw) {
+    if has_dangerous_metacharacters(raw) {
         return CommandKind::NeedsConfirm;
     }
-    let program = raw.split_whitespace().next().unwrap_or("");
-    if DENY_PROGRAMS.contains(&program) {
-        return CommandKind::NeedsConfirm;
+    // Split on pipe/sequencing operators and classify each segment.
+    // If any segment is NeedsConfirm, the whole line is NeedsConfirm.
+    for segment in raw.split(|c| c == '|' || c == ';') {
+        // Strip leading `&` to handle `&&` and `||` (they leave empty/`&` segments after split)
+        let segment = segment.trim_start_matches('&').trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let program = segment.split_whitespace().next().unwrap_or("");
+        if program.is_empty() {
+            continue;
+        }
+        if DENY_PROGRAMS.contains(&program) {
+            return CommandKind::NeedsConfirm;
+        }
+        if !SAFE_PROGRAMS.contains(&program) {
+            return CommandKind::NeedsConfirm;
+        }
     }
-    if SAFE_PROGRAMS.contains(&program) {
-        CommandKind::ReadOnly
-    } else {
-        CommandKind::NeedsConfirm
-    }
+    CommandKind::ReadOnly
 }
 
 /// Classify a raw command block. Multi-line blocks are checked line by line;
@@ -408,9 +421,14 @@ mod tests {
 
     #[test]
     fn classify_metacharacters_require_confirm() {
+        // Redirections and subshell expansion always require confirmation
         assert_eq!(classify("ls > out.txt"), CommandKind::NeedsConfirm);
-        assert_eq!(classify("cat foo | grep bar"), CommandKind::NeedsConfirm);
         assert_eq!(classify("echo $(pwd)"), CommandKind::NeedsConfirm);
+        // Pipes between safe programs are now read-only
+        assert_eq!(classify("cat foo | grep bar"), CommandKind::ReadOnly);
+        assert_eq!(classify("find . -type f | head -80"), CommandKind::ReadOnly);
+        // Pipes involving non-safe programs still require confirmation
+        assert_eq!(classify("cat foo | xargs rm"), CommandKind::NeedsConfirm);
     }
 
     #[test]
