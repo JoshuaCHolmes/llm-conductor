@@ -213,25 +213,29 @@ impl OutlierProvider {
 
     fn messages_to_text(&self, messages: &[Message]) -> String {
         use crate::types::Role;
-        messages.iter().map(|msg| match msg.role {
-            Role::System => format!("System: {}", msg.content),
-            Role::User => format!("User: {}", msg.content),
-            Role::Assistant => {
-                if let Some(ref tcs) = msg.tool_calls {
-                    let calls: Vec<String> = tcs.iter().map(|tc| {
-                        let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                            .ok()
-                            .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| tc.arguments.clone());
-                        format!("[Called bash: {}]", cmd)
-                    }).collect();
-                    let prefix = if msg.content.is_empty() { String::new() } else { format!("{}\n", msg.content) };
-                    format!("Assistant: {}{}", prefix, calls.join("\n"))
-                } else {
-                    format!("Assistant: {}", msg.content)
+        messages.iter().map(|msg| {
+            let is_conductor = msg.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false);
+            match msg.role {
+                Role::System => format!("System: {}", msg.content),
+                Role::User if is_conductor => format!("[conductor]: {}", msg.content),
+                Role::User => format!("User: {}", msg.content),
+                Role::Assistant => {
+                    if let Some(ref tcs) = msg.tool_calls {
+                        let calls: Vec<String> = tcs.iter().map(|tc| {
+                            let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                .ok()
+                                .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
+                                .unwrap_or_else(|| tc.arguments.clone());
+                            format!("[Called bash: {}]", cmd)
+                        }).collect();
+                        let prefix = if msg.content.is_empty() { String::new() } else { format!("{}\n", msg.content) };
+                        format!("Assistant: {}{}", prefix, calls.join("\n"))
+                    } else {
+                        format!("Assistant: {}", msg.content)
+                    }
                 }
+                Role::Tool => format!("[conductor]: [Shell output]\n{}\n[End of shell output]", msg.content),
             }
-            Role::Tool => format!("User: [Shell output]\n{}\n[End of shell output]", msg.content),
         }).collect::<Vec<_>>().join("\n\n")
     }
 }

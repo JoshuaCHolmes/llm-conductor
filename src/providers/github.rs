@@ -63,6 +63,7 @@ impl GitHubProvider {
 /// Serialize messages to OpenAI format with tool call / tool result support.
 fn serialize_messages_openai(messages: &[Message]) -> Vec<serde_json::Value> {
     messages.iter().map(|m| {
+        let is_conductor = m.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false);
         match m.role {
             Role::Tool => json!({
                 "role": "tool",
@@ -82,6 +83,10 @@ fn serialize_messages_openai(messages: &[Message]) -> Vec<serde_json::Value> {
                 };
                 json!({ "role": "assistant", "content": content_val, "tool_calls": tc })
             }
+            Role::User if is_conductor => json!({
+                "role": "user",
+                "content": format!("[conductor]: {}", m.content),
+            }),
             _ => json!({ "role": m.role.as_str(), "content": m.content }),
         }
     }).collect()

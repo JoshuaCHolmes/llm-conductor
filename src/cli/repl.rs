@@ -743,6 +743,10 @@ Read-only commands run automatically; commands that modify the system require us
 If a command is denied, a tool result will explain why — adjust your approach accordingly. \
 If a command fails, report the error output and ask the user how to proceed; don't retry silently.
 
+**Conversation turns:** Messages from the user come as plain user messages. \
+Automated feedback from the conductor (shell results, rubberduck critiques, tool output) \
+is prefixed with `[conductor]:` — system-generated, not typed by the user.
+
 Rubberduck tool: pass a description of your plan or decision as `query`. You will receive an adversarial \
 critique pointing out risks and gaps. Use this before complex or risky actions.
 
@@ -790,6 +794,10 @@ If a command fails, report the error output and ask the user how to proceed; don
 
 When you receive [Shell output] messages, use them to continue reasoning. \
 Once you have what you need, give your final answer without any bash blocks.
+
+**Conversation turns:** Messages from the user come as plain `User:` turns. \
+Automated feedback from the conductor system (shell output, rubberduck results, tool output) \
+arrives prefixed with `[conductor]:` — these are system-generated, not typed by the user.
 
 **Rubberduck block:** Emit a fenced `rubberduck` block containing a concise description of your plan or \
 decision. An adversarial critic reviews it and returns a critique in [Rubberduck result]. \
