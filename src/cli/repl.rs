@@ -823,6 +823,12 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         Ok(match ans.as_str() {
             "y" => CommandDecision::Accept,
             "Y" => CommandDecision::AcceptForSession,
+            "" => {
+                // Empty input — likely phantom newline from WSL idle state; treat as denial but
+                // make it visible so user understands what happened.
+                eprintln!("{} Empty input — command denied (phantom newline from idle?)", "⚠".yellow());
+                CommandDecision::Deny(String::new())
+            }
             _ => CommandDecision::Deny(ans),
         })
     }
@@ -965,12 +971,14 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         
         // REPL loop
         let mut rl = DefaultEditor::new()?;
+        let mut consecutive_eof = 0u8;
         
         loop {
             let readline = rl.readline(&format!("{} ", "❯".bright_blue().bold()));
             
             match readline {
                 Ok(line) => {
+                    consecutive_eof = 0;
                     let line = line.trim();
                     
                     if line.is_empty() {
@@ -999,13 +1007,20 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                 }
                 Err(rustyline::error::ReadlineError::Interrupted) => {
                     // Ctrl+C — cancel current line, stay in the loop
+                    consecutive_eof = 0;
                     println!();
                     continue;
                 }
                 Err(rustyline::error::ReadlineError::Eof) => {
-                    // Ctrl+D or stdin closed — clean exit
-                    println!("{}", "Goodbye!".bright_cyan());
-                    break;
+                    // WSL/terminal can send spurious EOF after idle; require two consecutive
+                    // Ctrl+D presses to actually exit, so a phantom EOF doesn't kill the session.
+                    consecutive_eof += 1;
+                    if consecutive_eof >= 2 {
+                        println!("{}", "Goodbye!".bright_cyan());
+                        break;
+                    }
+                    println!("{}", "(Press Ctrl+D again to exit)".dimmed());
+                    continue;
                 }
                 Err(e) => {
                     // Transient input error (terminal resize, interrupt from sleep, etc.)
