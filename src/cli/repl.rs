@@ -825,18 +825,17 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         println!("{} {} {}", "⚡".yellow(), "Run:".bright_white(), cmd.bright_yellow());
         print!("{}", "  [y] accept · [Y] session accept · [text] correct: ".dimmed());
         std::io::stdout().flush()?;
+
+        // Read from /dev/tty directly rather than stdin — rustyline manages the stdin fd
+        // between readline() calls, so plain read_line(&mut stdin()) gets immediate EOF.
+        // /dev/tty always refers to the controlling terminal, regardless of stdin state.
         let mut ans = String::new();
-        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut ans)?;
+        let tty = std::fs::OpenOptions::new().read(true).open("/dev/tty")?;
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(tty), &mut ans)?;
         let ans = ans.trim().to_string();
         Ok(match ans.as_str() {
             "y" => CommandDecision::Accept,
             "Y" => CommandDecision::AcceptForSession,
-            "" => {
-                // Empty input — likely phantom newline from WSL idle state; treat as denial but
-                // make it visible so user understands what happened.
-                eprintln!("{} Empty input — command denied (phantom newline from idle?)", "⚠".yellow());
-                CommandDecision::Deny(String::new())
-            }
             _ => CommandDecision::Deny(ans),
         })
     }
