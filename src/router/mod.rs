@@ -13,6 +13,12 @@ pub struct Router {
     provider_map: HashMap<ProviderId, usize>, // Maps ProviderId to index in providers vec
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Router {
     pub fn new() -> Self {
         Self {
@@ -112,8 +118,9 @@ impl Router {
     }
     
     /// Find provider for a model using the provider map
-    pub fn find_provider_for_model(&self, model: &ModelInfo) -> Option<&Box<dyn Provider>> {
+    pub fn find_provider_for_model(&self, model: &ModelInfo) -> Option<&dyn Provider> {
         self.provider_map.get(&model.provider)
             .and_then(|&idx| self.providers.get(idx))
+            .map(|b| b.as_ref())
     }
 }

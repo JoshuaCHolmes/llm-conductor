@@ -50,6 +50,7 @@ which = "7"
 # Testing infrastructure (optional features)
 tempfile = { version = "3", optional = true }
 async-trait = "0.1"
+sha2 = "0.11.0"
 
 [features]
 default = []

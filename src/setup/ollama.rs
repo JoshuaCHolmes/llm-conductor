@@ -116,28 +116,97 @@ impl OllamaInstaller {
     
     #[cfg(target_os = "linux")]
     async fn install_linux_via_script() -> Result<()> {
-        // Download and run official install script
+        use colored::*;
+        use sha2::{Digest, Sha256};
+
+        // Download the official install script and stage it for verification.
         let script = reqwest::get("https://ollama.com/install.sh")
             .await?
             .text()
             .await?;
-        
-        let temp_script = "/tmp/ollama-install.sh";
-        tokio::fs::write(temp_script, script).await?;
-        
+
+        // Reject obviously suspicious content. Ollama's installer is a POSIX
+        // shell script — anything else means the upstream URL was hijacked.
+        let head = script.lines().next().unwrap_or("").trim();
+        if !(head.starts_with("#!/bin/sh") || head.starts_with("#!/usr/bin/env sh") || head.starts_with("#!/bin/bash")) {
+            return Err(anyhow!(
+                "downloaded ollama installer doesn't start with a shell shebang (got: {:?}); refusing to execute",
+                head.chars().take(80).collect::<String>()
+            ));
+        }
+
+        // Compute and display the SHA256 so the user can pin it via env var
+        // or compare against an out-of-band known-good value.
+        let mut h = Sha256::new();
+        h.update(script.as_bytes());
+        let digest = h.finalize();
+        let hex = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+        println!("{} ollama install script downloaded ({} bytes)", "✓".bright_green(), script.len());
+        println!("  {} {}", "sha256:".dimmed(), hex.bright_white());
+
+        // If the user pinned a known-good hash via env, enforce it.
+        if let Ok(pinned) = std::env::var("LLM_CONDUCTOR_OLLAMA_INSTALL_SHA256") {
+            let pinned = pinned.trim().to_lowercase();
+            if pinned != hex {
+                return Err(anyhow!(
+                    "ollama install script SHA256 mismatch: expected {}, got {}",
+                    pinned, hex
+                ));
+            }
+            println!("  {} pinned hash matches", "✓".bright_green());
+        } else {
+            // No pin — require explicit confirmation before executing remote code.
+            // Skipping the prompt is opt-in via env so non-interactive installs work.
+            if std::env::var("LLM_CONDUCTOR_OLLAMA_INSTALL_AUTO").map(|v| v == "1").unwrap_or(false) {
+                println!("  {} LLM_CONDUCTOR_OLLAMA_INSTALL_AUTO=1 set, proceeding without prompt", "⚠".yellow());
+            } else {
+                eprintln!();
+                eprintln!("  {} About to execute the script above as your shell.", "⚠".yellow());
+                eprintln!("  {} Pin the hash for future runs:", "→".dimmed());
+                eprintln!("  {}", format!("export LLM_CONDUCTOR_OLLAMA_INSTALL_SHA256={}", hex).dimmed());
+                eprint!("  {} ", "Proceed? [y/N]:".bright_yellow());
+                use std::io::Write;
+                std::io::stderr().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                    return Err(anyhow!("user declined ollama installer execution"));
+                }
+            }
+        }
+
+        // Stage to a private temp file (0o700 dir, 0o600 file on unix).
+        let temp_dir = std::env::temp_dir();
+        let temp_script = temp_dir.join(format!("ollama-install-{}.sh", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_script)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            }
+            f.write_all(script.as_bytes())?;
+            f.sync_all()?;
+        }
+
         let output = Command::new("sh")
-            .arg(temp_script)
+            .arg(&temp_script)
             .output()
             .map_err(|e| anyhow!("Failed to execute install script: {}", e))?;
-        
-        // Clean up
-        let _ = std::fs::remove_file(temp_script);
-        
+
+        let _ = std::fs::remove_file(&temp_script);
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("{}", stderr));
         }
-        
+
         Ok(())
     }
     
@@ -210,7 +279,7 @@ impl OllamaInstaller {
         
         // Install ollama to user profile
         let output = Command::new("nix-env")
-            .args(&["-iA", "nixpkgs.ollama"])
+            .args(["-iA", "nixpkgs.ollama"])
             .output()
             .map_err(|e| anyhow!("Failed to run nix-env: {}", e))?;
         

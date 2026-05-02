@@ -21,7 +21,7 @@ pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
     std::thread::spawn(move || {
         let fd = unsafe {
             libc::open(
-                b"/dev/tty\0".as_ptr() as *const libc::c_char,
+                c"/dev/tty".as_ptr(),
                 libc::O_RDONLY | libc::O_NONBLOCK,
             )
         };

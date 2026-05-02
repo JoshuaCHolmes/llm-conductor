@@ -326,6 +326,55 @@ const DENY_PROGRAMS: &[&str] = &[
     "env", "printenv", // may expose credentials in shell environment
 ];
 
+/// Read-only `git` subcommands: safe to run without confirmation.
+/// `config`, `stash`, and similar are handled by the special-case branches in
+/// `is_readonly_git_invocation` and intentionally NOT listed here so the
+/// fall-through doesn't accidentally permit a write form.
+const GIT_READONLY_SUBCOMMANDS: &[&str] = &[
+    "status", "log", "diff", "show", "branch", "rev-parse", "ls-files",
+    "blame", "describe", "remote", "rev-list", "shortlog",
+    "tag", "reflog", "ls-remote", "for-each-ref", "cat-file", "name-rev",
+    "show-ref", "ls-tree", "grep",
+];
+
+fn is_readonly_git_invocation(segment: &str) -> bool {
+    let mut parts = segment.split_whitespace();
+    if parts.next() != Some("git") { return false; }
+    // Skip leading git-level flags like `-c key=val` or `--no-pager`.
+    let sub = loop {
+        match parts.next() {
+            None => return false,
+            Some(tok) if tok.starts_with('-') => {
+                if tok == "-c" || tok == "-C" { let _ = parts.next(); }
+                continue;
+            }
+            Some(tok) => break tok,
+        }
+    };
+    // Special cases: writeable subcommands with read-only flag forms.
+    match sub {
+        "config" => {
+            // `git config --get …` etc. is read-only; bare `git config k v` writes.
+            return parts.any(|t| matches!(t,
+                "--get" | "-l" | "--list" | "--show-origin" | "--get-all" | "--get-regexp"
+            ));
+        }
+        "stash" => {
+            // `git stash` (no subcommand) defaults to `stash push` which writes.
+            return matches!(parts.next(), Some("list") | Some("show"));
+        }
+        "remote" => {
+            // `git remote add foo …` writes; `git remote -v` / `git remote show` are safe.
+            // The generic list already covers `remote` for the bare/list case;
+            // disallow if any positional that looks like a write subcommand follows.
+            let writes = ["add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune", "update"];
+            return !parts.any(|t| writes.contains(&t));
+        }
+        _ => {}
+    }
+    GIT_READONLY_SUBCOMMANDS.contains(&sub)
+}
+
 /// Check for shell metacharacters that imply side-effects even for safe programs.
 /// Pipes and sequential operators are handled separately in classify_line so that
 /// fully read-only pipelines (e.g. `find . | head -20 | grep foo`) don't require confirmation.
@@ -341,7 +390,7 @@ fn classify_line(raw: &str) -> CommandKind {
     }
     // Split on pipe/sequencing operators and classify each segment.
     // If any segment is NeedsConfirm, the whole line is NeedsConfirm.
-    for segment in raw.split(|c| c == '|' || c == ';') {
+    for segment in raw.split(['|', ';']) {
         // Strip leading `&` to handle `&&` and `||` (they leave empty/`&` segments after split)
         let segment = segment.trim_start_matches('&').trim();
         if segment.is_empty() {
@@ -352,6 +401,10 @@ fn classify_line(raw: &str) -> CommandKind {
             continue;
         }
         if DENY_PROGRAMS.contains(&program) {
+            // Special-case: read-only `git` subcommands are safe.
+            if program == "git" && is_readonly_git_invocation(segment) {
+                continue;
+            }
             return CommandKind::NeedsConfirm;
         }
         if !SAFE_PROGRAMS.contains(&program) {
@@ -465,6 +518,27 @@ mod tests {
         assert_eq!(classify("rm -rf /"), CommandKind::NeedsConfirm);
         assert_eq!(classify("sudo apt install foo"), CommandKind::NeedsConfirm);
         assert_eq!(classify("git push"), CommandKind::NeedsConfirm);
+    }
+
+    #[test]
+    fn classify_git_readonly_subcommands_safe() {
+        assert_eq!(classify("git status"), CommandKind::ReadOnly);
+        assert_eq!(classify("git log --oneline -10"), CommandKind::ReadOnly);
+        assert_eq!(classify("git diff HEAD~1"), CommandKind::ReadOnly);
+        assert_eq!(classify("git show abc123"), CommandKind::ReadOnly);
+        assert_eq!(classify("git branch -v"), CommandKind::ReadOnly);
+        assert_eq!(classify("git rev-parse HEAD"), CommandKind::ReadOnly);
+        assert_eq!(classify("git ls-files"), CommandKind::ReadOnly);
+        assert_eq!(classify("git --no-pager log"), CommandKind::ReadOnly);
+        assert_eq!(classify("git -c color.ui=never status"), CommandKind::ReadOnly);
+        assert_eq!(classify("git stash list"), CommandKind::ReadOnly);
+        assert_eq!(classify("git config --get user.email"), CommandKind::ReadOnly);
+        // ... but writes still need confirm.
+        assert_eq!(classify("git push"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git commit -am foo"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git stash"), CommandKind::NeedsConfirm); // stash with no sub = push
+        assert_eq!(classify("git stash pop"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git config user.email foo@bar"), CommandKind::NeedsConfirm);
     }
 
     #[test]

@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role, ToolCall};
+use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, ToolCall};
 use super::{Provider, ToolDefinition, ToolCallResponse, serialize_messages_openai};
 
 /// GitHub Copilot provider using GitHub Models API
@@ -17,6 +17,7 @@ pub struct GitHubProvider {
 
 #[derive(Debug, Deserialize)]
 struct GitHubMessage {
+    #[allow(dead_code)]
     role: String,
     content: String,
 }

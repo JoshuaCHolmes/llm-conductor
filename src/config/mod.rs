@@ -26,7 +26,7 @@ impl CredentialManager {
     /// Interactive setup for all credentials
     pub async fn interactive_setup(&self) -> Result<()> {
         use colored::*;
-        use dialoguer::{Confirm, Input, Password};
+        use dialoguer::{Confirm, Password};
         
         println!("\n{}", "=== API Credentials Setup ===".bright_cyan().bold());
         println!("Let's configure your API keys for cloud providers.\n");
@@ -78,10 +78,14 @@ impl CredentialManager {
         Ok(())
     }
     
-    /// Save a single credential
+    /// Save a single credential.
+    ///
+    /// Writes atomically via tmp + rename, and on Unix tightens permissions
+    /// to 0o600 so secrets aren't world-readable. The directory is also
+    /// chmod'd to 0o700 best-effort.
     pub fn save_credential(&self, key: &str, value: &str) -> Result<()> {
         let env_file = self.config_dir.join(".env");
-        
+
         // Read existing .env if it exists
         let mut env_vars = if env_file.exists() {
             std::fs::read_to_string(&env_file)?
@@ -92,16 +96,48 @@ impl CredentialManager {
         } else {
             Vec::new()
         };
-        
+
         // Remove old value if exists
         env_vars.retain(|line| !line.starts_with(&format!("{}=", key)));
-        
+
         // Add new value
         env_vars.push(format!("{}={}", key, value));
-        
-        // Write back
-        std::fs::write(env_file, env_vars.join("\n") + "\n")?;
-        
+
+        // Atomic write: temp file in same dir, fsync, rename. Avoids leaving
+        // a half-written .env if the process is killed mid-write.
+        let tmp = self.config_dir.join(".env.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(env_vars.join("\n").as_bytes())?;
+            f.write_all(b"\n")?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &env_file)?;
+
+        // Re-assert permissions on the destination (rename preserves source perms,
+        // but be defensive in case the tmp branch was skipped on Windows).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&self.config_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(windows)]
+        {
+            // No POSIX mode bits; warn once if the file is in a clearly-shared location.
+            tracing::debug!("credential .env saved at {} (Windows ACLs not tightened)", env_file.display());
+        }
+
         Ok(())
     }
     
@@ -198,17 +234,14 @@ pub struct UserPreferences {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum VerbosityLevel {
     Minimal,
+    #[default]
     Normal,
     Verbose,
 }
 
-impl Default for VerbosityLevel {
-    fn default() -> Self {
-        VerbosityLevel::Normal
-    }
-}
 
 impl UserInfoManager {
     pub fn new() -> Result<Self> {

@@ -2,14 +2,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use tracing_subscriber;
 
 use llm_conductor::cli::Repl;
 use llm_conductor::config::{CredentialManager, ProviderConfigManager, UserInfoManager};
 use llm_conductor::providers::OllamaProvider;
 use llm_conductor::router::Router;
 use llm_conductor::setup::{FirstRunSetup, InstallStatus, OllamaInstaller};
-use llm_conductor::usage_tracking::{UsageTracker, ProviderUsage, ResetPeriod};
+use llm_conductor::usage_tracking::UsageTracker;
 use llm_conductor::types::ProviderId;
 
 #[derive(Parser)]
@@ -268,9 +267,8 @@ async fn list_providers() -> Result<()> {
     match OllamaInstaller::check_installation().await {
         InstallStatus::InstalledAndRunning => {
             print!("{}", "✓ Running".bright_green());
-            if let Some(usage) = usage_tracker.get_usage(&ProviderId::Ollama) {
-                let remaining = usage.remaining_capacity();
-                println!(" ({})", format!("Unlimited").dimmed());
+            if let Some(_usage) = usage_tracker.get_usage(&ProviderId::Ollama) {
+                println!(" ({})", "Unlimited".dimmed());
             } else {
                 println!(" ({})", "No usage data".dimmed());
             }
@@ -307,7 +305,7 @@ async fn list_providers() -> Result<()> {
                     LimitType::Unlimited => {
                         println!(" ({})", "Unlimited".dimmed());
                     }
-                    LimitType::RequestBased { max_requests, current_requests, reset_period, next_reset } => {
+                    LimitType::RequestBased { max_requests, current_requests, reset_period, next_reset: _ } => {
                         let remaining = max_requests - current_requests;
                         let formatted_remaining = if remaining == 0 {
                             remaining.to_string().bright_red()
@@ -420,7 +418,7 @@ async fn handle_config_command(cmd: ConfigCommands) -> Result<()> {
             cred_manager.interactive_setup().await?;
         }
         
-        ConfigCommands::AddOutlier { browser, profile } => {
+        ConfigCommands::AddOutlier { browser, profile: _ } => {
             use colored::*;
             println!("{}", "⚠ Automated Outlier cookie extraction not yet implemented".yellow());
             println!();
@@ -443,10 +441,8 @@ async fn handle_config_command(cmd: ConfigCommands) -> Result<()> {
             // Determine enabled state
             let enabled = if disable {
                 false
-            } else if let Some(e) = enable {
-                e
             } else {
-                true // Default to enable if neither flag specified
+                enable.unwrap_or(true)
             };
             
             provider_manager.set_enabled(&provider, enabled)?;

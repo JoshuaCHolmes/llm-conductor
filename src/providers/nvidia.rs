@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
+use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId};
 use super::Provider;
 
 /// NVIDIA NIM provider for free AI inference
@@ -17,6 +17,7 @@ pub struct NvidiaProvider {
 
 #[derive(Debug, Deserialize)]
 struct NvidiaMessage {
+    #[allow(dead_code)]
     role: String,
     content: String,
 }

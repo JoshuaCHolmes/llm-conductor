@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role, ToolCall};
+use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, ToolCall};
 use super::{Provider, ToolDefinition, ToolCallResponse, serialize_messages_openai};
 
 /// TAMU AI provider using Texas A&M's OpenWebUI-based API
@@ -18,6 +18,7 @@ pub struct TamuProvider {
 
 #[derive(Debug, Deserialize)]
 struct TamuMessage {
+    #[allow(dead_code)]
     role: String,
     content: String,
 }

@@ -29,6 +29,7 @@ impl Default for ProviderSettings {
 /// Main provider configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ProvidersConfig {
     /// Ollama local model provider
     pub ollama: ProviderSettings,
@@ -46,17 +47,6 @@ pub struct ProvidersConfig {
     pub outlier: ProviderSettings,
 }
 
-impl Default for ProvidersConfig {
-    fn default() -> Self {
-        Self {
-            ollama: ProviderSettings::default(),
-            github: ProviderSettings::default(),
-            tamu: ProviderSettings::default(),
-            nvidia: ProviderSettings::default(),
-            outlier: ProviderSettings::default(),
-        }
-    }
-}
 
 /// Manager for provider configuration
 pub struct ProviderConfigManager {

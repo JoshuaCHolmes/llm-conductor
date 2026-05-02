@@ -78,6 +78,7 @@ impl CoreContext {
         self.constraints.iter().map(|s| s.len() / 4).sum::<usize>()
     }
 
+    #[allow(clippy::inherent_to_string)]
     fn to_string(&self) -> String {
         let mut parts = vec![self.system_instructions.clone()];
         
@@ -114,6 +115,7 @@ impl ProjectContext {
         self.conventions.len() * 10
     }
 
+    #[allow(clippy::inherent_to_string)]
     fn to_string(&self) -> String {
         format!(
             "Project: {}\n{}\n\nArchitecture:\n{}\n\nKey files: {}",

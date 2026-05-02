@@ -213,9 +213,43 @@ fn render_markdown_line(line: &str) -> String {
     render_inline(line)
 }
 
+/// Which fenced region the streaming parser is currently inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceKind { Bash, BashLong, BashSub, Tool, Rubberduck }
+
+impl FenceKind {
+    /// Opening marker (without trailing newline). Order matters in the parser:
+    /// `bash-sub` and `bash-long` must be tried before `bash`.
+    fn marker(self) -> &'static str {
+        match self {
+            FenceKind::BashSub    => "```bash-sub",
+            FenceKind::BashLong   => "```bash-long",
+            FenceKind::Bash       => "```bash",
+            FenceKind::Tool       => "```tool",
+            FenceKind::Rubberduck => "```rubberduck",
+        }
+    }
+}
+
+/// Longest opening marker we need to keep in `pending` to safely detect a fence
+/// even when its leading backticks straddle a chunk boundary. Equals
+/// `"```rubberduck".len()` (13).
+const MAX_FENCE_MARKER_LEN: usize = 13;
+
+/// Top-level streaming state: outside any fence, inside `<think>`, or inside
+/// one of the action fences. Replaces the previous six bool/buffer pair.
+#[derive(Default)]
+enum StreamMode {
+    #[default]
+    Normal,
+    Think,
+    InFence { kind: FenceKind, buf: String },
+}
+
+
 /// State machine for streaming model responses.
 ///
-/// Handles six special regions transparently:
+/// Handles two transparent regions and five action-fence regions:
 /// - `<think>...</think>` — printed dimmed, excluded from `clean_text`
 /// - ` ```bash...``` ` (sync) — silently captured; blank gap suppressed
 /// - ` ```bash-long...``` ` — same as bash but uses extended timeout on run
@@ -227,19 +261,9 @@ fn render_markdown_line(line: &str) -> String {
 /// basis. Trailing newlines are discarded to avoid blank lines after output.
 #[derive(Default)]
 struct ReplyStreamState {
-    in_think: bool,
-    in_bash: bool,
-    in_bash_long: bool,
-    in_bash_sub: bool,
-    in_tool: bool,
-    in_rubberduck: bool,
+    mode: StreamMode,
     showed_thinking: bool,
     pending: String,
-    bash_block_buf: String,
-    bash_long_block_buf: String,
-    bash_sub_block_buf: String,
-    tool_block_buf: String,
-    rubberduck_buf: String,
     /// Accumulates the current incomplete line until a newline arrives.
     line_buf: String,
     /// Trailing newlines held back until we know what follows them.
@@ -260,7 +284,7 @@ impl ReplyStreamState {
     /// Print any deferred blank lines before new content.
     fn flush_deferred(&mut self) {
         for _ in 0..self.deferred_newlines {
-            print!("\n");
+            println!();
             self.clean_text.push('\n');
         }
         self.deferred_newlines = 0;
@@ -305,15 +329,78 @@ impl ReplyStreamState {
         }
     }
 
-    /// Flush text that precedes a bash block: trim trailing whitespace, print via
+    /// Flush text that precedes a fence: trim trailing whitespace, print via
     /// normal renderer, then discard any deferred newlines so no blank gap appears.
-    fn flush_before_bash(&mut self, before: &str) {
-        let trimmed = before.trim_end_matches(|c: char| c == '\n' || c == ' ');
+    fn flush_before_fence(&mut self, before: &str) {
+        let trimmed = before.trim_end_matches(['\n', ' ']);
         if !trimmed.is_empty() {
             self.print_normal(trimmed);
         }
-        self.flush_line_buf(); // flush partial line if any
+        self.flush_line_buf();
         self.deferred_newlines = 0;
+    }
+
+    /// Find the earliest fence-opening or `<think>` marker in `pending`.
+    /// Returns `None` if none found. The sync `bash` marker uses
+    /// `find_sync_bash` so it doesn't false-match `bash-long` / `bash-sub`.
+    fn earliest_marker(&self) -> Option<(MarkerHit, usize)> {
+        let mut best: Option<(MarkerHit, usize)> = None;
+        let mut consider = |hit: MarkerHit, pos: Option<usize>| {
+            if let Some(p) = pos {
+                if best.as_ref().is_none_or(|(_, bp)| p < *bp) {
+                    best = Some((hit, p));
+                }
+            }
+        };
+        consider(MarkerHit::Think, self.pending.find("<think>"));
+        consider(MarkerHit::Fence(FenceKind::BashSub),  self.pending.find(FenceKind::BashSub.marker()));
+        consider(MarkerHit::Fence(FenceKind::BashLong), self.pending.find(FenceKind::BashLong.marker()));
+        consider(MarkerHit::Fence(FenceKind::Bash),     find_sync_bash(&self.pending));
+        consider(MarkerHit::Fence(FenceKind::Tool), self.pending.find(FenceKind::Tool.marker())
+            .filter(|&p| !self.pending[p..].starts_with("```tool-")));
+        consider(MarkerHit::Fence(FenceKind::Rubberduck), self.pending.find(FenceKind::Rubberduck.marker())
+            .filter(|&p| !self.pending[p..].starts_with("```rubberduck-")));
+        best
+    }
+
+    /// Action fence finished — emit the inline placeholder (if any) and
+    /// register the resulting Action. Returns the parsed Action, if any.
+    fn dispatch_fence(&mut self, kind: FenceKind, buf: String) {
+        let body = buf.trim().to_string();
+        if body.is_empty() { return; }
+        match kind {
+            FenceKind::Bash     => self.actions.push(Action::Bash(body)),
+            FenceKind::BashLong => self.actions.push(Action::BashLong(body)),
+            FenceKind::BashSub  => {
+                let preview: String = body.lines().next().unwrap_or("").chars().take(40).collect();
+                self.flush_deferred();
+                let ph = format!("[⚡ {}]", preview);
+                print!("{}", ph.yellow().dimmed());
+                std::io::stdout().flush().unwrap();
+                self.clean_text.push_str(&ph);
+                self.actions.push(Action::BashSub(body));
+            }
+            FenceKind::Tool => {
+                let fn_name = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["function"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "tool".to_string());
+                self.flush_deferred();
+                let ph = format!("[🔧 {}]", fn_name);
+                print!("{}", ph.yellow().dimmed());
+                std::io::stdout().flush().unwrap();
+                self.clean_text.push_str(&ph);
+                self.actions.push(Action::Tool(body));
+            }
+            FenceKind::Rubberduck => {
+                self.flush_deferred();
+                let ph = "[🦆 rubberduck...]";
+                print!("{}", ph.cyan().dimmed());
+                std::io::stdout().flush().unwrap();
+                self.clean_text.push_str(ph);
+                self.actions.push(Action::Think(body));
+            }
+        }
     }
 
     pub fn process_chunk(&mut self, chunk: &str) {
@@ -321,7 +408,7 @@ impl ReplyStreamState {
 
         // Suppress leading whitespace/newlines before the first real content
         if !self.has_started {
-            let trimmed = self.pending.trim_start_matches(|c: char| c == '\n' || c == '\r' || c == ' ');
+            let trimmed = self.pending.trim_start_matches(['\n', '\r', ' ']);
             if !trimmed.is_empty() {
                 self.has_started = true;
                 self.pending = trimmed.to_string();
@@ -332,189 +419,92 @@ impl ReplyStreamState {
         }
 
         loop {
-            if self.in_bash {
-                if let Some(pos) = self.pending.find("```") {
-                    self.bash_block_buf.push_str(&self.pending[..pos]);
-                    let cmd = self.bash_block_buf.trim().to_string();
-                    if !cmd.is_empty() {
-                        self.actions.push(Action::Bash(cmd));
+            // Take ownership of mode for borrow-checker reasons; restore at end.
+            let mode = std::mem::replace(&mut self.mode, StreamMode::Normal);
+            match mode {
+                StreamMode::InFence { kind, mut buf } => {
+                    if let Some(pos) = self.pending.find("```") {
+                        buf.push_str(&self.pending[..pos]);
+                        self.pending = self.pending[pos + 3..].to_string();
+                        self.dispatch_fence(kind, buf);
+                        // mode left as Normal; loop continues
+                    } else {
+                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                        if safe > 0 {
+                            buf.push_str(&self.pending[..safe]);
+                            self.pending = self.pending[safe..].to_string();
+                        }
+                        self.mode = StreamMode::InFence { kind, buf };
+                        break;
                     }
-                    self.bash_block_buf.clear();
-                    self.in_bash = false;
-                    self.pending = self.pending[pos + 3..].to_string();
-                } else {
-                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
-                    if safe > 0 {
-                        self.bash_block_buf.push_str(&self.pending[..safe]);
-                        self.pending = self.pending[safe..].to_string();
-                    }
-                    break;
                 }
-            } else if self.in_bash_long {
-                if let Some(pos) = self.pending.find("```") {
-                    self.bash_long_block_buf.push_str(&self.pending[..pos]);
-                    let cmd = self.bash_long_block_buf.trim().to_string();
-                    if !cmd.is_empty() {
-                        self.actions.push(Action::BashLong(cmd));
-                    }
-                    self.bash_long_block_buf.clear();
-                    self.in_bash_long = false;
-                    self.pending = self.pending[pos + 3..].to_string();
-                } else {
-                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
-                    if safe > 0 {
-                        self.bash_long_block_buf.push_str(&self.pending[..safe]);
-                        self.pending = self.pending[safe..].to_string();
-                    }
-                    break;
-                }
-            } else if self.in_bash_sub {
-                if let Some(pos) = self.pending.find("```") {
-                    self.bash_sub_block_buf.push_str(&self.pending[..pos]);
-                    let cmd = self.bash_sub_block_buf.trim().to_string();
-                    if !cmd.is_empty() {
-                        let preview: String = cmd.lines().next().unwrap_or("").chars().take(40).collect();
-                        self.flush_deferred();
-                        let ph = format!("[⚡ {}]", preview);
-                        print!("{}", ph.yellow().dimmed());
-                        std::io::stdout().flush().unwrap();
-                        self.clean_text.push_str(&ph);
-                        self.actions.push(Action::BashSub(cmd));
-                    }
-                    self.bash_sub_block_buf.clear();
-                    self.in_bash_sub = false;
-                    self.pending = self.pending[pos + 3..].to_string();
-                } else {
-                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
-                    if safe > 0 {
-                        self.bash_sub_block_buf.push_str(&self.pending[..safe]);
-                        self.pending = self.pending[safe..].to_string();
-                    }
-                    break;
-                }
-            } else if self.in_tool {
-                if let Some(pos) = self.pending.find("```") {
-                    self.tool_block_buf.push_str(&self.pending[..pos]);
-                    let content = self.tool_block_buf.trim().to_string();
-                    if !content.is_empty() {
-                        let fn_name = serde_json::from_str::<serde_json::Value>(&content)
-                            .ok()
-                            .and_then(|v| v["function"].as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| "tool".to_string());
-                        self.flush_deferred();
-                        let ph = format!("[🔧 {}]", fn_name);
-                        print!("{}", ph.yellow().dimmed());
-                        std::io::stdout().flush().unwrap();
-                        self.clean_text.push_str(&ph);
-                        self.actions.push(Action::Tool(content));
-                    }
-                    self.tool_block_buf.clear();
-                    self.in_tool = false;
-                    self.pending = self.pending[pos + 3..].to_string();
-                } else {
-                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
-                    if safe > 0 {
-                        self.tool_block_buf.push_str(&self.pending[..safe]);
-                        self.pending = self.pending[safe..].to_string();
-                    }
-                    break;
-                }
-            } else if self.in_rubberduck {
-                if let Some(pos) = self.pending.find("```") {
-                    self.rubberduck_buf.push_str(&self.pending[..pos]);
-                    let query = self.rubberduck_buf.trim().to_string();
-                    if !query.is_empty() {
-                        self.flush_deferred();
-                        let ph = "[🦆 rubberduck...]";
-                        print!("{}", ph.cyan().dimmed());
-                        std::io::stdout().flush().unwrap();
-                        self.clean_text.push_str(ph);
-                        self.actions.push(Action::Think(query));
-                    }
-                    self.rubberduck_buf.clear();
-                    self.in_rubberduck = false;
-                    self.pending = self.pending[pos + 3..].to_string();
-                } else {
-                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
-                    if safe > 0 {
-                        self.rubberduck_buf.push_str(&self.pending[..safe]);
-                        self.pending = self.pending[safe..].to_string();
-                    }
-                    break;
-                }
-            } else if self.in_think {
-                if let Some(pos) = self.pending.find("</think>") {
-                    let before = &self.pending[..pos];
-                    if !before.is_empty() {
-                        print!("{}", before.dimmed());
-                        std::io::stdout().flush().unwrap();
-                    }
-                    self.in_think = false;
-                    self.pending = self.pending[pos + "</think>".len()..].to_string();
-                } else {
-                    let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(8));
-                    if safe > 0 {
-                        print!("{}", self.pending[..safe].dimmed());
-                        std::io::stdout().flush().unwrap();
-                        self.pending = self.pending[safe..].to_string();
-                    }
-                    break;
-                }
-            } else {
-                let think_pos    = self.pending.find("<think>");
-                let sub_pos      = self.pending.find("```bash-sub");
-                let long_pos     = self.pending.find("```bash-long");
-                let sync_pos     = find_sync_bash(&self.pending);
-                let tool_pos     = self.pending.find("```tool")
-                    .filter(|&p| !self.pending[p..].starts_with("```tool-"));
-                let rubberduck_pos = self.pending.find("```rubberduck")
-                    .filter(|&p| !self.pending[p..].starts_with("```rubberduck-"));
-
-                let first = [
-                    think_pos       .map(|p| (0u8, p)),
-                    sub_pos         .map(|p| (1u8, p)),
-                    long_pos        .map(|p| (2u8, p)),
-                    sync_pos        .map(|p| (3u8, p)),
-                    tool_pos        .map(|p| (4u8, p)),
-                    rubberduck_pos .map(|p| (5u8, p)),
-                ].iter().filter_map(|x| *x).min_by_key(|&(_, p)| p);
-
-                match first {
-                    Some((0, pos)) => {
-                        let before = self.pending[..pos].to_string();
+                StreamMode::Think => {
+                    if let Some(pos) = self.pending.find("</think>") {
+                        let before = &self.pending[..pos];
                         if !before.is_empty() {
-                            self.print_normal(&before);
+                            print!("{}", before.dimmed());
+                            std::io::stdout().flush().unwrap();
                         }
-                        self.flush_line_buf();
-                        self.flush_deferred();
-                        if !self.showed_thinking {
-                            println!("{}", "💭 Thinking...".dimmed().italic());
-                            self.showed_thinking = true;
+                        self.pending = self.pending[pos + "</think>".len()..].to_string();
+                        // mode resets to Normal
+                    } else {
+                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(8));
+                        if safe > 0 {
+                            print!("{}", self.pending[..safe].dimmed());
+                            std::io::stdout().flush().unwrap();
+                            self.pending = self.pending[safe..].to_string();
                         }
-                        self.in_think = true;
-                        self.pending = self.pending[pos + "<think>".len()..].to_string();
+                        self.mode = StreamMode::Think;
+                        break;
                     }
-                    Some((1, pos)) => {
-                        let before = self.pending[..pos].to_string();
-                        self.flush_before_bash(&before);
-                        self.in_bash_sub = true;
-                        let rest = &self.pending[pos + "```bash-sub".len()..];
-                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
-                    }
-                    Some((2, pos)) => {
-                        let before = self.pending[..pos].to_string();
-                        self.flush_before_bash(&before);
-                        self.in_bash_long = true;
-                        let rest = &self.pending[pos + "```bash-long".len()..];
-                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
-                    }
-                    Some((3, pos)) => {
-                        let after_start = pos + "```bash".len();
-                        let remaining = self.pending[after_start..].to_string();
-                        // Guard: need enough lookahead to rule out -long/-sub suffix.
-                        // If remaining is empty or starts with '-' with < 5 chars, wait.
-                        if remaining.is_empty() || (remaining.starts_with('-') && remaining.len() < "-sub".len()) {
-                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
+                }
+                StreamMode::Normal => {
+                    let hit = self.earliest_marker();
+                    match hit {
+                        Some((MarkerHit::Think, pos)) => {
+                            let before = self.pending[..pos].to_string();
+                            if !before.is_empty() {
+                                self.print_normal(&before);
+                            }
+                            self.flush_line_buf();
+                            self.flush_deferred();
+                            if !self.showed_thinking {
+                                println!("{}", "💭 Thinking...".dimmed().italic());
+                                self.showed_thinking = true;
+                            }
+                            self.pending = self.pending[pos + "<think>".len()..].to_string();
+                            self.mode = StreamMode::Think;
+                        }
+                        Some((MarkerHit::Fence(FenceKind::Bash), pos)) => {
+                            // Sync `bash` requires extra lookahead to be sure
+                            // we haven't matched the `bash` prefix of a yet-unseen
+                            // `bash-long` or `bash-sub`.
+                            let after_start = pos + "```bash".len();
+                            let remaining_owned = self.pending[after_start..].to_string();
+                            if remaining_owned.is_empty() || (remaining_owned.starts_with('-') && remaining_owned.len() < "-sub".len()) {
+                                let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(MAX_FENCE_MARKER_LEN));
+                                if safe > 0 {
+                                    let to_print = self.pending[..safe].to_string();
+                                    self.print_normal(&to_print);
+                                    self.pending = self.pending[safe..].to_string();
+                                }
+                                break;
+                            }
+                            let before = self.pending[..pos].to_string();
+                            self.flush_before_fence(&before);
+                            self.pending = remaining_owned.strip_prefix('\n').unwrap_or(&remaining_owned).to_string();
+                            self.mode = StreamMode::InFence { kind: FenceKind::Bash, buf: String::new() };
+                        }
+                        Some((MarkerHit::Fence(kind), pos)) => {
+                            let before = self.pending[..pos].to_string();
+                            self.flush_before_fence(&before);
+                            let rest = &self.pending[pos + kind.marker().len()..];
+                            self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
+                            self.mode = StreamMode::InFence { kind, buf: String::new() };
+                        }
+                        None => {
+                            // No marker — print everything except the lookahead window.
+                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(MAX_FENCE_MARKER_LEN));
                             if safe > 0 {
                                 let to_print = self.pending[..safe].to_string();
                                 self.print_normal(&to_print);
@@ -522,34 +512,6 @@ impl ReplyStreamState {
                             }
                             break;
                         }
-                        let before = self.pending[..pos].to_string();
-                        self.flush_before_bash(&before);
-                        self.in_bash = true;
-                        self.pending = if remaining.starts_with('\n') { remaining[1..].to_string() } else { remaining };
-                    }
-                    Some((4, pos)) => {
-                        let before = self.pending[..pos].to_string();
-                        self.flush_before_bash(&before);
-                        self.in_tool = true;
-                        let rest = &self.pending[pos + "```tool".len()..];
-                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
-                    }
-                    Some((5, pos)) => {
-                        let before = self.pending[..pos].to_string();
-                        self.flush_before_bash(&before);
-                        self.in_rubberduck = true;
-                        let rest = &self.pending[pos + "```rubberduck".len()..];
-                        self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
-                    }
-                    _ => {
-                        // Keep enough bytes to detect the longest marker ("```rubberduck" = 13)
-                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(13));
-                        if safe > 0 {
-                            let to_print = self.pending[..safe].to_string();
-                            self.print_normal(&to_print);
-                            self.pending = self.pending[safe..].to_string();
-                        }
-                        break;
                     }
                 }
             }
@@ -566,30 +528,40 @@ impl ReplyStreamState {
         }
         self.deferred_newlines = 0;
         if !self.pending.is_empty() {
-            let in_any_block = self.in_bash || self.in_bash_long || self.in_bash_sub
-                || self.in_tool || self.in_rubberduck;
-            if in_any_block {
-                // Truncated/unclosed block — discard silently
-            } else if self.in_think {
-                print!("{}", self.pending.dimmed());
-                std::io::stdout().flush().unwrap();
-            } else {
-                let trimmed = self.pending.trim_end_matches('\n');
-                if !trimmed.is_empty() {
-                    let rendered = render_markdown_line(trimmed);
-                    print!("{}", rendered);
-                    self.clean_text.push_str(trimmed);
+            // Take mode by replace so we can match by value; whatever path we take
+            // resets to Normal at the end (the parser is consumed at flush time).
+            let mode = std::mem::replace(&mut self.mode, StreamMode::Normal);
+            match mode {
+                StreamMode::InFence { .. } => {
+                    // Truncated/unclosed block — discard silently
+                }
+                StreamMode::Think => {
+                    print!("{}", self.pending.dimmed());
                     std::io::stdout().flush().unwrap();
+                }
+                StreamMode::Normal => {
+                    let trimmed = self.pending.trim_end_matches('\n');
+                    if !trimmed.is_empty() {
+                        let rendered = render_markdown_line(trimmed);
+                        print!("{}", rendered);
+                        self.clean_text.push_str(trimmed);
+                        std::io::stdout().flush().unwrap();
+                    }
                 }
             }
             self.pending.clear();
+        } else {
+            // Even with empty pending, an open fence at flush time stays discarded.
+            self.mode = StreamMode::Normal;
         }
-        self.bash_block_buf.clear();
-        self.bash_long_block_buf.clear();
-        self.bash_sub_block_buf.clear();
-        self.tool_block_buf.clear();
-        self.rubberduck_buf.clear();
     }
+}
+
+/// Result of `earliest_marker` — what kind of marker we hit and where.
+#[derive(Debug, Clone, Copy)]
+enum MarkerHit {
+    Think,
+    Fence(FenceKind),
 }
 
 /// Decision returned when prompting the user about a destructive command.
@@ -617,8 +589,8 @@ fn find_compact_boundary(history: &[Message], desired_keep: usize) -> usize {
         return 0;
     }
     let split = history.len() - desired_keep;
-    for i in split..history.len() {
-        if matches!(history[i].role, crate::types::Role::User) {
+    for (i, msg) in history.iter().enumerate().skip(split) {
+        if matches!(msg.role, crate::types::Role::User) {
             return i;
         }
     }
@@ -1247,7 +1219,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
     async fn handle_command(&mut self, command: &str) -> Result<bool> {
         let parts: Vec<&str> = command.split_whitespace().collect();
         
-        match parts.get(0).map(|s| *s) {
+        match parts.first().copied() {
             Some("/help") => {
                 self.print_help();
                 Ok(true)
@@ -1293,14 +1265,14 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 }
                 Ok(true)
             }
-            Some("/new") | Some("/session") if parts.get(1).map_or(true, |s| *s == "new") => {
+            Some("/new") | Some("/session") if parts.get(1).is_none_or(|s| *s == "new") => {
                 self.router.reset_all_sessions().await;
                 self.reset_session_state().await;
                 println!("{}", "✓ Started new conversation".green());
                 Ok(true)
             }
             Some("/allow") => {
-                match parts.get(1).map(|s| *s) {
+                match parts.get(1).copied() {
                     None | Some("list") => {
                         if self.session_auto_accepts.is_empty() {
                             println!("{}", "No session auto-accepts.".dimmed());
@@ -1343,7 +1315,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 Ok(true)
             }
             Some("/sessions") => {
-                let arg = parts.get(1).map(|s| *s);
+                let arg = parts.get(1).copied();
                 match arg {
                     Some(">") => {
                         let total = self.session_store.list()?.len();
@@ -1419,7 +1391,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 Ok(true)
             }
             Some("/todo") => {
-                match parts.get(1).map(|s| *s) {
+                match parts.get(1).copied() {
                     None | Some("list") => {
                         if self.todos.is_empty() {
                             println!("{}", "No todos.".dimmed());
@@ -1890,7 +1862,7 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     (s.clean_text.clone(), s.actions.clone())
                 };
 
-                let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
+                let tokens = token_count.unwrap_or((clean_response.len() / 4) as u64);
                 self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
 
                 let model_source = format!("{}/{}", model.provider, model.name);

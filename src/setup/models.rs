@@ -7,6 +7,7 @@ use std::process::Command;
 
 /// Manages model downloads and availability
 pub struct ModelManager {
+    #[allow(dead_code)]
     cache_dir: PathBuf,
 }
 
@@ -80,7 +81,7 @@ impl ModelManager {
         
         // Start pull command
         let mut child = Command::new("ollama")
-            .args(&["pull", model_name])
+            .args(["pull", model_name])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

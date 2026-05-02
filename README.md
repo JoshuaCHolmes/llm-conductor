@@ -46,7 +46,7 @@ llm-conductor  # Start chatting!
 
 ### Other Platforms
 
-See [INSTALLATION.md](INSTALLATION.md) for platform-specific instructions.
+See [INSTALLATION.md](docs/INSTALLATION.md) for platform-specific instructions.
 
 ## 📚 Usage
 
@@ -67,11 +67,11 @@ llm-conductor config show  # View configuration
 
 ## 📖 Documentation
 
-- **[INSTALLATION.md](INSTALLATION.md)** - Installation guide
-- **[NIXOS_USAGE.md](NIXOS_USAGE.md)** - NixOS instructions
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - System design
-- **[TESTING.md](TESTING.md)** - Testing guide
-- **[ROADMAP.md](ROADMAP.md)** - Development roadmap
+- **[INSTALLATION.md](docs/INSTALLATION.md)** - Installation guide
+- **[NIXOS_USAGE.md](docs/NIXOS_USAGE.md)** - NixOS instructions
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - System design
+- **[TESTING.md](docs/TESTING.md)** - Testing guide
+- **[ROADMAP.md](docs/ROADMAP.md)** - Development roadmap
 
 ## 🗺️ Status
 
@@ -86,7 +86,7 @@ llm-conductor config show  # View configuration
 - Additional providers
 - Resource tracking
 
-See [ROADMAP.md](ROADMAP.md) for details.
+See [ROADMAP.md](docs/ROADMAP.md) for details.
 
 ## 📝 License
 

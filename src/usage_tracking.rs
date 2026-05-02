@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc, Duration};
 use serde::{Deserialize, Serialize};
@@ -293,7 +293,7 @@ pub struct UsageTracker {
 }
 
 impl UsageTracker {
-    pub fn new(config_dir: &PathBuf) -> Result<Self> {
+    pub fn new(config_dir: &Path) -> Result<Self> {
         let config_path = config_dir.join("usage.json");
         
         let providers = if config_path.exists() {
