@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::time::{timeout, Duration};
@@ -31,6 +31,54 @@ pub enum CommandKind {
     NeedsConfirm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnKind {
+    /// Persistent-shell command (default `bash`).
+    Shell,
+    /// Stateless subshell (`bash-sub`).
+    ShellSub,
+    /// Long-running shell (`bash-long`).
+    ShellLong,
+    /// Todo-list operation.
+    Todo,
+    /// Adversarial critic ("rubberduck") result.
+    Think,
+}
+
+/// Generic indexed action turn — used by `/show N` to surface any prior
+/// shell command, todo operation, or think result by ordinal.
+#[derive(Debug, Clone)]
+pub struct ActionTurn {
+    /// Header label, e.g. "$ ls -la" or "🦆 think: refactor risks".
+    pub label: String,
+    /// Body to render line-by-line under `/show`.
+    pub output: String,
+    /// `Some` for shell turns; `None` for todo/think.
+    pub exit_code: Option<i32>,
+    pub kind: TurnKind,
+}
+
+impl ActionTurn {
+    pub fn shell(cmd: &str, output: String, exit_code: i32, kind: TurnKind) -> Self {
+        Self {
+            label: format!("$ {}", cmd),
+            output,
+            exit_code: Some(exit_code),
+            kind,
+        }
+    }
+
+    pub fn todo(summary: String, body: String) -> Self {
+        Self { label: format!("todo: {}", summary), output: body, exit_code: None, kind: TurnKind::Todo }
+    }
+
+    pub fn think(query: String, body: String) -> Self {
+        Self { label: format!("🦆 think: {}", query), output: body, exit_code: None, kind: TurnKind::Think }
+    }
+}
+
+/// Legacy shell-only turn shape kept for backward compatibility with any
+/// out-of-tree consumers; new code should use `ActionTurn`.
 #[derive(Debug, Clone)]
 pub struct ShellTurn {
     pub cmd: String,
@@ -69,8 +117,10 @@ impl Shell {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        let stdin = child.stdin.take()
+            .ok_or_else(|| anyhow!("bash child process did not expose a piped stdin"))?;
+        let stdout = child.stdout.take()
+            .ok_or_else(|| anyhow!("bash child process did not expose a piped stdout"))?;
 
         let mut proc = ShellProcess {
             _child: child,
@@ -177,16 +227,16 @@ pub fn classify_timeout(cmd: &str) -> Duration {
 }
 
 /// Run a command in a fresh subshell with no persistent state (used for
-/// bash-sub blocks). Returns `(output, exit_code)`.
-pub async fn run_stateless(cmd: &str) -> (String, i32) {
-    let result = timeout(
-        DEFAULT_TIMEOUT,
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .output(),
-    )
-    .await;
+/// bash-sub blocks). Returns `(output, exit_code)`. `cwd` lets the caller pin
+/// the subshell to the persistent shell's current directory so that
+/// post-`cd` behaviour matches between the two execution paths.
+pub async fn run_stateless(cmd: &str, cwd: Option<&str>) -> (String, i32) {
+    let mut command = tokio::process::Command::new("bash");
+    command.args(["--norc", "--noprofile", "-c", cmd]);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let result = timeout(DEFAULT_TIMEOUT, command.output()).await;
 
     match result {
         Ok(Ok(out)) => {
@@ -219,24 +269,22 @@ async fn collect_output(
     current_cwd: &str,
 ) -> Result<(String, i32, String)> {
     let mut lines_out: Vec<String> = Vec::new();
-    let mut exit_code = 0i32;
     let mut new_cwd = current_cwd.to_string();
 
-    loop {
+    let exit_code: i32 = loop {
         match proc.lines.next_line().await? {
-            None => return Err(anyhow::anyhow!("shell EOF")),
+            None => return Err(anyhow!("shell EOF")),
             Some(line) => {
                 if let Some(cwd) = line.strip_prefix(SENTINEL_CWD) {
                     new_cwd = cwd.to_string();
                 } else if let Some(code_str) = line.strip_prefix(SENTINEL_EXIT) {
-                    exit_code = code_str.trim().parse().unwrap_or(0);
-                    break;
+                    break code_str.trim().parse().unwrap_or(0);
                 } else {
                     lines_out.push(line);
                 }
             }
         }
-    }
+    };
 
     let mut output = lines_out.join("\n");
     // Truncate on a char boundary — byte-based truncate can panic on multibyte chars.

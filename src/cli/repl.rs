@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::session::{SessionStore, Todo, TodoStatus};
-use crate::cli::executor::{self, Shell, ShellTurn};
+use crate::cli::executor::{self, ActionTurn, Shell, TurnKind};
 use crate::providers::{ToolDefinition};
 use crate::router::Router;
 use crate::types::{Message, Task};
@@ -43,6 +43,54 @@ pub enum Action {
     Tool(String),
     /// Adversarial think request — spawns a critic model call.
     Think(String),
+}
+
+/// Provider-agnostic action ready to execute. The fence parser and the
+/// native function-call path both lower into this type so a single driver
+/// can run them with identical semantics.
+#[derive(Debug)]
+struct PlannedAction {
+    /// `Some(tool_call_id)` when the result should be paired with a
+    /// `Role::Tool` message; `None` for fence-mode (conductor-user feedback).
+    feedback_id: Option<String>,
+    kind: PlannedKind,
+}
+
+#[derive(Debug)]
+enum PlannedKind {
+    Bash { cmd: String, timeout: Option<std::time::Duration>, parallel: bool },
+    Todo { dispatch_json: String },
+    Think { query: String },
+    Unknown { name: String },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FeedbackMode {
+    /// Pair each result with its tool_call id (native function-calling).
+    ToolResults,
+    /// Aggregate all results into a single conductor-user message.
+    ConductorUser,
+}
+
+/// Plan-phase outcome: either we have actions to execute or we're done.
+enum PlanPhase {
+    Done,
+    Actions { planned: Vec<PlannedAction>, mode: FeedbackMode },
+}
+
+#[derive(Debug)]
+struct ActionResult {
+    feedback_id: Option<String>,
+    feedback_text: String,
+}
+
+#[derive(Debug, Default)]
+struct ExecOutcome {
+    /// User pressed Cancel on at least one prompt — abort further rounds.
+    cancelled: bool,
+    /// At least one action actually ran (not just denied/cancelled).
+    any_executed: bool,
+    results: Vec<ActionResult>,
 }
 
 /// Strip `**`, `*`, `` ` ``, `_` marker characters (used for heading text).
@@ -663,7 +711,8 @@ pub struct Repl {
     session_store: SessionStore,
     session_id: Option<String>,
     sessions_page: usize,
-    shell_turns: Vec<ShellTurn>,
+    /// Indexed log of every action result (shell, todo, think) for `/show N`.
+    action_turns: Vec<ActionTurn>,
     shell: Shell,
     /// Commands that have been accepted for the full session (exact match).
     session_auto_accepts: HashSet<String>,
@@ -692,7 +741,7 @@ impl Repl {
             session_store,
             session_id: None,
             sessions_page: 0,
-            shell_turns: Vec::new(),
+            action_turns: Vec::new(),
             shell,
             session_auto_accepts: HashSet::new(),
             todos: Vec::new(),
@@ -853,7 +902,7 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
     async fn reset_session_state(&mut self) {
         self.history.clear();
         self.session_id = None;
-        self.shell_turns.clear();
+        self.action_turns.clear();
         self.session_auto_accepts.clear();
         self.todos.clear();
         self.compacted_summary = None;
@@ -1050,6 +1099,30 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
 
     /// Compact conversation history by summarizing old turns.
     /// Returns true if compaction occurred.
+    /// Pick the smallest available model for compaction so we don't burn
+    /// frontier-quota on summarization. Returns None when no model whose
+    /// `capability_tier <= Advanced` is available; caller falls back.
+    fn pick_compaction_model(&self, _task: &Task) -> Option<&crate::types::ModelInfo> {
+        use crate::types::CapabilityTier;
+        // Honour the user's filter: never escape it. Among matching models,
+        // prefer Basic, then Advanced.
+        let filter = &self.model_filter;
+        let mut best: Option<&crate::types::ModelInfo> = None;
+        for m in self.router.available_models() {
+            if !filter.matches(m) { continue; }
+            if m.capability_tier == CapabilityTier::Frontier { continue; }
+            best = Some(match best {
+                None => m,
+                Some(prev) if m.capability_tier < prev.capability_tier => m,
+                Some(prev) => prev,
+            });
+        }
+        if let Some(m) = best {
+            tracing::debug!("compaction picked {} (tier={:?})", m.name, m.capability_tier);
+        }
+        best
+    }
+
     async fn compact_history(&mut self, force: bool) -> Result<bool> {
         const COMPACT_THRESHOLD_TOKENS: usize = 6_000;
         const COMPACT_KEEP_RECENT: usize = 20;
@@ -1088,9 +1161,20 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             prior_context
         );
 
-        // Grab model selection before the async borrow
+        // Grab model selection before the async borrow.
+        // Compaction is a deterministic summarization task — bias toward the
+        // smallest available model (Basic, then Advanced, then Frontier) so we
+        // don't burn frontier-quota on low-stakes work. Falls back to the
+        // existing filter-based selection when no smaller model is available.
         let task = Task::new("Compact history", &prompt);
-        let model_opt = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker).cloned();
+        let model_opt = self
+            .pick_compaction_model(&task)
+            .cloned()
+            .or_else(|| {
+                self.router
+                    .select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+                    .cloned()
+            });
 
         let m = match model_opt {
             None => {
@@ -1132,8 +1216,31 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         self.compacted_summary = Some(summary_buf);
         self.history.drain(0..boundary);
 
+        // Defensive: guarantee the live tail starts on a clean turn boundary.
+        // `find_compact_boundary` already prefers a Role::User split, but if it
+        // had to fall back (no User in the kept window) we may now be staring at
+        // an orphaned tool result whose preceding assistant tool_calls was
+        // summarised away. Such an orphan triggers 400s on every OpenAI-compat
+        // API ("messages with role 'tool' must follow a message with tool_calls").
+        let mut dropped_orphans = 0usize;
+        while let Some(first) = self.history.first() {
+            match first.role {
+                crate::types::Role::Tool => { self.history.remove(0); dropped_orphans += 1; }
+                crate::types::Role::Assistant if first.tool_calls.is_some() => {
+                    self.history.remove(0); dropped_orphans += 1;
+                }
+                _ => break,
+            }
+        }
+        if dropped_orphans > 0 {
+            tracing::warn!(
+                "compact_history dropped {} orphan tool/assistant message(s) at head of live tail",
+                dropped_orphans
+            );
+        }
+
         println!("{} Compacted {} messages into summary ({} kept).",
-            "✓".bright_green(), boundary, self.history.len());
+            "✓".bright_green(), boundary + dropped_orphans, self.history.len());
         Ok(true)
     }
 
@@ -1192,6 +1299,49 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 println!("{}", "✓ Started new conversation".green());
                 Ok(true)
             }
+            Some("/allow") => {
+                match parts.get(1).map(|s| *s) {
+                    None | Some("list") => {
+                        if self.session_auto_accepts.is_empty() {
+                            println!("{}", "No session auto-accepts.".dimmed());
+                        } else {
+                            println!("{}", "Auto-accepted commands (this session):".bright_cyan().bold());
+                            let mut sorted: Vec<&String> = self.session_auto_accepts.iter().collect();
+                            sorted.sort();
+                            for entry in sorted {
+                                println!("  {}", entry);
+                            }
+                            println!("{}", "  (suffix * matches as a prefix; e.g. 'cargo *')".dimmed());
+                        }
+                    }
+                    Some("add") => {
+                        let entry: String = parts[2..].join(" ");
+                        if entry.is_empty() {
+                            eprintln!("{}", "Usage: /allow add <command-or-prefix*>".yellow());
+                        } else {
+                            self.session_auto_accepts.insert(entry.clone());
+                            println!("{} Auto-accepting: {}", "✓".bright_green(), entry);
+                        }
+                    }
+                    Some("rm") => {
+                        let entry: String = parts[2..].join(" ");
+                        if self.session_auto_accepts.remove(&entry) {
+                            println!("{} Removed: {}", "✓".bright_green(), entry);
+                        } else {
+                            eprintln!("{}", format!("Not in auto-accept list: {}", entry).yellow());
+                        }
+                    }
+                    Some("clear") => {
+                        let n = self.session_auto_accepts.len();
+                        self.session_auto_accepts.clear();
+                        println!("{} Cleared {} entries.", "✓".bright_green(), n);
+                    }
+                    _ => {
+                        eprintln!("{}", "Usage: /allow [list|add <cmd>|rm <cmd>|clear]".yellow());
+                    }
+                }
+                Ok(true)
+            }
             Some("/sessions") => {
                 let arg = parts.get(1).map(|s| *s);
                 match arg {
@@ -1235,24 +1385,30 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             }
             Some("/show") => {
                 match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
-                    Some(n) if n >= 1 && n <= self.shell_turns.len() => {
-                        let turn = &self.shell_turns[n - 1];
-                        let exit_suffix = if turn.exit_code != 0 {
-                            format!(" {}", format!("[exit {}]", turn.exit_code).bright_red())
-                        } else {
-                            String::new()
+                    Some(n) if n >= 1 && n <= self.action_turns.len() => {
+                        let turn = &self.action_turns[n - 1];
+                        let exit_suffix = match turn.exit_code {
+                            Some(c) if c != 0 => format!(" {}", format!("[exit {}]", c).bright_red()),
+                            _ => String::new(),
                         };
-                        println!("{} {}{} {}", "●".bright_cyan(), turn.cmd.bright_white(), exit_suffix, format!("(shell #{})", n).dimmed());
+                        let kind_tag = match turn.kind {
+                            TurnKind::Shell => "shell",
+                            TurnKind::ShellSub => "bash-sub",
+                            TurnKind::ShellLong => "bash-long",
+                            TurnKind::Todo => "todo",
+                            TurnKind::Think => "think",
+                        };
+                        println!("{} {}{} {}", "●".bright_cyan(), turn.label.bright_white(), exit_suffix, format!("({} #{})", kind_tag, n).dimmed());
                         for line in turn.output.lines() {
                             println!("  {} {}", "│".dimmed(), line);
                         }
                         println!("  {}", "└".dimmed());
                     }
                     _ => {
-                        if self.shell_turns.is_empty() {
-                            eprintln!("{}", "No shell turns in this session.".yellow());
+                        if self.action_turns.is_empty() {
+                            eprintln!("{}", "No action turns in this session.".yellow());
                         } else {
-                            eprintln!("{}", format!("Usage: /show N  (1–{})", self.shell_turns.len()).yellow());
+                            eprintln!("{}", format!("Usage: /show N  (1–{})", self.action_turns.len()).yellow());
                         }
                     }
                 }
@@ -1364,6 +1520,193 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         }
     }
     
+    /// Run a planned batch of actions. Handles confirmation, parallel
+    /// scheduling for stateless `bash-sub`, error capture, and indexed
+    /// turn recording. Returns per-action feedback in source order.
+    async fn execute_actions(
+        &mut self,
+        planned: Vec<PlannedAction>,
+        model: &crate::types::ModelInfo,
+    ) -> Result<ExecOutcome> {
+        let mut outcome = ExecOutcome::default();
+        let mut i = 0;
+
+        while i < planned.len() {
+            // ── Try to batch consecutive auto-acceptable parallel bash-sub ────
+            // (stateless subshell + read-only or session-allow-listed)
+            let mut batch_end = i;
+            while batch_end < planned.len() {
+                let p = &planned[batch_end];
+                let (cmd, parallel) = match &p.kind {
+                    PlannedKind::Bash { cmd, parallel: true, .. } => (cmd.as_str(), true),
+                    _ => ("", false),
+                };
+                if !parallel { break; }
+                let kind = executor::classify(cmd);
+                let auto = kind == executor::CommandKind::ReadOnly
+                    || self.session_auto_accepts.iter().any(|p| cmd == p);
+                if !auto { break; }
+                batch_end += 1;
+            }
+
+            if batch_end - i >= 2 {
+                // Run the batch in parallel.
+                let cwd = self.shell.cwd.clone();
+                let batch: Vec<(Option<String>, String)> = planned[i..batch_end].iter().map(|p| {
+                    let cmd = match &p.kind {
+                        PlannedKind::Bash { cmd, .. } => cmd.clone(),
+                        _ => unreachable!(),
+                    };
+                    (p.feedback_id.clone(), cmd)
+                }).collect();
+
+                let futures = batch.iter().map(|(_, cmd)| {
+                    let c = cmd.clone();
+                    let cwd = cwd.clone();
+                    async move { executor::run_stateless(&c, Some(&cwd)).await }
+                });
+                let results = futures::future::join_all(futures).await;
+
+                for ((id, cmd), (output, exit_code)) in batch.into_iter().zip(results) {
+                    let turn_num = self.action_turns.len() + 1;
+                    print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
+                    self.action_turns.push(ActionTurn::shell(&cmd, output.clone(), exit_code, TurnKind::ShellSub));
+                    let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
+                    let feedback_text = format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output);
+                    outcome.results.push(ActionResult { feedback_id: id, feedback_text });
+                    outcome.any_executed = true;
+                }
+                i = batch_end;
+                continue;
+            }
+
+            // ── Sequential single action ─────────────────────────────────────
+            let p = &planned[i];
+            i += 1;
+
+            match &p.kind {
+                PlannedKind::Bash { cmd, timeout, parallel } => {
+                    let cmd = cmd.clone();
+                    let timeout = *timeout;
+                    let parallel = *parallel;
+
+                    let kind = executor::classify(&cmd);
+                    let auto_allowed = self.session_auto_accepts.iter().any(|p| cmd == *p)
+                        || self.session_auto_accepts.iter().any(|p| p.ends_with('*') && cmd.starts_with(p.trim_end_matches('*')));
+                    let decision = if kind == executor::CommandKind::ReadOnly || auto_allowed {
+                        CommandDecision::Accept
+                    } else {
+                        Self::readline_command_decision(&cmd, &mut self.rl)?
+                    };
+
+                    match decision {
+                        CommandDecision::Cancel => {
+                            outcome.cancelled = true;
+                            // Synthesize a cancellation feedback so paired
+                            // tool_call_ids aren't left dangling.
+                            outcome.results.push(ActionResult {
+                                feedback_id: p.feedback_id.clone(),
+                                feedback_text: format!("[Cancelled by user before execution: {}]", cmd),
+                            });
+                            break;
+                        }
+                        CommandDecision::AcceptForSession => {
+                            self.session_auto_accepts.insert(cmd.clone());
+                            self.run_one_shell(&cmd, timeout, parallel, p.feedback_id.clone(), &mut outcome).await;
+                        }
+                        CommandDecision::Accept => {
+                            self.run_one_shell(&cmd, timeout, parallel, p.feedback_id.clone(), &mut outcome).await;
+                        }
+                        CommandDecision::Deny(reason) => {
+                            let entry = if reason.is_empty() {
+                                format!("[Command denied: {}] (no reason given)", cmd)
+                            } else {
+                                format!("[Command denied: {}]\nUser correction: {}", cmd, reason)
+                            };
+                            println!("{}", "  (denied)".dimmed());
+                            outcome.results.push(ActionResult {
+                                feedback_id: p.feedback_id.clone(),
+                                feedback_text: format!("[Shell output]\n{}\n[End of shell output]", entry),
+                            });
+                        }
+                    }
+                }
+                PlannedKind::Todo { dispatch_json } => {
+                    let result_text = self.apply_todo_action(dispatch_json);
+                    println!("{}", result_text.dimmed());
+                    let summary: String = result_text.lines().next().unwrap_or("").chars().take(80).collect();
+                    self.action_turns.push(ActionTurn::todo(summary, result_text.clone()));
+                    outcome.results.push(ActionResult {
+                        feedback_id: p.feedback_id.clone(),
+                        feedback_text: format!("[Tool output]\n{}\n[End of tool output]", result_text),
+                    });
+                    outcome.any_executed = true;
+                }
+                PlannedKind::Think { query } => {
+                    let q = query.clone();
+                    let result = Self::do_think_call(
+                        &mut self.is_thinking, &self.router, model, &q,
+                        &mut self.usage_tracker,
+                    ).await;
+                    if !result.starts_with("[Rubberduck") {
+                        println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
+                        for line in result.lines() {
+                            println!("  {}", render_markdown_line(line));
+                        }
+                        println!();
+                    }
+                    self.action_turns.push(ActionTurn::think(q.clone(), result.clone()));
+                    outcome.results.push(ActionResult {
+                        feedback_id: p.feedback_id.clone(),
+                        feedback_text: format!("[Rubberduck result]\n{}\n[End of rubberduck result]", result),
+                    });
+                    outcome.any_executed = true;
+                }
+                PlannedKind::Unknown { name } => {
+                    outcome.results.push(ActionResult {
+                        feedback_id: p.feedback_id.clone(),
+                        feedback_text: format!("[unknown tool: {}]", name),
+                    });
+                }
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// Run one shell command and append its result to `outcome`. Distinguishes
+    /// between non-zero exit codes (real program failure) and shell crashes
+    /// (executor itself returned Err) — the latter gets exit_code = -1 and a
+    /// distinct `[shell crashed: …]` marker so the model doesn't conflate them.
+    async fn run_one_shell(
+        &mut self,
+        cmd: &str,
+        timeout: Option<std::time::Duration>,
+        parallel: bool,
+        feedback_id: Option<String>,
+        outcome: &mut ExecOutcome,
+    ) {
+        let (output, exit_code, kind) = if parallel {
+            let (o, ec) = executor::run_stateless(cmd, Some(&self.shell.cwd)).await;
+            (o, ec, TurnKind::ShellSub)
+        } else {
+            match self.shell.run(cmd, timeout).await {
+                Ok((o, ec)) => {
+                    let k = if timeout == Some(executor::LONG_TIMEOUT) { TurnKind::ShellLong } else { TurnKind::Shell };
+                    (o, ec, k)
+                }
+                Err(e) => (format!("[shell crashed: {}]", e), -1, TurnKind::Shell),
+            }
+        };
+        let turn_num = self.action_turns.len() + 1;
+        print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
+        self.action_turns.push(ActionTurn::shell(cmd, output.clone(), exit_code, kind));
+        let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
+        let feedback_text = format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output);
+        outcome.results.push(ActionResult { feedback_id, feedback_text });
+        outcome.any_executed = true;
+    }
+
     async fn handle_message(&mut self, content: &str) -> Result<()> {
         // Add user message to history
         self.history.push(Message::user(content).with_source("user"));
@@ -1408,17 +1751,21 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 println!();
             }
 
-            // Build messages: dynamic system prompt + history
+            // Build messages: dynamic system prompt + history.
+            // Pre-allocate to avoid the double-realloc that
+            // `vec![system].extend(history.clone())` would do.
             let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos, self.compacted_summary.as_deref(), &self.shell.cwd);
-            let mut messages = vec![system_msg];
-            messages.extend(self.history.clone());
+            let mut messages: Vec<Message> = Vec::with_capacity(self.history.len() + 1);
+            messages.push(system_msg);
+            messages.extend(self.history.iter().cloned());
 
             // Find provider
             let provider = self.router.find_provider_for_model(&model)
                 .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
 
-            if supports_tool_calling {
-                // ── Function-calling path (TAMU / GitHub) ────────────────────────
+            // ── Plan & response phase: produce (planned_actions, mode) ────────────
+            let plan_result: PlanPhase = if supports_tool_calling {
+                // Function-calling path
                 let tools = vec![
                     ToolDefinition::bash(),
                     ToolDefinition::rubberduck(),
@@ -1428,7 +1775,6 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 ];
                 let result = provider.call_with_tools(&model, &messages, &tools).await?;
 
-                // Display any text content the model returned alongside the tool call
                 if let Some(ref text) = result.text {
                     if !text.is_empty() {
                         print!("{} ", "❯".bright_green().bold());
@@ -1442,109 +1788,52 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 });
                 self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
 
-                if let Some(tool_calls) = result.tool_calls {
-                    if tool_rounds >= MAX_TOOL_ROUNDS {
-                        eprintln!("{} Tool round limit reached", "⚠".yellow());
-                        break;
-                    }
+                let model_source = format!("{}/{}", model.provider, model.name);
 
-                    // Add assistant tool-call message to history
-                    let model_source = format!("{}/{}", model.provider, model.name);
+                if let Some(tool_calls) = result.tool_calls {
+                    // Record the assistant tool-call message immediately so
+                    // the per-call tool_results we push later stay paired.
                     self.history.push(Message::assistant_tool_calls(
                         result.text.clone().unwrap_or_default(),
                         tool_calls.clone(),
                     ).with_source(model_source));
 
-                    for tc in &tool_calls {
-                        match tc.name.as_str() {
+                    let planned = tool_calls.into_iter().map(|tc| {
+                        let kind = match tc.name.as_str() {
                             "bash" => {
                                 let cmd = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                     .ok()
                                     .and_then(|v| v["command"].as_str().map(|s| s.to_string()))
                                     .unwrap_or_else(|| tc.arguments.clone());
-
-                                let kind = executor::classify(&cmd);
-                                let decision = if kind == executor::CommandKind::ReadOnly || self.session_auto_accepts.contains(&cmd) {
-                                    CommandDecision::Accept
-                                } else {
-                                    Self::readline_command_decision(&cmd, &mut self.rl)?
-                                };
-
-                                match decision {
-                                    CommandDecision::Cancel => break,
-                                    CommandDecision::AcceptForSession => {
-                                        self.session_auto_accepts.insert(cmd.clone());
-                                        let (output, exit_code) = self.shell.run(&cmd, None).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
-                                        let turn_num = self.shell_turns.len() + 1;
-                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
-                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                                        let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}{}\n{}", cmd, exit_note, output)));
-                                    }
-                                    CommandDecision::Accept => {
-                                        let (output, exit_code) = self.shell.run(&cmd, None).await.unwrap_or_else(|e| (format!("Error: {}", e), 1));
-                                        let turn_num = self.shell_turns.len() + 1;
-                                        print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
-                                        self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                                        let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                                        self.history.push(Message::tool_result(&tc.id, format!("$ {}{}\n{}", cmd, exit_note, output)));
-                                    }
-                                    CommandDecision::Deny(reason) => {
-                                        let denial = if reason.is_empty() {
-                                            format!("[Command denied: {}] (no reason given)", cmd)
-                                        } else {
-                                            format!("[Command denied: {}]\nUser correction: {}", cmd, reason)
-                                        };
-                                        println!("{}", "  (denied)".dimmed());
-                                        self.history.push(Message::tool_result(&tc.id, denial));
-                                    }
-                                }
+                                PlannedKind::Bash { cmd, timeout: None, parallel: false }
                             }
                             "rubberduck" => {
                                 let query = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                     .ok()
                                     .and_then(|v| v["query"].as_str().map(|s| s.to_string()))
                                     .unwrap_or_else(|| tc.arguments.clone());
-                                let tc_id = tc.id.clone();
-                                let result = Self::do_think_call(
-                                    &mut self.is_thinking, &self.router, &model, &query,
-                                    &mut self.usage_tracker,
-                                ).await;
-                                if !result.starts_with("[Rubberduck") {
-                                    println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
-                                    for line in result.lines() {
-                                        println!("  {}", render_markdown_line(line));
-                                    }
-                                    println!();
-                                }
-                                self.history.push(Message::tool_result(&tc_id, result));
+                                PlannedKind::Think { query }
                             }
                             "todo_add" | "todo_update" | "todo_list" => {
                                 let dispatch = serde_json::json!({
                                     "function": tc.name,
                                     "args": serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::Value::Object(Default::default()))
                                 });
-                                let result_text = self.apply_todo_action(&dispatch.to_string());
-                                println!("{}", result_text.dimmed());
-                                self.history.push(Message::tool_result(&tc.id, result_text));
+                                PlannedKind::Todo { dispatch_json: dispatch.to_string() }
                             }
-                            _ => {
-                                self.history.push(Message::tool_result(&tc.id, format!("[unknown tool: {}]", tc.name)));
-                            }
-                        }
-                    }
-                    println!(); // blank line after shell output batch
-                    tool_rounds += 1;
-                    continue;
+                            other => PlannedKind::Unknown { name: other.to_string() },
+                        };
+                        PlannedAction { feedback_id: Some(tc.id.clone()), kind }
+                    }).collect::<Vec<_>>();
+
+                    PlanPhase::Actions { planned, mode: FeedbackMode::ToolResults }
                 } else {
-                    // Text response, no tool calls — already displayed above if non-empty
                     let text = result.text.unwrap_or_default();
-                    let model_source = format!("{}/{}", model.provider, model.name);
                     self.history.push(Message::assistant(&text).with_source(model_source));
-                    break;
+                    PlanPhase::Done
                 }
             } else {
-                // ── Streaming code-block path (Outlier / Ollama / TAMU) ──────────────
+                // Streaming code-block path (Outlier / Ollama / TAMU non-tool models)
                 print!("{} ", "❯".bright_green().bold());
 
                 let state = Arc::new(Mutex::new(ReplyStreamState::default()));
@@ -1553,9 +1842,6 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     state_cb.lock().unwrap().process_chunk(&chunk);
                 };
 
-                // Watch for Escape key to cancel the stream.
-                // done_rx fires only after the watcher thread has fully restored
-                // terminal state — we must await it before any readline() call.
                 let stop_watcher = Arc::new(AtomicBool::new(false));
                 let (cancel_rx, watcher_done_rx) = crate::cli::tty::spawn_esc_watcher(stop_watcher.clone());
 
@@ -1576,8 +1862,6 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     }
                 };
 
-                // Wait for the ESC watcher to finish restoring terminal state
-                // before we attempt any rustyline readline() calls.
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(200),
                     watcher_done_rx,
@@ -1593,7 +1877,6 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     StreamOutcome::Cancelled => {
                         println!("{}", "(interrupted)".dimmed().italic());
                         println!();
-                        // Remove the dangling user message so the next turn isn't confused.
                         if matches!(self.history.last().map(|m| &m.role), Some(crate::types::Role::User)) {
                             self.history.pop();
                         }
@@ -1607,111 +1890,88 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     (s.clean_text.clone(), s.actions.clone())
                 };
 
-                // Record usage
                 let tokens = token_count.unwrap_or_else(|| (clean_response.len() / 4) as u64);
                 self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
 
-                // Store full raw response (including bash blocks) for cross-provider context
                 let model_source = format!("{}/{}", model.provider, model.name);
                 self.history.push(Message::assistant(raw_response.clone()).with_source(model_source));
 
-                let has_any_action = !actions.is_empty();
-                if !has_any_action || tool_rounds >= MAX_TOOL_ROUNDS {
-                    if tool_rounds >= MAX_TOOL_ROUNDS && has_any_action {
-                        eprintln!("{} Shell round limit reached", "⚠".yellow());
-                    }
-                    break;
+                if actions.is_empty() {
+                    PlanPhase::Done
+                } else {
+                    let planned = actions.into_iter().map(|a| {
+                        let kind = match a {
+                            Action::Bash(c)     => PlannedKind::Bash { cmd: c, timeout: None, parallel: false },
+                            Action::BashLong(c) => PlannedKind::Bash { cmd: c, timeout: Some(executor::LONG_TIMEOUT), parallel: false },
+                            Action::BashSub(c)  => PlannedKind::Bash { cmd: c, timeout: None, parallel: true },
+                            Action::Tool(json)  => PlannedKind::Todo { dispatch_json: json },
+                            Action::Think(q)    => PlannedKind::Think { query: q },
+                        };
+                        PlannedAction { feedback_id: None, kind }
+                    }).collect::<Vec<_>>();
+                    PlanPhase::Actions { planned, mode: FeedbackMode::ConductorUser }
                 }
+            };
 
-                // Execute actions in source order, collecting feedback in that same order
-                let mut feedback_items: Vec<String> = Vec::new();
+            // ── Action phase ──────────────────────────────────────────────────────
+            let (planned, mode) = match plan_result {
+                PlanPhase::Done => break,
+                PlanPhase::Actions { planned, mode } => (planned, mode),
+            };
 
-                for action in &actions {
-                    let (cmd, timeout, is_parallel) = match action {
-                        Action::Bash(c)         => (c, None, false),
-                        Action::BashLong(c)     => (c, Some(executor::LONG_TIMEOUT), false),
-                        Action::BashSub(c) => (c, None, true),
-                        Action::Tool(json) => {
-                            let result_text = self.apply_todo_action(json);
-                            println!("{}", result_text.dimmed());
-                            feedback_items.push(format!("[Tool output]\n{}\n[End of tool output]", result_text));
-                            continue;
-                        }
-                        Action::Think(query) => {
-                            let result = Self::do_think_call(
-                                &mut self.is_thinking, &self.router, &model, query,
-                                &mut self.usage_tracker,
-                            ).await;
-                            if !result.starts_with("[Rubberduck") {
-                                println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
-                                for line in result.lines() {
-                                    println!("  {}", render_markdown_line(line));
-                                }
-                                println!();
+            if tool_rounds >= MAX_TOOL_ROUNDS {
+                eprintln!("{} Tool round limit reached after {} rounds", "⚠".yellow(), tool_rounds);
+                // Inject a synthetic conductor message so the model gets explicit
+                // feedback rather than an opaque silent termination next turn.
+                let note = format!(
+                    "[conductor]: tool-round limit ({}) reached; pending actions skipped. Please summarize progress and stop, or wait for the user to continue.",
+                    MAX_TOOL_ROUNDS
+                );
+                match mode {
+                    FeedbackMode::ToolResults => {
+                        // Pair each pending tool_call with a synthetic result so
+                        // the next turn isn't malformed.
+                        for p in &planned {
+                            if let Some(ref id) = p.feedback_id {
+                                self.history.push(Message::tool_result(id, note.clone()));
                             }
-                            feedback_items.push(format!("[Rubberduck result]\n{}\n[End of rubberduck result]", result));
-                            continue;
                         }
-                    };
+                    }
+                    FeedbackMode::ConductorUser => {
+                        self.history.push(Message::user(note).with_source("conductor/round-limit"));
+                    }
+                }
+                break;
+            }
 
-                    let kind = executor::classify(cmd);
-                    let decision = if kind == executor::CommandKind::ReadOnly || self.session_auto_accepts.contains(cmd) {
-                        CommandDecision::Accept
-                    } else {
-                        Self::readline_command_decision(cmd, &mut self.rl)?
-                    };
+            let outcome = self.execute_actions(planned, &model).await?;
 
-                    match decision {
-                        CommandDecision::Cancel => break,
-                        CommandDecision::AcceptForSession => {
-                            self.session_auto_accepts.insert(cmd.clone());
-                            let (output, exit_code) = if is_parallel {
-                                executor::run_stateless(cmd).await
-                            } else {
-                                self.shell.run(cmd, timeout).await.unwrap_or_else(|e| (format!("Error: {}", e), 1))
-                            };
-                            let turn_num = self.shell_turns.len() + 1;
-                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
-                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                            let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                            feedback_items.push(format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output));
-                        }
-                        CommandDecision::Accept => {
-                            let (output, exit_code) = if is_parallel {
-                                executor::run_stateless(cmd).await
-                            } else {
-                                self.shell.run(cmd, timeout).await.unwrap_or_else(|e| (format!("Error: {}", e), 1))
-                            };
-                            let turn_num = self.shell_turns.len() + 1;
-                            print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
-                            self.shell_turns.push(ShellTurn { cmd: cmd.clone(), output: output.clone(), exit_code });
-                            let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                            feedback_items.push(format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output));
-                        }
-                        CommandDecision::Deny(reason) => {
-                            let entry = if reason.is_empty() {
-                                format!("[DENIED: {}] (no reason given)", cmd)
-                            } else {
-                                format!("[DENIED: {}]\nUser correction: {}", cmd, reason)
-                            };
-                            println!("{}", "  (denied)".dimmed());
-                            feedback_items.push(format!("[Shell output]\n{}\n[End of shell output]", entry));
+            if outcome.any_executed {
+                println!(); // visual separator after the action batch
+            }
+
+            match mode {
+                FeedbackMode::ToolResults => {
+                    for r in outcome.results {
+                        if let Some(id) = r.feedback_id {
+                            self.history.push(Message::tool_result(&id, r.feedback_text));
                         }
                     }
                 }
-
-                if !actions.is_empty() {
-                    println!(); // blank line after action batch
+                FeedbackMode::ConductorUser => {
+                    let combined: Vec<String> = outcome.results.into_iter().map(|r| r.feedback_text).collect();
+                    if combined.is_empty() {
+                        break;
+                    }
+                    self.history.push(Message::user(combined.join("\n\n")).with_source("conductor/feedback"));
                 }
-
-                // Build feedback message preserving source order
-                if feedback_items.is_empty() {
-                    break;
-                }
-
-                self.history.push(Message::user(feedback_items.join("\n\n")).with_source("conductor/feedback"));
-                tool_rounds += 1;
             }
+
+            if outcome.cancelled {
+                break;
+            }
+
+            tool_rounds += 1;
         }
 
         // Auto-save session
@@ -1887,6 +2147,7 @@ Be concise — short paragraphs or bullet points. No preamble. No \"I\" statemen
         println!("  {} - Summarize and compact old history", "/compact".bright_white());
         println!("  {} - Adversarial review of a plan or decision", "/think <question>".bright_white());
         println!("  {} - Show/add/update todos", "/todo [add|done|start|block|rm]".bright_white());
+        println!("  {} - Manage session auto-accept allow-list", "/allow [list|add|rm|clear]".bright_white());
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();
         println!("{}", "Tip: start with --resume to pick a previous session".dimmed());
