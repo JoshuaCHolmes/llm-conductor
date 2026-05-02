@@ -1,5 +1,5 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use uuid::Uuid;
 
 use super::{ComplexityLevel, ModelId};
@@ -51,12 +51,9 @@ impl Task {
 /// Metadata about a task
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskMetadata {
-    #[serde(skip)]
-    pub created_at: Option<Instant>,
-    #[serde(skip)]
-    pub started_at: Option<Instant>,
-    #[serde(skip)]
-    pub completed_at: Option<Instant>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
     pub assigned_to: Option<ModelId>,
     pub attempts: usize,
     pub tags: Vec<String>,

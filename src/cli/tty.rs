@@ -30,16 +30,28 @@ pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
             return;
         }
 
-        // Save terminal state and enable single-character raw input
+        // Save terminal state and enable single-character raw input.
+        // If tcgetattr fails, we have no original state to restore — bail out
+        // immediately rather than tcsetattr-ing zeroed garbage on shutdown.
         let mut old_tio: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe { libc::tcgetattr(fd, &mut old_tio) };
+        let getattr_rc = unsafe { libc::tcgetattr(fd, &mut old_tio) };
+        if getattr_rc != 0 {
+            unsafe { libc::close(fd); }
+            let _ = done_tx.send(());
+            return;
+        }
 
         let mut raw_tio = old_tio;
         // Disable canonical (line-buffered) mode and echo; keep ISIG so Ctrl+C still works
         raw_tio.c_lflag &= !(libc::ECHO | libc::ICANON);
         raw_tio.c_cc[libc::VMIN] = 0;
         raw_tio.c_cc[libc::VTIME] = 0;
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw_tio) };
+        let setattr_rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw_tio) };
+        if setattr_rc != 0 {
+            unsafe { libc::close(fd); }
+            let _ = done_tx.send(());
+            return;
+        }
 
         while !stop.load(Ordering::Relaxed) {
             let mut buf = [0u8; 1];

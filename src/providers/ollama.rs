@@ -61,7 +61,7 @@ impl Provider for OllamaProvider {
                     Role::User => "user".to_string(),
                     Role::Assistant => "assistant".to_string(),
                     Role::System => "system".to_string(),
-                    Role::Tool => "user".to_string(),
+                    Role::Tool => "tool".to_string(),
                 },
                 content: m.content.clone(),
             })
@@ -106,7 +106,7 @@ impl Provider for OllamaProvider {
                     Role::User => "user".to_string(),
                     Role::Assistant => "assistant".to_string(),
                     Role::System => "system".to_string(),
-                    Role::Tool => "user".to_string(),
+                    Role::Tool => "tool".to_string(),
                 },
                 content: m.content.clone(),
             })
@@ -131,29 +131,52 @@ impl Provider for OllamaProvider {
         
         let mut stream = response.bytes_stream();
         let mut full_response = String::new();
-        
+        let mut buffer = String::new();
+        let mut done = false;
+
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            let text = String::from_utf8_lossy(&chunk);
-            
-            // Parse each line as JSON
-            for line in text.lines() {
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Drain complete newline-terminated JSON objects, retaining any
+            // partial trailing fragment for the next iteration.
+            while let Some(idx) = buffer.find('\n') {
+                let line = buffer[..idx].trim().to_string();
+                buffer.drain(..=idx);
+
                 if line.is_empty() {
                     continue;
                 }
-                
-                if let Ok(chunk_response) = serde_json::from_str::<OllamaChatResponse>(line) {
+
+                if let Ok(chunk_response) = serde_json::from_str::<OllamaChatResponse>(&line) {
                     let content = chunk_response.message.content;
                     full_response.push_str(&content);
                     callback(content);
-                    
+
                     if chunk_response.done {
+                        done = true;
                         break;
                     }
                 }
             }
+
+            if done {
+                break;
+            }
         }
-        
+
+        // Process any final fragment that lacks a trailing newline.
+        if !done {
+            let tail = buffer.trim();
+            if !tail.is_empty() {
+                if let Ok(chunk_response) = serde_json::from_str::<OllamaChatResponse>(tail) {
+                    let content = chunk_response.message.content;
+                    full_response.push_str(&content);
+                    callback(content);
+                }
+            }
+        }
+
         Ok((full_response, None))
     }
     

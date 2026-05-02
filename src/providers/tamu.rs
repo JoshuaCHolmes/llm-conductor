@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role, ToolCall};
-use super::{Provider, ToolDefinition, ToolCallResponse};
+use super::{Provider, ToolDefinition, ToolCallResponse, serialize_messages_openai};
 
 /// TAMU AI provider using Texas A&M's OpenWebUI-based API
 /// Daily quotas with reset at 6-7 PM Central
@@ -81,36 +81,7 @@ impl TamuProvider {
 }
 
 /// Serialize a Message slice to OpenAI-format JSON, including tool call and tool result fields.
-fn serialize_messages_openai(messages: &[Message]) -> Vec<serde_json::Value> {
-    messages.iter().map(|m| {
-        let is_conductor = m.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false);
-        match m.role {
-            Role::Tool => json!({
-                "role": "tool",
-                "tool_call_id": m.tool_call_id.as_deref().unwrap_or(""),
-                "content": m.content,
-            }),
-            Role::Assistant if m.tool_calls.is_some() => {
-                let tc: Vec<serde_json::Value> = m.tool_calls.as_ref().unwrap().iter().map(|tc| json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": { "name": tc.name, "arguments": tc.arguments }
-                })).collect();
-                let content_val = if m.content.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    json!(m.content)
-                };
-                json!({ "role": "assistant", "content": content_val, "tool_calls": tc })
-            }
-            Role::User if is_conductor => json!({
-                "role": "user",
-                "content": format!("[conductor]: {}", m.content),
-            }),
-            _ => json!({ "role": m.role.as_str(), "content": m.content }),
-        }
-    }).collect()
-}
+/// Now provided by `super::serialize_messages_openai`.
 
 #[async_trait]
 impl Provider for TamuProvider {
@@ -167,7 +138,7 @@ impl Provider for TamuProvider {
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
         let model_name = self.get_api_model_name(&model.id);
 
-        let tamu_messages = serialize_messages_openai(messages);
+        let tamu_messages = serialize_messages_openai(messages)?;
 
         let payload = json!({
             "model": model_name,
@@ -208,7 +179,7 @@ impl Provider for TamuProvider {
     ) -> Result<(String, Option<u64>)> {
         let model_name = self.get_api_model_name(&model.id);
 
-        let tamu_messages = serialize_messages_openai(messages);
+        let tamu_messages = serialize_messages_openai(messages)?;
 
         let payload = json!({
             "model": model_name,
@@ -280,7 +251,7 @@ impl Provider for TamuProvider {
         tools: &[ToolDefinition],
     ) -> Result<ToolCallResponse> {
         let model_name = self.get_api_model_name(&model.id);
-        let tamu_messages = serialize_messages_openai(messages);
+        let tamu_messages = serialize_messages_openai(messages)?;
 
         let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| json!({
             "type": "function",
