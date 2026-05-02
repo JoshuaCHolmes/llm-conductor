@@ -18,6 +18,17 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// their own loop.
 pub const NO_TIMEOUT: Option<Duration> = None;
 
+/// Maximum time to wait for the first chunk of an SSE/NDJSON stream after the
+/// HTTP response headers arrive. Larger than per-chunk because cold model loads
+/// (e.g. NVIDIA NIM, Ollama swapping models) can be slow.
+pub const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum silence between subsequent stream chunks. If exceeded, treat the
+/// stream as stalled and surface a timeout error rather than hanging the agent.
+pub const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for non-streaming `chat()` calls when the provider's HTTP
+/// client itself has no overall timeout (because it's shared with streaming).
+pub const CHAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Build a `reqwest::Client` with sensible defaults for chat APIs.
 ///
 /// Pass `None` for `request_timeout` when the client will be used for

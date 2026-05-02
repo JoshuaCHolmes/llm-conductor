@@ -6,18 +6,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 
-use crate::providers::http::{build_client, sanitize_error_body, send_with_retry};
+use crate::providers::http::{
+    build_client, sanitize_error_body, send_with_retry, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT,
+};
 use crate::providers::Provider;
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
 
 const BASE_URL: &str = "https://playground.outlier.ai";
 
-/// Maximum time to wait for the first SSE chunk after connection established.
-const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
-/// Maximum silence between subsequent SSE chunks mid-stream.
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 /// HTTP retries for non-streaming requests.
 const HTTP_RETRIES: u32 = 2;
 

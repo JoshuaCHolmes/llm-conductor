@@ -4,7 +4,11 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::time::timeout;
 
+use crate::providers::http::{
+    build_client, sanitize_error_body, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT,
+};
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, ToolCall};
 use super::{Provider, ToolDefinition, ToolCallResponse, serialize_messages_openai};
 
@@ -51,11 +55,10 @@ struct GitHubStreamChunk {
 impl GitHubProvider {
     pub fn new(token: String) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("Failed to build HTTP client"),
+            // No overall request timeout: shared with chat_stream, which uses
+            // per-chunk timeouts. Non-streaming chat() / call_with_tools wrap
+            // their requests in tokio::time::timeout instead.
+            client: build_client(None).expect("build GitHub HTTP client"),
             token,
         }
     }
@@ -121,19 +124,22 @@ impl Provider for GitHubProvider {
             "max_tokens": 4096,
         });
 
-        let response = self
-            .client
-            .post("https://models.inference.ai.azure.com/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+        let response = timeout(
+            CHAT_REQUEST_TIMEOUT,
+            self.client
+                .post("https://models.inference.ai.azure.com/chat/completions")
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send(),
+        )
+            .await
+            .map_err(|_| anyhow!("GitHub chat request timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("GitHub API error {}: {}", status, body));
+            return Err(anyhow!("GitHub API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let github_response: GitHubResponse = response.json().await?;
@@ -186,9 +192,20 @@ impl Provider for GitHubProvider {
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
         let mut buffer = String::new();
+        let mut first_chunk = true;
+        let mut done = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while !done {
+            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let chunk = match timeout(wait, stream.next()).await {
+                Err(_) => return Err(anyhow!(
+                    "GitHub stream stalled (no chunk for {:?})", wait
+                )),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(Some(Ok(c))) => c,
+            };
+            first_chunk = false;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(newline_pos) = buffer.find('\n') {
@@ -201,6 +218,7 @@ impl Provider for GitHubProvider {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
+                    done = true;
                     break;
                 }
 
@@ -250,19 +268,22 @@ impl Provider for GitHubProvider {
             "max_tokens": 4096,
         });
 
-        let response = self
-            .client
-            .post("https://models.inference.ai.azure.com/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+        let response = timeout(
+            CHAT_REQUEST_TIMEOUT,
+            self.client
+                .post("https://models.inference.ai.azure.com/chat/completions")
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send(),
+        )
+            .await
+            .map_err(|_| anyhow!("GitHub call_with_tools timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("GitHub API error {}: {}", status, body));
+            return Err(anyhow!("GitHub API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let raw: serde_json::Value = response.json().await?;
@@ -283,13 +304,16 @@ impl Provider for GitHubProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        let response = self
-            .client
-            .get("https://api.github.com/user")
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?;
+        let response = timeout(
+            std::time::Duration::from_secs(10),
+            self.client
+                .get("https://api.github.com/user")
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header("Accept", "application/vnd.github+json")
+                .send(),
+        )
+            .await
+            .map_err(|_| anyhow!("GitHub health check timed out"))??;
 
         Ok(response.status().is_success())
     }

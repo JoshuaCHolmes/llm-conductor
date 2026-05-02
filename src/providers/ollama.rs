@@ -3,7 +3,9 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::time::timeout;
 
+use crate::providers::http::{build_client, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT};
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
 use super::Provider;
 
@@ -16,7 +18,9 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(base_url: Option<String>) -> Self {
         Self {
-            client: Client::new(),
+            // No overall request timeout: this client is shared with chat_stream.
+            // Local Ollama can take >2 min on cold model loads.
+            client: build_client(None).expect("build Ollama HTTP client"),
             base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
         }
     }
@@ -78,14 +82,18 @@ impl Provider for OllamaProvider {
             "stream": false,
         });
         
-        let response = self.client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await?
-            .json::<OllamaChatResponse>()
-            .await?;
-        
+        let response = timeout(CHAT_REQUEST_TIMEOUT, async {
+            self.client
+                .post(&url)
+                .json(&request)
+                .send()
+                .await?
+                .json::<OllamaChatResponse>()
+                .await
+        })
+            .await
+            .map_err(|_| anyhow!("Ollama chat timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
+
         Ok(response.message.content)
     }
     
@@ -133,9 +141,19 @@ impl Provider for OllamaProvider {
         let mut full_response = String::new();
         let mut buffer = String::new();
         let mut done = false;
+        let mut first_chunk = true;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while !done {
+            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let chunk = match timeout(wait, stream.next()).await {
+                Err(_) => return Err(anyhow!(
+                    "Ollama stream stalled (no chunk for {:?})", wait
+                )),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(Some(Ok(c))) => c,
+            };
+            first_chunk = false;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             // Drain complete newline-terminated JSON objects, retaining any
@@ -159,10 +177,6 @@ impl Provider for OllamaProvider {
                     }
                 }
             }
-
-            if done {
-                break;
-            }
         }
 
         // Process any final fragment that lacks a trailing newline.
@@ -182,10 +196,10 @@ impl Provider for OllamaProvider {
     
     async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/api/tags", self.base_url);
-        
-        match self.client.get(&url).send().await {
-            Ok(response) => Ok(response.status().is_success()),
-            Err(_) => Ok(false),
+
+        match timeout(std::time::Duration::from_secs(5), self.client.get(&url).send()).await {
+            Ok(Ok(response)) => Ok(response.status().is_success()),
+            _ => Ok(false),
         }
     }
 }

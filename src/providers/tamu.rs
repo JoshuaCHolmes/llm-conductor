@@ -4,7 +4,11 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::time::timeout;
 
+use crate::providers::http::{
+    build_client, sanitize_error_body, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT,
+};
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, ToolCall};
 use super::{Provider, ToolDefinition, ToolCallResponse, serialize_messages_openai};
 
@@ -59,11 +63,10 @@ struct TamuStreamChunk {
 impl TamuProvider {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("Failed to build HTTP client"),
+            // No overall request timeout: the same client is used by chat_stream,
+            // which applies per-chunk timeouts. Non-streaming chat() /
+            // call_with_tools / health_check wrap requests in tokio::time::timeout.
+            client: build_client(None).expect("build TAMU HTTP client"),
             api_key,
             base_url: "https://chat-api.tamu.ai".to_string(),
         }
@@ -147,19 +150,22 @@ impl Provider for TamuProvider {
             "max_tokens": 16000,
         });
 
-        let response = self
-            .client
-            .post(format!("{}/api/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+        let response = timeout(
+            CHAT_REQUEST_TIMEOUT,
+            self.client
+                .post(format!("{}/api/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send(),
+        )
+            .await
+            .map_err(|_| anyhow!("TAMU chat request timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("TAMU API error {}: {}", status, body));
+            return Err(anyhow!("TAMU API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let tamu_response: TamuResponse = response.json().await?;
@@ -203,16 +209,27 @@ impl Provider for TamuProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("TAMU API error {}: {}", status, body));
+            return Err(anyhow!("TAMU API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
         let mut buffer = String::new();
         let mut total_tokens: Option<u64> = None;
+        let mut first_chunk = true;
+        let mut done = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while !done {
+            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let chunk = match timeout(wait, stream.next()).await {
+                Err(_) => return Err(anyhow!(
+                    "TAMU stream stalled (no chunk for {:?})", wait
+                )),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(Some(Ok(c))) => c,
+            };
+            first_chunk = false;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(newline_pos) = buffer.find('\n') {
@@ -225,6 +242,7 @@ impl Provider for TamuProvider {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
+                    done = true;
                     break;
                 }
 
@@ -271,19 +289,22 @@ impl Provider for TamuProvider {
             "max_tokens": 4096,
         });
 
-        let response = self
-            .client
-            .post(format!("{}/api/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+        let response = timeout(
+            CHAT_REQUEST_TIMEOUT,
+            self.client
+                .post(format!("{}/api/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send(),
+        )
+            .await
+            .map_err(|_| anyhow!("TAMU call_with_tools timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("TAMU API error {}: {}", status, body));
+            return Err(anyhow!("TAMU API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let raw: serde_json::Value = response.json().await?;
@@ -312,14 +333,17 @@ impl Provider for TamuProvider {
             "max_tokens": 1
         });
 
-        let response = self
-            .client
-            .post(format!("{}/api/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&test_payload)
-            .send()
-            .await?;
+        let response = timeout(
+            std::time::Duration::from_secs(15),
+            self.client
+                .post(format!("{}/api/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&test_payload)
+                .send(),
+        )
+            .await
+            .map_err(|_| anyhow!("TAMU health check timed out"))??;
 
         // Success or rate limit means the API key works
         Ok(response.status().is_success() || response.status().as_u16() == 429)

@@ -4,9 +4,16 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::time::timeout;
 
+use crate::providers::http::{
+    build_client, sanitize_error_body, send_with_retry, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT,
+    FIRST_CHUNK_TIMEOUT,
+};
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId};
 use super::Provider;
+
+const HTTP_RETRIES: u32 = 2;
 
 /// NVIDIA NIM provider for free AI inference
 /// Free tier with rate limits (varies by model)
@@ -51,7 +58,9 @@ struct NvidiaStreamChunk {
 impl NvidiaProvider {
     pub fn new(api_key: Option<String>) -> Self {
         Self {
-            client: Client::new(),
+            // No overall request timeout: this client is shared with chat_stream,
+            // which relies on per-chunk timeouts instead.
+            client: build_client(None).expect("build NVIDIA HTTP client"),
             api_key,
         }
     }
@@ -149,21 +158,26 @@ impl Provider for NvidiaProvider {
             "top_p": 0.9,
         });
 
-        let mut request = self
-            .client
-            .post("https://integrate.api.nvidia.com/v1/chat/completions")
-            .header("Content-Type", "application/json");
+        let make_req = || {
+            let mut r = self
+                .client
+                .post("https://integrate.api.nvidia.com/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .json(&payload);
+            if let Some(key) = &self.api_key {
+                r = r.header("Authorization", format!("Bearer {}", key));
+            }
+            r
+        };
 
-        if let Some(key) = &self.api_key {
-            request = request.header("Authorization", format!("Bearer {}", key));
-        }
-
-        let response = request.json(&payload).send().await?;
+        let response = timeout(CHAT_REQUEST_TIMEOUT, send_with_retry(make_req, HTTP_RETRIES))
+            .await
+            .map_err(|_| anyhow!("NVIDIA chat request timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("NVIDIA API error {}: {}", status, body));
+            return Err(anyhow!("NVIDIA API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let nvidia_response: NvidiaResponse = response.json().await?;
@@ -217,15 +231,26 @@ impl Provider for NvidiaProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("NVIDIA API error {}: {}", status, body));
+            return Err(anyhow!("NVIDIA API error {}: {}", status, sanitize_error_body(&body)));
         }
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
         let mut buffer = String::new();
+        let mut first_chunk = true;
+        let mut done = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        while !done {
+            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let chunk = match timeout(wait, stream.next()).await {
+                Err(_) => return Err(anyhow!(
+                    "NVIDIA stream stalled (no chunk for {:?})", wait
+                )),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(Some(Ok(c))) => c,
+            };
+            first_chunk = false;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(newline_pos) = buffer.find('\n') {
@@ -238,6 +263,7 @@ impl Provider for NvidiaProvider {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
+                    done = true;
                     break;
                 }
 
@@ -256,7 +282,6 @@ impl Provider for NvidiaProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
-        // Check if we can list models
         let mut request = self
             .client
             .get("https://integrate.api.nvidia.com/v1/models");
@@ -265,7 +290,9 @@ impl Provider for NvidiaProvider {
             request = request.header("Authorization", format!("Bearer {}", key));
         }
 
-        let response = request.send().await?;
+        let response = timeout(CHAT_REQUEST_TIMEOUT, request.send())
+            .await
+            .map_err(|_| anyhow!("NVIDIA health check timed out"))??;
         Ok(response.status().is_success())
     }
 }
