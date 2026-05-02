@@ -1,19 +1,63 @@
 use async_trait::async_trait;
 use anyhow::Result;
+use serde_json::json;
 
-use crate::types::{Message, ModelInfo, ToolCall};
+use crate::types::{Message, ModelInfo, Role, ToolCall};
 
 pub mod ollama;
 pub mod github;
 pub mod tamu;
 pub mod nvidia;
 pub mod outlier;
+pub mod http;
 
 pub use ollama::OllamaProvider;
 pub use github::GitHubProvider;
 pub use tamu::TamuProvider;
 pub use nvidia::NvidiaProvider;
 pub use outlier::OutlierProvider;
+
+/// Serialize a slice of `Message`s into the OpenAI `chat/completions` shape.
+///
+/// Returns `Err` if any tool-result message fails validation (missing or empty
+/// `tool_call_id`) — sending such a payload causes 400 errors at every
+/// OpenAI-compatible API and silent context loss at non-strict ones.
+pub fn serialize_messages_openai(messages: &[Message]) -> Result<Vec<serde_json::Value>> {
+    messages.iter().map(|m| {
+        let is_conductor = m.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false);
+        let value = match m.role {
+            Role::Tool => {
+                let id = m.require_tool_call_id()
+                    .map_err(|e| anyhow::anyhow!("invalid tool message: {}", e))?;
+                json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": m.content,
+                })
+            }
+            Role::Assistant if m.tool_calls.is_some() => {
+                let tcs = m.tool_calls.as_ref().unwrap();
+                let tc: Vec<serde_json::Value> = tcs.iter().map(|tc| json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments }
+                })).collect();
+                let content_val = if m.content.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    json!(m.content)
+                };
+                json!({ "role": "assistant", "content": content_val, "tool_calls": tc })
+            }
+            Role::User if is_conductor => json!({
+                "role": "user",
+                "content": format!("[conductor]: {}", m.content),
+            }),
+            _ => json!({ "role": m.role.as_str(), "content": m.content }),
+        };
+        Ok(value)
+    }).collect()
+}
 
 /// A function/tool definition to pass to OpenAI-compatible APIs
 #[derive(Debug, Clone)]

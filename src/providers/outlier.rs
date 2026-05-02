@@ -1,12 +1,16 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time::{timeout, Duration};
 
+use crate::providers::http::{build_client, sanitize_error_body, send_with_retry};
 use crate::providers::Provider;
-use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId};
+use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
 
 const BASE_URL: &str = "https://playground.outlier.ai";
 
@@ -14,6 +18,8 @@ const BASE_URL: &str = "https://playground.outlier.ai";
 const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum silence between subsequent SSE chunks mid-stream.
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+/// HTTP retries for non-streaming requests.
+const HTTP_RETRIES: u32 = 2;
 
 #[derive(Debug, Serialize)]
 struct TurnRequest {
@@ -54,18 +60,51 @@ struct Delta {
     content: Option<String>,
 }
 
+/// Mutable per-instance state. Holds the active server-side conversation id
+/// (if any) and the model name it was opened against, so we can reuse the
+/// conversation across turns and reset only on `/new` or model change.
+#[derive(Debug, Default)]
+struct OutlierState {
+    conv_id: Option<String>,
+    /// Model name (e.g. "claude-opus-4-6") the active conversation was created with.
+    /// Differs from the requested model → we tear down and recreate.
+    conv_model: Option<String>,
+    /// Number of user turns we've already sent to `conv_id`. 0 means the next
+    /// turn is the first; subsequent turns can be sent as just-the-latest-user.
+    turns_sent: usize,
+}
+
 pub struct OutlierProvider {
     client: Client,
     cookie: String,
     csrf_token: String,
+    state: Arc<Mutex<OutlierState>>,
+    /// Lazily-discovered models the user is entitled to (intersection of the
+    /// catalog with the `/users` modelChecklist endpoint). Falls back to the
+    /// full hardcoded catalog when discovery fails.
+    discovered: Arc<OnceCell<Vec<ModelInfo>>>,
 }
 
 impl OutlierProvider {
     pub fn new(cookie: String, csrf_token: String) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()?;
-        Ok(Self { client, cookie, csrf_token })
+        // No overall timeout — streaming uses per-chunk timeouts in the loop.
+        let client = build_client(None)?;
+        Ok(Self {
+            client,
+            cookie,
+            csrf_token,
+            state: Arc::new(Mutex::new(OutlierState::default())),
+            discovered: Arc::new(OnceCell::new()),
+        })
+    }
+
+    /// Returns the standard set of headers shared by every Outlier request.
+    fn auth_headers(&self, builder: RequestBuilder, referer_path: &str) -> RequestBuilder {
+        builder
+            .header("origin", BASE_URL)
+            .header("referer", format!("{}{}", BASE_URL, referer_path))
+            .header("x-csrf-token", &self.csrf_token)
+            .header("cookie", &self.cookie)
     }
 
     fn get_api_model_name<'a>(&self, model_id: &'a ModelId) -> &'a str {
@@ -78,13 +117,18 @@ impl OutlierProvider {
         }
     }
 
-    fn get_outlier_model_id(&self, model_name: &str) -> &str {
+    /// Last-resort modelId table for models whose UUIDs we know. The Outlier
+    /// web UI ships these UUIDs in its JS bundle and there is no documented
+    /// public endpoint that lists them; if a name isn't found we fall back to
+    /// an empty modelId — the server tolerates this for many models, and
+    /// failures surface as a clean error rather than silent miscoding.
+    fn get_outlier_model_id(&self, model_name: &str) -> &'static str {
         match model_name {
             "claude-opus-4-6" => "6984f819cfe8911f7189318e",
             "claude-sonnet-4-6" => "69843e1d7cce9fb8fe25b99e",
             "claude-haiku-4-5-20251001" => "67130cfdb7e918a2cb03e5ae",
             "gpt-5.2-chat-latest" => "67812345abcd1234ef567890",
-            _ => "6984f819cfe8911f7189318e",
+            _ => "",
         }
     }
 
@@ -104,6 +148,36 @@ impl OutlierProvider {
         }
     }
 
+    /// POST /users — discover which models this account is allowed to use.
+    /// Returns a map of `modelChecklist` (e.g. {"claude-opus-4-6": true, …}).
+    async fn fetch_model_checklist(&self) -> Result<HashMap<String, bool>> {
+        let url = format!("{}/internal/experts/assistant/users", BASE_URL);
+        let resp = send_with_retry(
+            || self.auth_headers(self.client.post(&url), "/chat")
+                .header("content-type", "application/json")
+                .body("{}"),
+            HTTP_RETRIES,
+        ).await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Outlier /users discovery failed: {} body={}",
+                status, sanitize_error_body(&body)
+            ));
+        }
+
+        #[derive(Deserialize)]
+        struct UsersResp {
+            #[serde(rename = "modelChecklist", default)]
+            model_checklist: HashMap<String, bool>,
+        }
+        let parsed: UsersResp = resp.json().await
+            .map_err(|e| anyhow::anyhow!("Outlier /users JSON: {e}"))?;
+        Ok(parsed.model_checklist)
+    }
+
     /// Always creates a fresh conversation with the given text as the initial message.
     async fn create_conversation(&self, text: &str, model_name: &str, model_id: &str) -> Result<String> {
         let url = format!("{}/internal/experts/assistant/conversations", BASE_URL);
@@ -117,39 +191,40 @@ impl OutlierProvider {
             "isMysteryModel": false
         });
 
-        let response = self.client.post(&url)
-            .header("origin", BASE_URL)
-            .header("referer", format!("{}/chat", BASE_URL))
-            .header("content-type", "application/json")
-            .header("x-csrf-token", &self.csrf_token)
-            .header("cookie", &self.cookie)
-            .json(&payload)
-            .send().await?;
+        let response = send_with_retry(
+            || self.auth_headers(self.client.post(&url), "/chat")
+                .header("content-type", "application/json")
+                .json(&payload),
+            HTTP_RETRIES,
+        ).await?;
 
         if response.status().is_success() {
             let body = response.text().await?;
             let data: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| anyhow::anyhow!("Outlier create_conversation: invalid JSON: {e}\nBody: {body}"))?;
+                .map_err(|e| anyhow::anyhow!(
+                    "Outlier create_conversation: invalid JSON: {e} body={}",
+                    sanitize_error_body(&body)
+                ))?;
             if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
                 return Ok(id.to_string());
             }
-            return Err(anyhow::anyhow!("Conversation created but no ID in response: {body}"));
+            return Err(anyhow::anyhow!(
+                "Conversation created but no ID in response: {}",
+                sanitize_error_body(&body)
+            ));
         }
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        Err(anyhow::anyhow!("Failed to create Outlier conversation: {status}\nBody: {body}"))
+        Err(anyhow::anyhow!(
+            "Failed to create Outlier conversation: {status} body={}",
+            sanitize_error_body(&body)
+        ))
     }
 
     /// Delete a conversation by ID. Best-effort — errors are logged and swallowed.
     async fn delete_conversation(&self, conv_id: &str) {
         let url = format!("{}/internal/experts/assistant/conversations/{}", BASE_URL, conv_id);
-        match self.client.delete(&url)
-            .header("origin", BASE_URL)
-            .header("referer", format!("{}/conversation", BASE_URL))
-            .header("x-csrf-token", &self.csrf_token)
-            .header("cookie", &self.cookie)
-            .send().await
-        {
+        match self.auth_headers(self.client.delete(&url), "/conversation").send().await {
             Ok(r) => tracing::debug!("Deleted Outlier conversation {}: {}", conv_id, r.status()),
             Err(e) => tracing::debug!("Failed to delete Outlier conversation {}: {}", conv_id, e),
         }
@@ -162,17 +237,18 @@ impl OutlierProvider {
             BASE_URL, conv_id
         );
         let payload = self.build_turn_request(text, model_name, model_id_str);
-        let response = self.client.post(&url)
-            .header("origin", BASE_URL)
-            .header("referer", format!("{}/conversation", BASE_URL))
+        let response = self.auth_headers(self.client.post(&url), "/conversation")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .header("x-csrf-token", &self.csrf_token)
-            .header("cookie", &self.cookie)
             .json(&payload)
             .send().await?;
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Outlier API error: {}", response.status()));
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Outlier API error: {status} body={}",
+                sanitize_error_body(&body)
+            ));
         }
         Ok(response)
     }
@@ -197,8 +273,7 @@ impl OutlierProvider {
                     while let Some(nl) = sse_buf.find('\n') {
                         let line = sse_buf[..nl].trim_end_matches('\r').to_string();
                         sse_buf = sse_buf[nl + 1..].to_string();
-                        if line.starts_with("data: ") {
-                            let data = &line[6..];
+                        if let Some(data) = line.strip_prefix("data: ") {
                             if data == "[DONE]" { done = true; break; }
                             if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                                 if let Some(content) = chunk.choices.first()
@@ -217,8 +292,11 @@ impl OutlierProvider {
         Ok(result)
     }
 
-    fn messages_to_text(&self, messages: &[Message]) -> String {
-        use crate::types::Role;
+    /// Flatten the entire history to prose for the *initial* turn of a fresh
+    /// conversation. Includes system + user + assistant + tool messages so the
+    /// server-side conversation starts with the same context the model would
+    /// see at any other provider.
+    fn flatten_history(messages: &[Message]) -> String {
         messages.iter().map(|msg| {
             let is_conductor = msg.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false);
             match msg.role {
@@ -244,12 +322,84 @@ impl OutlierProvider {
             }
         }).collect::<Vec<_>>().join("\n\n")
     }
-}
 
-#[async_trait]
-impl Provider for OutlierProvider {
-    async fn available_models(&self) -> Result<Vec<ModelInfo>> {
-        Ok(vec![
+    /// Pick out the latest user message + any tool/conductor messages that
+    /// followed it. Used for incremental turns on an already-open conversation
+    /// — Outlier holds prior turns server-side so we don't need to resend.
+    fn latest_turn_text(messages: &[Message]) -> String {
+        // Find the index of the last User message.
+        let last_user_idx = messages.iter().rposition(|m| matches!(m.role, Role::User));
+        let slice = match last_user_idx {
+            Some(i) => &messages[i..],
+            None => messages, // shouldn't happen — defensive
+        };
+        Self::flatten_history(slice)
+    }
+
+    /// Tear down any open server-side conversation and clear local state.
+    async fn drop_conversation(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(id) = state.conv_id.take() {
+            state.conv_model = None;
+            state.turns_sent = 0;
+            // Drop the lock before awaiting network IO.
+            drop(state);
+            self.delete_conversation(&id).await;
+        }
+    }
+
+    /// Ensure we have an open conversation matching `model_name`. If the
+    /// existing one was opened against a different model, recreate. Returns
+    /// `(conv_id, is_first_turn)` so the caller knows how much history to send.
+    async fn ensure_conversation(
+        &self,
+        messages: &[Message],
+        model_name: &str,
+        model_id_str: &str,
+    ) -> Result<(String, bool)> {
+        // Fast path: existing conversation, same model.
+        {
+            let state = self.state.lock().await;
+            if let (Some(id), Some(m)) = (&state.conv_id, &state.conv_model) {
+                if m == model_name {
+                    return Ok((id.clone(), false));
+                }
+            }
+        }
+
+        // Need a new conversation. If one exists for a different model, drop it first.
+        self.drop_conversation().await;
+
+        let initial_text = Self::flatten_history(messages);
+        let conv_id = self.create_conversation(&initial_text, model_name, model_id_str).await?;
+        let mut state = self.state.lock().await;
+        state.conv_id = Some(conv_id.clone());
+        state.conv_model = Some(model_name.to_string());
+        state.turns_sent = 0;
+        Ok((conv_id, true))
+    }
+
+    /// On a stream error worth retrying (e.g. timeout), drop the broken
+    /// conversation so the next attempt creates a fresh one.
+    async fn invalidate_after_failure(&self) {
+        self.drop_conversation().await;
+    }
+
+    /// Pick the text payload to send for this turn:
+    /// - first turn of a fresh conversation: full history (already in create_conversation)
+    /// - subsequent turn: only the latest user-trailing slice
+    fn turn_text(messages: &[Message], is_first_turn: bool) -> String {
+        if is_first_turn {
+            Self::flatten_history(messages)
+        } else {
+            Self::latest_turn_text(messages)
+        }
+    }
+
+    /// Full hardcoded catalog. Used as the universe to filter when entitlement
+    /// discovery succeeds, and as the entire fallback when it fails.
+    fn catalog() -> Vec<ModelInfo> {
+        vec![
             ModelInfo {
                 id: ModelId::ClaudeOpus45,
                 name: "claude-opus-4.6".to_string(),
@@ -338,30 +488,92 @@ impl Provider for OutlierProvider {
                 cost_per_token: 0.0,
                 supports_tool_calling: false,
             },
-        ])
+        ]
+    }
+
+    /// Map a catalog entry's name to the Outlier api model name we'd send,
+    /// so we can intersect the catalog with `modelChecklist` keys.
+    fn catalog_api_name(info: &ModelInfo) -> String {
+        match &info.id {
+            ModelId::ClaudeOpus45 => "claude-opus-4-6".to_string(),
+            ModelId::ClaudeSonnet45 => "claude-sonnet-4-6".to_string(),
+            ModelId::Gpt4o => "gpt-5.2-chat-latest".to_string(),
+            ModelId::Custom(name) => name.clone(),
+            _ => "claude-opus-4-6".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for OutlierProvider {
+    async fn available_models(&self) -> Result<Vec<ModelInfo>> {
+        let cached = self.discovered.get_or_init(|| async {
+            match self.fetch_model_checklist().await {
+                Ok(checklist) if !checklist.is_empty() => {
+                    let allowed: Vec<ModelInfo> = Self::catalog().into_iter()
+                        .filter(|m| {
+                            let api = Self::catalog_api_name(m);
+                            checklist.get(&api).copied().unwrap_or(false)
+                        })
+                        .collect();
+                    if allowed.is_empty() {
+                        // Entitlement endpoint replied but nothing matched our catalog;
+                        // surface the full catalog so the user can still try models.
+                        tracing::warn!(
+                            "Outlier modelChecklist had {} entries but none matched our catalog; returning full catalog",
+                            checklist.len()
+                        );
+                        Self::catalog()
+                    } else {
+                        tracing::debug!("Outlier discovered {} entitled model(s)", allowed.len());
+                        allowed
+                    }
+                }
+                Ok(_) => {
+                    tracing::debug!("Outlier modelChecklist was empty; returning full catalog");
+                    Self::catalog()
+                }
+                Err(e) => {
+                    tracing::warn!("Outlier model discovery failed ({}); using hardcoded catalog", e);
+                    Self::catalog()
+                }
+            }
+        }).await;
+        Ok(cached.clone())
     }
 
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id_str = self.get_outlier_model_id(model_name);
-        let text = self.messages_to_text(messages);
 
         for attempt in 0..2u8 {
             if attempt > 0 {
                 eprintln!("⚠  Outlier stalled, retrying with fresh conversation…");
             }
-            let conv_id = self.create_conversation(&text, model_name, model_id_str).await?;
+
+            let (conv_id, is_first_turn) =
+                self.ensure_conversation(messages, model_name, model_id_str).await?;
+            let text = Self::turn_text(messages, is_first_turn);
 
             let result: Result<String> = match self.send_turn(&conv_id, &text, model_name, model_id_str).await {
                 Err(e) => Err(e),
                 Ok(resp) => Self::drain_sse(resp).await,
             };
-            self.delete_conversation(&conv_id).await;
 
             match result {
-                Ok(content) => return Ok(content),
-                Err(ref e) if e.to_string().contains("timed out") && attempt == 0 => continue,
-                Err(e) => return Err(e),
+                Ok(content) => {
+                    let mut state = self.state.lock().await;
+                    state.turns_sent += 1;
+                    return Ok(content);
+                }
+                Err(ref e) if e.to_string().contains("timed out") && attempt == 0 => {
+                    self.invalidate_after_failure().await;
+                    continue;
+                }
+                Err(e) => {
+                    self.invalidate_after_failure().await;
+                    return Err(e);
+                }
             }
         }
         Err(anyhow::anyhow!("Outlier: request timed out after retry"))
@@ -375,7 +587,6 @@ impl Provider for OutlierProvider {
     ) -> Result<(String, Option<u64>)> {
         let model_name = self.get_api_model_name(&model.id);
         let model_id_str = self.get_outlier_model_id(model_name);
-        let text = self.messages_to_text(messages);
 
         // NOTE: `callback` is Box<dyn Fn + Send> but NOT Sync.
         // To avoid holding &callback across .await (which requires Sync), we expand the SSE loop
@@ -385,11 +596,19 @@ impl Provider for OutlierProvider {
             if attempt > 0 {
                 eprintln!("⚠  Outlier stalled, retrying with fresh conversation…");
             }
-            let conv_id = self.create_conversation(&text, model_name, model_id_str).await?;
+
+            let (conv_id, is_first_turn) = match self
+                .ensure_conversation(messages, model_name, model_id_str)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            let text = Self::turn_text(messages, is_first_turn);
 
             let response = match self.send_turn(&conv_id, &text, model_name, model_id_str).await {
                 Err(e) => {
-                    self.delete_conversation(&conv_id).await;
+                    self.invalidate_after_failure().await;
                     last_err = Some(e);
                     continue;
                 }
@@ -421,8 +640,7 @@ impl Provider for OutlierProvider {
                         while let Some(nl) = sse_buf.find('\n') {
                             let line = sse_buf[..nl].trim_end_matches('\r').to_string();
                             sse_buf = sse_buf[nl + 1..].to_string();
-                            if line.starts_with("data: ") {
-                                let data = &line[6..];
+                            if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" { done = true; break; }
                                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                                     if let Some(content) = chunk.choices.first()
@@ -440,14 +658,17 @@ impl Provider for OutlierProvider {
                 }
             }
 
-            self.delete_conversation(&conv_id).await;
-
             if let Some(e) = stream_err {
+                self.invalidate_after_failure().await;
                 if e.to_string().contains("timed out") && attempt == 0 {
                     last_err = Some(e);
                     continue;
                 }
                 return Err(e);
+            }
+            {
+                let mut state = self.state.lock().await;
+                state.turns_sent += 1;
             }
             return Ok((full_content, None));
         }
@@ -456,11 +677,46 @@ impl Provider for OutlierProvider {
 
     async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/internal/experts/assistant/conversations/", BASE_URL);
-        let response = self.client.get(&url)
-            .header("origin", BASE_URL)
-            .header("x-csrf-token", &self.csrf_token)
-            .header("cookie", &self.cookie)
-            .send().await?;
+        let response = self.auth_headers(self.client.get(&url), "/chat").send().await?;
         Ok(response.status().is_success())
+    }
+
+    async fn reset_session(&self) {
+        self.drop_conversation().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Message;
+
+    #[test]
+    fn latest_turn_text_extracts_only_trailing_slice() {
+        let history = vec![
+            Message::system("sys"),
+            Message::user("first ask"),
+            Message::assistant("first answer"),
+            Message::user("second ask"),
+            Message::tool_result("call_1", "tool output"),
+        ];
+        let s = OutlierProvider::latest_turn_text(&history);
+        assert!(s.contains("second ask"), "got: {}", s);
+        assert!(s.contains("tool output"), "got: {}", s);
+        assert!(!s.contains("first ask"), "should not include earlier user turn: {}", s);
+        assert!(!s.contains("first answer"));
+    }
+
+    #[test]
+    fn flatten_history_keeps_everything() {
+        let history = vec![
+            Message::system("sys"),
+            Message::user("hi"),
+            Message::assistant("hello"),
+        ];
+        let s = OutlierProvider::flatten_history(&history);
+        assert!(s.contains("System: sys"));
+        assert!(s.contains("User: hi"));
+        assert!(s.contains("Assistant: hello"));
     }
 }
