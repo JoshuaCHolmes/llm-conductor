@@ -259,4 +259,102 @@ mod tests {
         let s = sanitize_error_body(body);
         assert_eq!(s, body);
     }
+
+    // ===== send_with_retry behavioral tests (wiremock) =====
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mk_client() -> Client {
+        build_client(Some(Duration::from_secs(2))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retry_happy_path_no_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url = format!("{}/x", server.uri());
+        let client = mk_client();
+        let resp = send_with_retry(|| client.post(&url), 3).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn retry_on_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        // First call: 503; subsequent: 200.
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server).await;
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server).await;
+        let url = format!("{}/x", server.uri());
+        let client = mk_client();
+        let resp = send_with_retry(|| client.post(&url), 3).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn retry_on_429_with_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .mount(&server).await;
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server).await;
+        let url = format!("{}/x", server.uri());
+        let client = mk_client();
+        let started = std::time::Instant::now();
+        let resp = send_with_retry(|| client.post(&url), 3).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        // Honored retry-after >= ~1s.
+        assert!(started.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn retry_exhausts_and_returns_last_error_status() {
+        let server = MockServer::start().await;
+        let counter = Arc::new(AtomicU32::new(0));
+        let c2 = counter.clone();
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(move |_: &wiremock::Request| {
+                c2.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            })
+            .mount(&server).await;
+        let url = format!("{}/x", server.uri());
+        let client = mk_client();
+        let resp = send_with_retry(|| client.post(&url), 2).await.unwrap();
+        // After max_retries=2, third response is returned even if 5xx.
+        assert_eq!(resp.status(), 500);
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_passes_through_4xx_without_retry() {
+        let server = MockServer::start().await;
+        let counter = Arc::new(AtomicU32::new(0));
+        let c2 = counter.clone();
+        Mock::given(method("POST")).and(path("/x"))
+            .respond_with(move |_: &wiremock::Request| {
+                c2.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(404)
+            })
+            .mount(&server).await;
+        let url = format!("{}/x", server.uri());
+        let client = mk_client();
+        let resp = send_with_retry(|| client.post(&url), 5).await.unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
 }
