@@ -249,6 +249,19 @@ impl SessionStore {
     }
 }
 
+fn format_age(dt: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - dt).num_seconds();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,15 +355,3 @@ mod tests {
     }
 }
 
-fn format_age(dt: DateTime<Utc>) -> String {
-    let secs = (Utc::now() - dt).num_seconds();
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
-}

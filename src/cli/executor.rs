@@ -331,9 +331,9 @@ const DENY_PROGRAMS: &[&str] = &[
 /// `is_readonly_git_invocation` and intentionally NOT listed here so the
 /// fall-through doesn't accidentally permit a write form.
 const GIT_READONLY_SUBCOMMANDS: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "rev-parse", "ls-files",
-    "blame", "describe", "remote", "rev-list", "shortlog",
-    "tag", "reflog", "ls-remote", "for-each-ref", "cat-file", "name-rev",
+    "status", "log", "diff", "show", "rev-parse", "ls-files",
+    "blame", "describe", "rev-list", "shortlog",
+    "reflog", "ls-remote", "for-each-ref", "cat-file", "name-rev",
     "show-ref", "ls-tree", "grep",
 ];
 
@@ -351,7 +351,7 @@ fn is_readonly_git_invocation(segment: &str) -> bool {
             Some(tok) => break tok,
         }
     };
-    // Special cases: writeable subcommands with read-only flag forms.
+    // Special cases: subcommands that are readable in some forms but mutate in others.
     match sub {
         "config" => {
             // `git config --get …` etc. is read-only; bare `git config k v` writes.
@@ -365,10 +365,33 @@ fn is_readonly_git_invocation(segment: &str) -> bool {
         }
         "remote" => {
             // `git remote add foo …` writes; `git remote -v` / `git remote show` are safe.
-            // The generic list already covers `remote` for the bare/list case;
-            // disallow if any positional that looks like a write subcommand follows.
             let writes = ["add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune", "update"];
             return !parts.any(|t| writes.contains(&t));
+        }
+        "branch" => {
+            // `git branch` (no args) lists; `git branch -a/-r/-v/--list/--show-current` lists.
+            // `git branch <name>` creates; `-d/-D/-m/-M/-c/-C` mutate.
+            let mutates = ["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--edit-description", "--set-upstream-to", "-u", "--unset-upstream"];
+            let rest: Vec<&str> = parts.collect();
+            if rest.iter().any(|t| mutates.contains(t)) { return false; }
+            // Any non-flag positional after `branch` is a new branch name.
+            return !rest.iter().any(|t| !t.starts_with('-'));
+        }
+        "tag" => {
+            // `git tag` lists; `git tag -l <pat>` lists; `git tag <name>` creates.
+            let mutates = ["-d", "-D", "--delete", "-a", "-s", "-u", "-f", "--force", "-m", "--message"];
+            let rest: Vec<&str> = parts.collect();
+            if rest.iter().any(|t| mutates.contains(t)) { return false; }
+            // After consuming `-l`/`--list`/`--contains`/`-n`, any positional is a tag name to create.
+            let mut allowed_positional_after = false;
+            for t in &rest {
+                if matches!(*t, "-l" | "--list" | "--contains" | "--no-contains" | "--points-at" | "--merged" | "--no-merged") {
+                    allowed_positional_after = true;
+                } else if !t.starts_with('-') && !allowed_positional_after {
+                    return false;
+                }
+            }
+            return true;
         }
         _ => {}
     }
@@ -539,6 +562,24 @@ mod tests {
         assert_eq!(classify("git stash"), CommandKind::NeedsConfirm); // stash with no sub = push
         assert_eq!(classify("git stash pop"), CommandKind::NeedsConfirm);
         assert_eq!(classify("git config user.email foo@bar"), CommandKind::NeedsConfirm);
+        // branch / tag write-form gating
+        assert_eq!(classify("git branch"), CommandKind::ReadOnly);
+        assert_eq!(classify("git branch -a"), CommandKind::ReadOnly);
+        assert_eq!(classify("git branch --show-current"), CommandKind::ReadOnly);
+        assert_eq!(classify("git branch new-feature"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git branch -d old"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git branch -D old"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git branch -m old new"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git tag"), CommandKind::ReadOnly);
+        assert_eq!(classify("git tag -l v*"), CommandKind::ReadOnly);
+        assert_eq!(classify("git tag --list"), CommandKind::ReadOnly);
+        assert_eq!(classify("git tag v1.0"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git tag -a v1.0 -m foo"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git tag -d v1.0"), CommandKind::NeedsConfirm);
+        // remote write-form gating
+        assert_eq!(classify("git remote -v"), CommandKind::ReadOnly);
+        assert_eq!(classify("git remote add origin git@github.com:foo/bar"), CommandKind::NeedsConfirm);
+        assert_eq!(classify("git remote remove origin"), CommandKind::NeedsConfirm);
     }
 
     #[test]

@@ -440,17 +440,3 @@ impl UserInfoManager {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_credential_manager() {
-        // Basic credential operations
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", temp_dir.path());
-        
-        // Would test save/load here
-    }
-}
