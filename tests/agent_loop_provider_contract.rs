@@ -61,7 +61,10 @@ impl Provider for ScriptedProvider {
         messages: &[Message],
         _tools: &[ToolDefinition],
     ) -> Result<ToolCallResponse> {
-        self.seen_history_lengths.lock().unwrap().push(messages.len());
+        self.seen_history_lengths
+            .lock()
+            .unwrap()
+            .push(messages.len());
 
         let next = self
             .script
@@ -154,7 +157,10 @@ async fn single_text_response_terminates_loop() {
     let (text, history) = drive_loop(&provider, "hi", 5).await.unwrap();
     assert_eq!(text, "hello world");
     assert_eq!(history.len(), 2);
-    assert_eq!(provider.seen_history_lengths.lock().unwrap().as_slice(), &[1]);
+    assert_eq!(
+        provider.seen_history_lengths.lock().unwrap().as_slice(),
+        &[1]
+    );
 }
 
 #[tokio::test]
@@ -236,7 +242,10 @@ async fn tool_result_messages_have_required_id_field() {
         Scripted::Text("ok"),
     ]);
     let (_text, history) = drive_loop(&provider, "x", 5).await.unwrap();
-    let tool_msg = history.iter().find(|m| matches!(m.role, Role::Tool)).unwrap();
+    let tool_msg = history
+        .iter()
+        .find(|m| matches!(m.role, Role::Tool))
+        .unwrap();
     assert_eq!(tool_msg.tool_call_id.as_deref(), Some("must-be-set"));
     assert!(!tool_msg.tool_call_id.as_ref().unwrap().is_empty());
 }
