@@ -29,7 +29,7 @@ impl Context {
     /// Estimate total token count
     pub fn token_count(&self) -> usize {
         let mut total = self.core.token_count();
-        
+
         if let Some(ref project) = self.project {
             total += project.token_count();
         }
@@ -39,27 +39,27 @@ impl Context {
         if let Some(ref task) = self.task {
             total += task.token_count();
         }
-        
+
         total
     }
 
     /// Convert to messages for model
     pub fn to_messages(&self) -> Vec<Message> {
         let mut messages = Vec::new();
-        
+
         // System message with core context
         messages.push(Message::system(self.core.to_string()));
-        
+
         // Add project context if present
         if let Some(ref project) = self.project {
             messages.push(Message::system(project.to_string()));
         }
-        
+
         // Add session history
         if let Some(ref session) = self.session {
             messages.extend(session.history.clone());
         }
-        
+
         messages
     }
 }
@@ -74,18 +74,18 @@ pub struct CoreContext {
 
 impl CoreContext {
     fn token_count(&self) -> usize {
-        self.system_instructions.len() / 4 + 
-        self.constraints.iter().map(|s| s.len() / 4).sum::<usize>()
+        self.system_instructions.len() / 4
+            + self.constraints.iter().map(|s| s.len() / 4).sum::<usize>()
     }
 
     #[allow(clippy::inherent_to_string)]
     fn to_string(&self) -> String {
         let mut parts = vec![self.system_instructions.clone()];
-        
+
         if !self.constraints.is_empty() {
             parts.push(format!("Constraints:\n{}", self.constraints.join("\n")));
         }
-        
+
         parts.join("\n\n")
     }
 }
@@ -110,9 +110,9 @@ pub struct ProjectContext {
 
 impl ProjectContext {
     fn token_count(&self) -> usize {
-        (self.description.len() + self.architecture.len()) / 4 +
-        self.key_files.len() * 20 +
-        self.conventions.len() * 10
+        (self.description.len() + self.architecture.len()) / 4
+            + self.key_files.len() * 20
+            + self.conventions.len() * 10
     }
 
     #[allow(clippy::inherent_to_string)]
@@ -149,8 +149,11 @@ pub struct TaskContext {
 
 impl TaskContext {
     fn token_count(&self) -> usize {
-        self.relevant_code.iter().map(|c| c.content.len() / 4).sum::<usize>() +
-        self.related_docs.iter().map(|d| d.len() / 4).sum::<usize>()
+        self.relevant_code
+            .iter()
+            .map(|c| c.content.len() / 4)
+            .sum::<usize>()
+            + self.related_docs.iter().map(|d| d.len() / 4).sum::<usize>()
     }
 }
 

@@ -1,17 +1,17 @@
-use async_trait::async_trait;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time::timeout;
 
+use super::Provider;
 use crate::providers::http::{
     build_client, sanitize_error_body, send_with_retry, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT,
     FIRST_CHUNK_TIMEOUT,
 };
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId};
-use super::Provider;
 
 const HTTP_RETRIES: u32 = 2;
 
@@ -170,14 +170,26 @@ impl Provider for NvidiaProvider {
             r
         };
 
-        let response = timeout(CHAT_REQUEST_TIMEOUT, send_with_retry(make_req, HTTP_RETRIES))
-            .await
-            .map_err(|_| anyhow!("NVIDIA chat request timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
+        let response = timeout(
+            CHAT_REQUEST_TIMEOUT,
+            send_with_retry(make_req, HTTP_RETRIES),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "NVIDIA chat request timed out after {:?}",
+                CHAT_REQUEST_TIMEOUT
+            )
+        })??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("NVIDIA API error {}: {}", status, sanitize_error_body(&body)));
+            return Err(anyhow!(
+                "NVIDIA API error {}: {}",
+                status,
+                sanitize_error_body(&body)
+            ));
         }
 
         let nvidia_response: NvidiaResponse = response.json().await?;
@@ -231,7 +243,11 @@ impl Provider for NvidiaProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("NVIDIA API error {}: {}", status, sanitize_error_body(&body)));
+            return Err(anyhow!(
+                "NVIDIA API error {}: {}",
+                status,
+                sanitize_error_body(&body)
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -241,11 +257,13 @@ impl Provider for NvidiaProvider {
         let mut done = false;
 
         while !done {
-            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let wait = if first_chunk {
+                FIRST_CHUNK_TIMEOUT
+            } else {
+                CHUNK_TIMEOUT
+            };
             let chunk = match timeout(wait, stream.next()).await {
-                Err(_) => return Err(anyhow!(
-                    "NVIDIA stream stalled (no chunk for {:?})", wait
-                )),
+                Err(_) => return Err(anyhow!("NVIDIA stream stalled (no chunk for {:?})", wait)),
                 Ok(None) => break,
                 Ok(Some(Err(e))) => return Err(e.into()),
                 Ok(Some(Ok(c))) => c,

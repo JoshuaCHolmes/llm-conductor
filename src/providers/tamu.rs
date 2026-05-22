@@ -1,16 +1,16 @@
-use async_trait::async_trait;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time::timeout;
 
+use super::{serialize_messages_openai, Provider, ToolCallResponse, ToolDefinition};
 use crate::providers::http::{
     build_client, sanitize_error_body, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT,
 };
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, ToolCall};
-use super::{Provider, ToolDefinition, ToolCallResponse, serialize_messages_openai};
 
 /// TAMU AI provider using Texas A&M's OpenWebUI-based API
 /// Daily quotas with reset at 6-7 PM Central
@@ -159,13 +159,22 @@ impl Provider for TamuProvider {
                 .json(&payload)
                 .send(),
         )
-            .await
-            .map_err(|_| anyhow!("TAMU chat request timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "TAMU chat request timed out after {:?}",
+                CHAT_REQUEST_TIMEOUT
+            )
+        })??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("TAMU API error {}: {}", status, sanitize_error_body(&body)));
+            return Err(anyhow!(
+                "TAMU API error {}: {}",
+                status,
+                sanitize_error_body(&body)
+            ));
         }
 
         let tamu_response: TamuResponse = response.json().await?;
@@ -209,7 +218,11 @@ impl Provider for TamuProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("TAMU API error {}: {}", status, sanitize_error_body(&body)));
+            return Err(anyhow!(
+                "TAMU API error {}: {}",
+                status,
+                sanitize_error_body(&body)
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -220,11 +233,13 @@ impl Provider for TamuProvider {
         let mut done = false;
 
         while !done {
-            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let wait = if first_chunk {
+                FIRST_CHUNK_TIMEOUT
+            } else {
+                CHUNK_TIMEOUT
+            };
             let chunk = match timeout(wait, stream.next()).await {
-                Err(_) => return Err(anyhow!(
-                    "TAMU stream stalled (no chunk for {:?})", wait
-                )),
+                Err(_) => return Err(anyhow!("TAMU stream stalled (no chunk for {:?})", wait)),
                 Ok(None) => break,
                 Ok(Some(Err(e))) => return Err(e.into()),
                 Ok(Some(Ok(c))) => c,
@@ -272,14 +287,19 @@ impl Provider for TamuProvider {
         let model_name = self.get_api_model_name(&model.id);
         let tamu_messages = serialize_messages_openai(messages)?;
 
-        let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| json!({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-            }
-        })).collect();
+        let tool_defs: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+            })
+            .collect();
 
         let payload = json!({
             "model": model_name,
@@ -298,30 +318,57 @@ impl Provider for TamuProvider {
                 .json(&payload)
                 .send(),
         )
-            .await
-            .map_err(|_| anyhow!("TAMU call_with_tools timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "TAMU call_with_tools timed out after {:?}",
+                CHAT_REQUEST_TIMEOUT
+            )
+        })??;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("TAMU API error {}: {}", status, sanitize_error_body(&body)));
+            return Err(anyhow!(
+                "TAMU API error {}: {}",
+                status,
+                sanitize_error_body(&body)
+            ));
         }
 
         let raw: serde_json::Value = response.json().await?;
         let choice = raw["choices"][0]["message"].clone();
-        let text = choice["content"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let text = choice["content"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         let tokens = raw["usage"]["total_tokens"].as_u64();
 
         if let Some(tc_arr) = choice["tool_calls"].as_array() {
-            let tool_calls: Vec<ToolCall> = tc_arr.iter().filter_map(|tc| {
-                let id = tc["id"].as_str()?.to_string();
-                let name = tc["function"]["name"].as_str()?.to_string();
-                let arguments = tc["function"]["arguments"].as_str()?.to_string();
-                Some(ToolCall { id, name, arguments })
-            }).collect();
-            Ok(ToolCallResponse { text, tool_calls: Some(tool_calls), tokens })
+            let tool_calls: Vec<ToolCall> = tc_arr
+                .iter()
+                .filter_map(|tc| {
+                    let id = tc["id"].as_str()?.to_string();
+                    let name = tc["function"]["name"].as_str()?.to_string();
+                    let arguments = tc["function"]["arguments"].as_str()?.to_string();
+                    Some(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    })
+                })
+                .collect();
+            Ok(ToolCallResponse {
+                text,
+                tool_calls: Some(tool_calls),
+                tokens,
+            })
         } else {
-            Ok(ToolCallResponse { text, tool_calls: None, tokens })
+            Ok(ToolCallResponse {
+                text,
+                tool_calls: None,
+                tokens,
+            })
         }
     }
 
@@ -342,8 +389,8 @@ impl Provider for TamuProvider {
                 .json(&test_payload)
                 .send(),
         )
-            .await
-            .map_err(|_| anyhow!("TAMU health check timed out"))??;
+        .await
+        .map_err(|_| anyhow!("TAMU health check timed out"))??;
 
         // Success or rate limit means the API key works
         Ok(response.status().is_success() || response.status().as_u16() == 429)

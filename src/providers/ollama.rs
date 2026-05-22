@@ -1,13 +1,15 @@
-use async_trait::async_trait;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::timeout;
 
-use crate::providers::http::{build_client, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT};
-use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
 use super::Provider;
+use crate::providers::http::{
+    build_client, CHAT_REQUEST_TIMEOUT, CHUNK_TIMEOUT, FIRST_CHUNK_TIMEOUT,
+};
+use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
 
 /// Ollama provider for local models
 pub struct OllamaProvider {
@@ -30,34 +32,37 @@ impl OllamaProvider {
 impl Provider for OllamaProvider {
     async fn available_models(&self) -> Result<Vec<ModelInfo>> {
         let url = format!("{}/api/tags", self.base_url);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .send()
             .await?
             .json::<OllamaTagsResponse>()
             .await?;
-        
-        let models = response.models.into_iter()
+
+        let models = response
+            .models
+            .into_iter()
             .map(|m| ModelInfo {
                 id: ModelId::Ollama(m.name.clone()),
                 name: m.name,
                 provider: ProviderId::Ollama,
-                capability_tier: CapabilityTier::Basic,  // Local models are Basic tier
-                context_window: 8192,  // Default, would need to query model details
+                capability_tier: CapabilityTier::Basic, // Local models are Basic tier
+                context_window: 8192, // Default, would need to query model details
                 supports_vision: false,
                 supports_streaming: true,
-                cost_per_token: 0.0,  // Free!
+                cost_per_token: 0.0, // Free!
                 supports_tool_calling: false,
             })
             .collect();
-        
+
         Ok(models)
     }
-    
+
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
         let url = format!("{}/api/chat", self.base_url);
-        
+
         let ollama_messages: Vec<OllamaMessage> = messages
             .iter()
             .map(|m| OllamaMessage {
@@ -70,18 +75,18 @@ impl Provider for OllamaProvider {
                 content: m.content.clone(),
             })
             .collect();
-        
+
         let model_name = match &model.id {
             ModelId::Ollama(name) => name.clone(),
             _ => return Err(anyhow!("Invalid model ID for Ollama provider")),
         };
-        
+
         let request = json!({
             "model": model_name,
             "messages": ollama_messages,
             "stream": false,
         });
-        
+
         let response = timeout(CHAT_REQUEST_TIMEOUT, async {
             self.client
                 .post(&url)
@@ -91,12 +96,12 @@ impl Provider for OllamaProvider {
                 .json::<OllamaChatResponse>()
                 .await
         })
-            .await
-            .map_err(|_| anyhow!("Ollama chat timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
+        .await
+        .map_err(|_| anyhow!("Ollama chat timed out after {:?}", CHAT_REQUEST_TIMEOUT))??;
 
         Ok(response.message.content)
     }
-    
+
     async fn chat_stream(
         &self,
         model: &ModelInfo,
@@ -104,9 +109,9 @@ impl Provider for OllamaProvider {
         callback: Box<dyn Fn(String) + Send>,
     ) -> Result<(String, Option<u64>)> {
         use futures::StreamExt;
-        
+
         let url = format!("{}/api/chat", self.base_url);
-        
+
         let ollama_messages: Vec<OllamaMessage> = messages
             .iter()
             .map(|m| OllamaMessage {
@@ -119,24 +124,20 @@ impl Provider for OllamaProvider {
                 content: m.content.clone(),
             })
             .collect();
-        
+
         let model_name = match &model.id {
             ModelId::Ollama(name) => name.clone(),
             _ => return Err(anyhow!("Invalid model ID for Ollama provider")),
         };
-        
+
         let request = json!({
             "model": model_name,
             "messages": ollama_messages,
             "stream": true,
         });
-        
-        let response = self.client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await?;
-        
+
+        let response = self.client.post(&url).json(&request).send().await?;
+
         let mut stream = response.bytes_stream();
         let mut full_response = String::new();
         let mut buffer = String::new();
@@ -144,11 +145,13 @@ impl Provider for OllamaProvider {
         let mut first_chunk = true;
 
         while !done {
-            let wait = if first_chunk { FIRST_CHUNK_TIMEOUT } else { CHUNK_TIMEOUT };
+            let wait = if first_chunk {
+                FIRST_CHUNK_TIMEOUT
+            } else {
+                CHUNK_TIMEOUT
+            };
             let chunk = match timeout(wait, stream.next()).await {
-                Err(_) => return Err(anyhow!(
-                    "Ollama stream stalled (no chunk for {:?})", wait
-                )),
+                Err(_) => return Err(anyhow!("Ollama stream stalled (no chunk for {:?})", wait)),
                 Ok(None) => break,
                 Ok(Some(Err(e))) => return Err(e.into()),
                 Ok(Some(Ok(c))) => c,
@@ -193,11 +196,16 @@ impl Provider for OllamaProvider {
 
         Ok((full_response, None))
     }
-    
+
     async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/api/tags", self.base_url);
 
-        match timeout(std::time::Duration::from_secs(5), self.client.get(&url).send()).await {
+        match timeout(
+            std::time::Duration::from_secs(5),
+            self.client.get(&url).send(),
+        )
+        .await
+        {
             Ok(Ok(response)) => Ok(response.status().is_success()),
             _ => Ok(false),
         }

@@ -3,10 +3,9 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
-
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration as StdDuration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time::timeout;
 
 use crate::providers::http::{
@@ -16,8 +15,9 @@ use crate::providers::Provider;
 use crate::types::{CapabilityTier, Message, ModelId, ModelInfo, ProviderId, Role};
 
 const BASE_URL: &str = "https://playground.outlier.ai";
+
+/// HTTP retries for non-streaming requests.
 const HTTP_RETRIES: u32 = 2;
-const MODEL_CACHE_TTL: StdDuration = StdDuration::from_secs(15 * 60); // 15 minutes
 
 #[derive(Debug, Serialize)]
 struct TurnRequest {
@@ -58,24 +58,18 @@ struct Delta {
     content: Option<String>,
 }
 
+/// Mutable per-instance state. Holds the active server-side conversation id
+/// (if any) and the model name it was opened against, so we can reuse the
+/// conversation across turns and reset only on `/new` or model change.
 #[derive(Debug, Default)]
 struct OutlierState {
     conv_id: Option<String>,
+    /// Model name (e.g. "claude-opus-4-6") the active conversation was created with.
+    /// Differs from the requested model → we tear down and recreate.
     conv_model: Option<String>,
+    /// Number of user turns we've already sent to `conv_id`. 0 means the next
+    /// turn is the first; subsequent turns can be sent as just-the-latest-user.
     turns_sent: usize,
-}
-
-/// Cached model list with TTL
-#[derive(Debug, Clone)]
-struct ModelCache {
-    models: Vec<ModelInfo>,
-    fetched_at: Instant,
-}
-
-impl ModelCache {
-    fn is_expired(&self) -> bool {
-        self.fetched_at.elapsed() > MODEL_CACHE_TTL
-    }
 }
 
 pub struct OutlierProvider {
@@ -83,21 +77,26 @@ pub struct OutlierProvider {
     cookie: String,
     csrf_token: String,
     state: Arc<Mutex<OutlierState>>,
-    model_cache: Arc<Mutex<Option<ModelCache>>>,
+    /// Lazily-discovered models the user is entitled to (intersection of the
+    /// catalog with the `/users` modelChecklist endpoint). Falls back to the
+    /// full hardcoded catalog when discovery fails.
+    discovered: Arc<OnceCell<Vec<ModelInfo>>>,
 }
 
 impl OutlierProvider {
     pub fn new(cookie: String, csrf_token: String) -> Result<Self> {
+        // No overall timeout — streaming uses per-chunk timeouts in the loop.
         let client = build_client(None)?;
         Ok(Self {
             client,
             cookie,
             csrf_token,
             state: Arc::new(Mutex::new(OutlierState::default())),
-            model_cache: Arc::new(Mutex::new(None)),
+            discovered: Arc::new(OnceCell::new()),
         })
     }
 
+    /// Returns the standard set of headers shared by every Outlier request.
     fn auth_headers(&self, builder: RequestBuilder, referer_path: &str) -> RequestBuilder {
         builder
             .header("origin", BASE_URL)
@@ -116,6 +115,11 @@ impl OutlierProvider {
         }
     }
 
+    /// Last-resort modelId table for models whose UUIDs we know. The Outlier
+    /// web UI ships these UUIDs in its JS bundle and there is no documented
+    /// public endpoint that lists them; if a name isn't found we fall back to
+    /// an empty modelId — the server tolerates this for many models, and
+    /// failures surface as a clean error rather than silent miscoding.
     async fn get_outlier_model_id(&self, model_name: &str) -> String {
         let url = "https://playground.outlier.ai/internal/experts/assistant/models";
         if let Ok(req) = self
@@ -171,6 +175,43 @@ impl OutlierProvider {
         }
     }
 
+    /// POST /users — discover which models this account is allowed to use.
+    /// Returns a map of `modelChecklist` (e.g. {"claude-opus-4-6": true, …}).
+    async fn fetch_model_checklist(&self) -> Result<HashMap<String, bool>> {
+        let url = format!("{}/internal/experts/assistant/users", BASE_URL);
+        let resp = send_with_retry(
+            || {
+                self.auth_headers(self.client.post(&url), "/chat")
+                    .header("content-type", "application/json")
+                    .body("{}")
+            },
+            HTTP_RETRIES,
+        )
+        .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Outlier /users discovery failed: {} body={}",
+                status,
+                sanitize_error_body(&body)
+            ));
+        }
+
+        #[derive(Deserialize)]
+        struct UsersResp {
+            #[serde(rename = "modelChecklist", default)]
+            model_checklist: HashMap<String, bool>,
+        }
+        let parsed: UsersResp = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Outlier /users JSON: {e}"))?;
+        Ok(parsed.model_checklist)
+    }
+
+    /// Always creates a fresh conversation with the given text as the initial message.
     async fn create_conversation(
         &self,
         text: &str,
@@ -184,7 +225,8 @@ impl OutlierProvider {
             "modelId": model_id,
             "challengeId": "",
             "initialTurnMode": "Normal",
-            "modelLabel": model_name,
+            "initialTurnType": "Text",
+            "isMysteryModel": false
         });
 
         let response = send_with_retry(
@@ -198,9 +240,13 @@ impl OutlierProvider {
         .await?;
 
         if response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let data: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| anyhow::anyhow!("Parse conversation response: {e}"))?;
+            let body = response.text().await?;
+            let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                anyhow::anyhow!(
+                    "Outlier create_conversation: invalid JSON: {e} body={}",
+                    sanitize_error_body(&body)
+                )
+            })?;
             if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
                 return Ok(id.to_string());
             }
@@ -217,6 +263,7 @@ impl OutlierProvider {
         ))
     }
 
+    /// Delete a conversation by ID. Best-effort — errors are logged and swallowed.
     async fn delete_conversation(&self, conv_id: &str) {
         let url = format!(
             "{}/internal/experts/assistant/conversations/{}",
@@ -232,6 +279,7 @@ impl OutlierProvider {
         }
     }
 
+    /// POST the turn-streaming endpoint and return the response (caller checks status).
     async fn send_turn(
         &self,
         conv_id: &str,
@@ -262,6 +310,7 @@ impl OutlierProvider {
         Ok(response)
     }
 
+    /// Drain an SSE response into a String (no streaming callback). Used by non-streaming `chat()`.
     async fn drain_sse(response: reqwest::Response) -> Result<String> {
         let mut stream = response.bytes_stream();
         let mut result = String::new();
@@ -311,6 +360,10 @@ impl OutlierProvider {
         Ok(result)
     }
 
+    /// Flatten the entire history to prose for the *initial* turn of a fresh
+    /// conversation. Includes system + user + assistant + tool messages so the
+    /// server-side conversation starts with the same context the model would
+    /// see at any other provider.
     fn flatten_history(messages: &[Message]) -> String {
         messages
             .iter()
@@ -358,31 +411,41 @@ impl OutlierProvider {
             .join("\n\n")
     }
 
+    /// Pick out the latest user message + any tool/conductor messages that
+    /// followed it. Used for incremental turns on an already-open conversation
+    /// — Outlier holds prior turns server-side so we don't need to resend.
     fn latest_turn_text(messages: &[Message]) -> String {
+        // Find the index of the last User message.
         let last_user_idx = messages.iter().rposition(|m| matches!(m.role, Role::User));
         let slice = match last_user_idx {
             Some(i) => &messages[i..],
-            None => messages,
+            None => messages, // shouldn't happen — defensive
         };
         Self::flatten_history(slice)
     }
 
+    /// Tear down any open server-side conversation and clear local state.
     async fn drop_conversation(&self) {
         let mut state = self.state.lock().await;
         if let Some(id) = state.conv_id.take() {
             state.conv_model = None;
             state.turns_sent = 0;
+            // Drop the lock before awaiting network IO.
             drop(state);
             self.delete_conversation(&id).await;
         }
     }
 
+    /// Ensure we have an open conversation matching `model_name`. If the
+    /// existing one was opened against a different model, recreate. Returns
+    /// `(conv_id, is_first_turn)` so the caller knows how much history to send.
     async fn ensure_conversation(
         &self,
         messages: &[Message],
         model_name: &str,
         model_id_str: &str,
     ) -> Result<(String, bool)> {
+        // Fast path: existing conversation, same model.
         {
             let state = self.state.lock().await;
             if let (Some(id), Some(m)) = (&state.conv_id, &state.conv_model) {
@@ -392,6 +455,7 @@ impl OutlierProvider {
             }
         }
 
+        // Need a new conversation. If one exists for a different model, drop it first.
         self.drop_conversation().await;
 
         let initial_text = Self::flatten_history(messages);
@@ -405,10 +469,15 @@ impl OutlierProvider {
         Ok((conv_id, true))
     }
 
+    /// On a stream error worth retrying (e.g. timeout), drop the broken
+    /// conversation so the next attempt creates a fresh one.
     async fn invalidate_after_failure(&self) {
         self.drop_conversation().await;
     }
 
+    /// Pick the text payload to send for this turn:
+    /// - first turn of a fresh conversation: full history (already in create_conversation)
+    /// - subsequent turn: only the latest user-trailing slice
     fn turn_text(messages: &[Message], is_first_turn: bool) -> String {
         if is_first_turn {
             Self::flatten_history(messages)
@@ -417,6 +486,8 @@ impl OutlierProvider {
         }
     }
 
+    /// Full hardcoded catalog. Used as the universe to filter when entitlement
+    /// discovery succeeds, and as the entire fallback when it fails.
     fn catalog() -> Vec<ModelInfo> {
         vec![
             ModelInfo {
@@ -510,6 +581,8 @@ impl OutlierProvider {
         ]
     }
 
+    /// Map a catalog entry's name to the Outlier api model name we'd send,
+    /// so we can intersect the catalog with `modelChecklist` keys.
     fn catalog_api_name(info: &ModelInfo) -> String {
         match &info.id {
             ModelId::ClaudeOpus45 => "claude-opus-4-6".to_string(),
@@ -519,126 +592,76 @@ impl OutlierProvider {
             _ => "claude-opus-4-6".to_string(),
         }
     }
-
-    /// Fetch fresh model list from Outlier API with detailed logging
-    async fn fetch_models_from_api(&self) -> Result<Vec<ModelInfo>> {
-        let catalog = Self::catalog();
-        let mut out = Vec::new();
-
-        let url = "https://playground.outlier.ai/internal/experts/assistant/models";
-        tracing::info!("Fetching Outlier models from API...");
-        
-        let response = self
-            .client
-            .get(url)
-            .header("cookie", &self.cookie)
-            .header("x-csrf-token", &self.csrf_token)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "Outlier models API returned {}: {}",
-                status,
-                sanitize_error_body(&body)
-            ));
-        }
-
-        let data = response.json::<serde_json::Value>().await?;
-        let arr = data
-            .get("models")
-            .unwrap_or(&data)
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Outlier API response missing 'models' array"))?;
-
-        tracing::info!("Outlier API returned {} models", arr.len());
-
-        for m in arr {
-            let slug = m
-                .get("slug")
-                .or_else(|| m.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            
-            if slug.is_empty() {
-                continue;
-            }
-
-            // Check if we have rich metadata in catalog
-            if let Some(known) = catalog.iter().find(|c| Self::catalog_api_name(c) == slug) {
-                tracing::debug!("  ✓ {} (from catalog)", slug);
-                out.push(known.clone());
-            } else {
-                // Unknown model - create with safe defaults
-                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(slug);
-                tracing::info!("  ⚠ {} (new model, using defaults)", slug);
-                out.push(ModelInfo {
-                    id: ModelId::Custom(slug.to_string()),
-                    name: name.to_string(),
-                    provider: ProviderId::Outlier,
-                    capability_tier: CapabilityTier::Advanced,
-                    context_window: 32000,
-                    supports_vision: false,
-                    supports_streaming: true,
-                    cost_per_token: 0.0,
-                    supports_tool_calling: false,
-                });
-            }
-        }
-
-        Ok(out)
-    }
 }
 
 #[async_trait]
 impl Provider for OutlierProvider {
-    async fn available_models(&self) -> Result<Vec<ModelInfo>> {
-        // Check cache first
-        {
-            let cache = self.model_cache.lock().await;
-            if let Some(ref cached) = *cache {
-                if !cached.is_expired() {
-                    let age_secs = cached.fetched_at.elapsed().as_secs();
-                    tracing::debug!(
-                        "Returning cached Outlier models ({} models, cached {} seconds ago)",
-                        cached.models.len(),
-                        age_secs
+    async fn available_models(&self) -> Result<Vec<crate::types::model::ModelInfo>> {
+        let cached = self
+            .discovered
+            .get_or_init(|| async {
+                let mut out = Vec::new();
+                let catalog = Self::catalog();
+
+                let url = "https://playground.outlier.ai/internal/experts/assistant/models";
+                if let Ok(req) = self
+                    .client
+                    .get(url)
+                    .header("cookie", &self.cookie)
+                    .header("x-csrf-token", &self.csrf_token)
+                    .send()
+                    .await
+                {
+                    if let Ok(data) = req.json::<serde_json::Value>().await {
+                        if let Some(arr) = data.get("models").unwrap_or(&data).as_array() {
+                            for m in arr {
+                                let slug = m
+                                    .get("slug")
+                                    .or_else(|| m.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if slug.is_empty() {
+                                    continue;
+                                }
+
+                                // Hybrid check: Do we have rich metadata for this in our local catalog?
+                                if let Some(known) =
+                                    catalog.iter().find(|c| Self::catalog_api_name(c) == slug)
+                                {
+                                    out.push(known.clone());
+                                } else {
+                                    // New unknown model! Append safely.
+                                    let name =
+                                        m.get("name").and_then(|v| v.as_str()).unwrap_or(slug);
+                                    out.push(crate::types::model::ModelInfo {
+                                        id: crate::types::model::ModelId::Custom(slug.to_string()),
+                                        name: name.to_string(),
+                                        provider: crate::types::model::ProviderId::Outlier,
+                                        capability_tier:
+                                            crate::types::model::CapabilityTier::Advanced, // Safe default
+                                        context_window: 32000,
+                                        supports_vision: false,
+                                        supports_streaming: true,
+                                        cost_per_token: 0.0,
+                                        supports_tool_calling: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if out.is_empty() {
+                    tracing::warn!(
+                        "Failed to fetch live Outlier models; falling back to static catalog."
                     );
-                    return Ok(cached.models.clone());
+                    return catalog;
                 }
-                tracing::info!("Outlier model cache expired, refreshing...");
-            }
-        }
 
-        // Cache miss or expired — fetch fresh
-        match self.fetch_models_from_api().await {
-            Ok(models) => {
-                if !models.is_empty() {
-                    // Cache the successful result
-                    let mut cache = self.model_cache.lock().await;
-                    *cache = Some(ModelCache {
-                        models: models.clone(),
-                        fetched_at: Instant::now(),
-                    });
-                    tracing::info!("✓ Cached {} Outlier models", models.len());
-                    return Ok(models);
-                }
-                tracing::warn!("API returned empty model list");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch Outlier models: {}", e);
-            }
-        }
-
-        // Fallback to static catalog
-        let catalog = Self::catalog();
-        tracing::warn!(
-            "Falling back to static Outlier catalog ({} models)",
-            catalog.len()
-        );
-        Ok(catalog)
+                out
+            })
+            .await;
+        Ok(cached.clone())
     }
 
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String> {
@@ -693,6 +716,9 @@ impl Provider for OutlierProvider {
         let model_id_string = self.get_outlier_model_id(model_name).await;
         let model_id_str = &model_id_string;
 
+        // NOTE: `callback` is Box<dyn Fn + Send> but NOT Sync.
+        // To avoid holding &callback across .await (which requires Sync), we expand the SSE loop
+        // inline here. The owned `callback` is Send and can be held across .await directly.
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..2u8 {
             if attempt > 0 {

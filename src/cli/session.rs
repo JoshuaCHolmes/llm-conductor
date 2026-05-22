@@ -33,10 +33,10 @@ impl TodoStatus {
 impl fmt::Display for TodoStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::Pending    => "pending",
+            Self::Pending => "pending",
             Self::InProgress => "in_progress",
-            Self::Done       => "done",
-            Self::Blocked    => "blocked",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
         };
         write!(f, "{}", s)
     }
@@ -66,10 +66,10 @@ impl Todo {
     /// One-line display: "● [status] title (id_prefix)"
     pub fn summary(&self, num: usize) -> String {
         let icon = match self.status {
-            TodoStatus::Pending    => "○",
+            TodoStatus::Pending => "○",
             TodoStatus::InProgress => "◐",
-            TodoStatus::Done       => "✓",
-            TodoStatus::Blocked    => "✗",
+            TodoStatus::Done => "✓",
+            TodoStatus::Blocked => "✗",
         };
         format!("{:2}. {} [{}] {}", num, icon, self.status, self.title)
     }
@@ -112,7 +112,13 @@ impl SessionStore {
     }
 
     /// Save or update a session. Returns the session ID (created on first save).
-    pub fn save(&self, session_id: Option<&str>, messages: &[Message], todos: &[Todo], compacted_summary: Option<&str>) -> Result<String> {
+    pub fn save(
+        &self,
+        session_id: Option<&str>,
+        messages: &[Message],
+        todos: &[Todo],
+        compacted_summary: Option<&str>,
+    ) -> Result<String> {
         let id = session_id
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -125,7 +131,11 @@ impl SessionStore {
             .find(|m| matches!(m.role, crate::types::Role::User))
             .map(|m| {
                 let s = m.content.chars().take(80).collect::<String>();
-                if m.content.len() > 80 { format!("{}…", s) } else { s }
+                if m.content.len() > 80 {
+                    format!("{}…", s)
+                } else {
+                    s
+                }
             })
             .unwrap_or_default();
 
@@ -197,7 +207,8 @@ impl SessionStore {
         for (i, meta) in page_sessions.iter().enumerate() {
             let num = start + i + 1;
             let age = format_age(meta.updated_at);
-            println!("  {} {}  {}  {}",
+            println!(
+                "  {} {}  {}  {}",
                 format!("[{}]", num).bright_yellow().bold(),
                 age.dimmed(),
                 meta.preview.bright_white(),
@@ -208,7 +219,10 @@ impl SessionStore {
         let pages = total.div_ceil(SESSIONS_PER_PAGE);
         if pages > 1 {
             println!();
-            println!("{}", format!("Page {}/{} — use > / < to navigate", page + 1, pages).dimmed());
+            println!(
+                "{}",
+                format!("Page {}/{} — use > / < to navigate", page + 1, pages).dimmed()
+            );
         }
 
         Ok(total)
@@ -244,7 +258,9 @@ impl SessionStore {
     /// Look up a session by 1-based display number (sorted by most recent).
     pub fn get_by_number(&self, n: usize) -> Result<SessionMeta> {
         let sessions = self.list()?;
-        sessions.into_iter().nth(n.saturating_sub(1))
+        sessions
+            .into_iter()
+            .nth(n.saturating_sub(1))
             .ok_or_else(|| anyhow::anyhow!("No session with number {}", n))
     }
 }
@@ -273,7 +289,13 @@ mod tests {
     }
 
     fn msg(role: Role, content: &str) -> Message {
-        Message { role, content: content.to_string(), tool_calls: None, tool_call_id: None, source: None }
+        Message {
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            source: None,
+        }
     }
 
     #[test]
@@ -299,7 +321,11 @@ mod tests {
 
         // Must reuse the same id and not create a new slot
         assert_eq!(id, id2, "resumed save should reuse the same session id");
-        assert_eq!(store.list().unwrap().len(), 1, "should still be exactly 1 session");
+        assert_eq!(
+            store.list().unwrap().len(),
+            1,
+            "should still be exactly 1 session"
+        );
 
         // Loaded session should have the updated messages
         let loaded = store.load(&id).unwrap();
@@ -311,7 +337,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = make_store(&dir);
 
-        let todos = vec![Todo::new("Task A", None), Todo::new("Task B", Some("do the thing"))];
+        let todos = vec![
+            Todo::new("Task A", None),
+            Todo::new("Task B", Some("do the thing")),
+        ];
         let id = store.save(None, &[], &todos, None).unwrap();
 
         let loaded = store.load(&id).unwrap();
@@ -337,7 +366,10 @@ mod tests {
         std::fs::write(&path, raw.to_string()).unwrap();
 
         let loaded = store.load(&id).unwrap();
-        assert!(loaded.todos.is_empty(), "old session should deserialize with empty todos");
+        assert!(
+            loaded.todos.is_empty(),
+            "old session should deserialize with empty todos"
+        );
     }
 
     #[test]
@@ -351,7 +383,10 @@ mod tests {
         let msgs2 = vec![msg(Role::User, "turn 2"), msg(Role::Assistant, "b")];
         store.save(None, &msgs2, &[], None).unwrap();
 
-        assert_eq!(store.list().unwrap().len(), 2, "two fresh sessions should produce two slots");
+        assert_eq!(
+            store.list().unwrap().len(),
+            2,
+            "two fresh sessions should produce two slots"
+        );
     }
 }
-

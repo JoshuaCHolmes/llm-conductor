@@ -33,20 +33,19 @@ impl Default for ProviderSettings {
 pub struct ProvidersConfig {
     /// Ollama local model provider
     pub ollama: ProviderSettings,
-    
+
     /// GitHub Copilot (50 req/month free)
     pub github: ProviderSettings,
-    
+
     /// TAMU AI (daily limits)
     pub tamu: ProviderSettings,
-    
+
     /// NVIDIA NIM (rate limits)
     pub nvidia: ProviderSettings,
-    
+
     /// Outlier Playground (unlimited via contract)
     pub outlier: ProviderSettings,
 }
-
 
 /// Manager for provider configuration
 pub struct ProviderConfigManager {
@@ -58,14 +57,14 @@ impl ProviderConfigManager {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
             .join("llm-conductor");
-        
+
         std::fs::create_dir_all(&config_dir)?;
-        
+
         Ok(Self {
             config_path: config_dir.join("providers.toml"),
         })
     }
-    
+
     /// Load provider configuration
     pub fn load(&self) -> Result<ProvidersConfig> {
         if !self.config_path.exists() {
@@ -74,26 +73,26 @@ impl ProviderConfigManager {
             self.save(&default)?;
             return Ok(default);
         }
-        
+
         let contents = std::fs::read_to_string(&self.config_path)?;
         let config: ProvidersConfig = toml::from_str(&contents)?;
         Ok(config)
     }
-    
+
     /// Save provider configuration
     pub fn save(&self, config: &ProvidersConfig) -> Result<()> {
         let contents = toml::to_string_pretty(config)?;
         std::fs::write(&self.config_path, contents)?;
         Ok(())
     }
-    
+
     /// Check if a provider is enabled
     pub fn is_enabled(&self, provider: &str) -> bool {
         let config = match self.load() {
             Ok(c) => c,
             Err(_) => return true, // Default to enabled if config fails
         };
-        
+
         match provider.to_lowercase().as_str() {
             "ollama" => config.ollama.enabled,
             "github" | "copilot" => config.github.enabled,
@@ -103,11 +102,11 @@ impl ProviderConfigManager {
             _ => true,
         }
     }
-    
+
     /// Set provider enabled/disabled
     pub fn set_enabled(&self, provider: &str, enabled: bool) -> Result<()> {
         let mut config = self.load()?;
-        
+
         match provider.to_lowercase().as_str() {
             "ollama" => config.ollama.enabled = enabled,
             "github" | "copilot" => config.github.enabled = enabled,
@@ -116,17 +115,21 @@ impl ProviderConfigManager {
             "outlier" => config.outlier.enabled = enabled,
             _ => return Err(anyhow::anyhow!("Unknown provider: {}", provider)),
         }
-        
+
         self.save(&config)?;
-        
-        println!("✓ Provider '{}' {}", provider, if enabled { "enabled" } else { "disabled" });
+
+        println!(
+            "✓ Provider '{}' {}",
+            provider,
+            if enabled { "enabled" } else { "disabled" }
+        );
         Ok(())
     }
-    
+
     /// Set provider priority
     pub fn set_priority(&self, provider: &str, priority: u8) -> Result<()> {
         let mut config = self.load()?;
-        
+
         match provider.to_lowercase().as_str() {
             "ollama" => config.ollama.priority = priority,
             "github" | "copilot" => config.github.priority = priority,
@@ -135,21 +138,17 @@ impl ProviderConfigManager {
             "outlier" => config.outlier.priority = priority,
             _ => return Err(anyhow::anyhow!("Unknown provider: {}", provider)),
         }
-        
+
         self.save(&config)?;
-        
+
         println!("✓ Provider '{}' priority set to {}", provider, priority);
         Ok(())
     }
-    
+
     /// Get custom setting for a provider
-    pub fn get_custom<T: for<'de> Deserialize<'de>>(
-        &self,
-        provider: &str,
-        key: &str,
-    ) -> Option<T> {
+    pub fn get_custom<T: for<'de> Deserialize<'de>>(&self, provider: &str, key: &str) -> Option<T> {
         let config = self.load().ok()?;
-        
+
         let settings = match provider.to_lowercase().as_str() {
             "ollama" => &config.ollama,
             "github" | "copilot" => &config.github,
@@ -158,20 +157,17 @@ impl ProviderConfigManager {
             "outlier" => &config.outlier,
             _ => return None,
         };
-        
-        settings.custom.get(key)
+
+        settings
+            .custom
+            .get(key)
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
-    
+
     /// Set custom setting for a provider
-    pub fn set_custom(
-        &self,
-        provider: &str,
-        key: &str,
-        value: serde_json::Value,
-    ) -> Result<()> {
+    pub fn set_custom(&self, provider: &str, key: &str, value: serde_json::Value) -> Result<()> {
         let mut config = self.load()?;
-        
+
         let settings = match provider.to_lowercase().as_str() {
             "ollama" => &mut config.ollama,
             "github" | "copilot" => &mut config.github,
@@ -180,23 +176,23 @@ impl ProviderConfigManager {
             "outlier" => &mut config.outlier,
             _ => return Err(anyhow::anyhow!("Unknown provider: {}", provider)),
         };
-        
+
         settings.custom.insert(key.to_string(), value);
         self.save(&config)?;
-        
+
         println!("✓ Set {} for provider '{}'", key, provider);
         Ok(())
     }
-    
+
     /// Get all enabled providers sorted by priority
     pub fn get_enabled_providers(&self) -> Vec<(String, u8)> {
         let config = match self.load() {
             Ok(c) => c,
             Err(_) => return vec![],
         };
-        
+
         let mut providers = vec![];
-        
+
         if config.ollama.enabled {
             providers.push(("ollama".to_string(), config.ollama.priority));
         }
@@ -212,10 +208,10 @@ impl ProviderConfigManager {
         if config.outlier.enabled {
             providers.push(("outlier".to_string(), config.outlier.priority));
         }
-        
+
         // Sort by priority (descending)
         providers.sort_by(|a, b| b.1.cmp(&a.1));
-        
+
         providers
     }
 }

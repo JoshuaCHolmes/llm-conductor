@@ -1,21 +1,21 @@
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::json;
 
 use crate::types::{Message, ModelInfo, Role, ToolCall};
 
-pub mod ollama;
 pub mod github;
-pub mod tamu;
-pub mod nvidia;
-pub mod outlier;
 pub mod http;
+pub mod nvidia;
+pub mod ollama;
+pub mod outlier;
+pub mod tamu;
 
-pub use ollama::OllamaProvider;
 pub use github::GitHubProvider;
-pub use tamu::TamuProvider;
 pub use nvidia::NvidiaProvider;
+pub use ollama::OllamaProvider;
 pub use outlier::OutlierProvider;
+pub use tamu::TamuProvider;
 
 /// Serialize a slice of `Message`s into the OpenAI `chat/completions` shape.
 ///
@@ -23,40 +23,53 @@ pub use outlier::OutlierProvider;
 /// `tool_call_id`) — sending such a payload causes 400 errors at every
 /// OpenAI-compatible API and silent context loss at non-strict ones.
 pub fn serialize_messages_openai(messages: &[Message]) -> Result<Vec<serde_json::Value>> {
-    messages.iter().map(|m| {
-        let is_conductor = m.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false);
-        let value = match m.role {
-            Role::Tool => {
-                let id = m.require_tool_call_id()
-                    .map_err(|e| anyhow::anyhow!("invalid tool message: {}", e))?;
-                json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": m.content,
-                })
-            }
-            Role::Assistant if m.tool_calls.is_some() => {
-                let tcs = m.tool_calls.as_ref().unwrap();
-                let tc: Vec<serde_json::Value> = tcs.iter().map(|tc| json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": { "name": tc.name, "arguments": tc.arguments }
-                })).collect();
-                let content_val = if m.content.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    json!(m.content)
-                };
-                json!({ "role": "assistant", "content": content_val, "tool_calls": tc })
-            }
-            Role::User if is_conductor => json!({
-                "role": "user",
-                "content": format!("[conductor]: {}", m.content),
-            }),
-            _ => json!({ "role": m.role.as_str(), "content": m.content }),
-        };
-        Ok(value)
-    }).collect()
+    messages
+        .iter()
+        .map(|m| {
+            let is_conductor = m
+                .source
+                .as_deref()
+                .map(|s| s.starts_with("conductor/"))
+                .unwrap_or(false);
+            let value = match m.role {
+                Role::Tool => {
+                    let id = m
+                        .require_tool_call_id()
+                        .map_err(|e| anyhow::anyhow!("invalid tool message: {}", e))?;
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": m.content,
+                    })
+                }
+                Role::Assistant if m.tool_calls.is_some() => {
+                    let tcs = m.tool_calls.as_ref().unwrap();
+                    let tc: Vec<serde_json::Value> = tcs
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": { "name": tc.name, "arguments": tc.arguments }
+                            })
+                        })
+                        .collect();
+                    let content_val = if m.content.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        json!(m.content)
+                    };
+                    json!({ "role": "assistant", "content": content_val, "tool_calls": tc })
+                }
+                Role::User if is_conductor => json!({
+                    "role": "user",
+                    "content": format!("[conductor]: {}", m.content),
+                }),
+                _ => json!({ "role": m.role.as_str(), "content": m.content }),
+            };
+            Ok(value)
+        })
+        .collect()
 }
 
 /// A function/tool definition to pass to OpenAI-compatible APIs
@@ -162,10 +175,10 @@ pub struct ToolCallResponse {
 pub trait Provider: Send + Sync {
     /// Get information about available models
     async fn available_models(&self) -> Result<Vec<ModelInfo>>;
-    
+
     /// Send messages and get response
     async fn chat(&self, model: &ModelInfo, messages: &[Message]) -> Result<String>;
-    
+
     /// Send messages and stream response.
     /// Returns (full_response_text, Option<total_tokens_used>).
     async fn chat_stream(
@@ -174,7 +187,7 @@ pub trait Provider: Send + Sync {
         messages: &[Message],
         callback: Box<dyn Fn(String) + Send>,
     ) -> Result<(String, Option<u64>)>;
-    
+
     /// Send messages with tool definitions (non-streaming). Used for function calling.
     /// Returns either a text response or a set of tool calls.
     /// Default implementation returns an error — only OpenAI-compat providers override this.
@@ -184,7 +197,9 @@ pub trait Provider: Send + Sync {
         _messages: &[Message],
         _tools: &[ToolDefinition],
     ) -> Result<ToolCallResponse> {
-        Err(anyhow::anyhow!("Tool calling not supported by this provider"))
+        Err(anyhow::anyhow!(
+            "Tool calling not supported by this provider"
+        ))
     }
 
     /// Check if provider is available/healthy

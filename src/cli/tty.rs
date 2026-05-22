@@ -9,9 +9,12 @@
 /// before doing any rustyline readline() calls, because tcsetattr is
 /// terminal-wide and raw mode will corrupt rustyline's input handling.
 #[cfg(unix)]
-pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
-    -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Receiver<()>)
-{
+pub fn spawn_esc_watcher(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -19,12 +22,7 @@ pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
     std::thread::spawn(move || {
-        let fd = unsafe {
-            libc::open(
-                c"/dev/tty".as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK,
-            )
-        };
+        let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         if fd < 0 {
             let _ = done_tx.send(());
             return;
@@ -36,7 +34,9 @@ pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
         let mut old_tio: libc::termios = unsafe { std::mem::zeroed() };
         let getattr_rc = unsafe { libc::tcgetattr(fd, &mut old_tio) };
         if getattr_rc != 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             let _ = done_tx.send(());
             return;
         }
@@ -48,7 +48,9 @@ pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
         raw_tio.c_cc[libc::VTIME] = 0;
         let setattr_rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw_tio) };
         if setattr_rc != 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             let _ = done_tx.send(());
             return;
         }
@@ -77,9 +79,12 @@ pub fn spawn_esc_watcher(stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
 
 /// No-op stub for non-unix platforms.
 #[cfg(not(unix))]
-pub fn spawn_esc_watcher(_stop: std::sync::Arc<std::sync::atomic::AtomicBool>)
-    -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Receiver<()>)
-{
+pub fn spawn_esc_watcher(
+    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     let (_done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     (rx, done_rx)

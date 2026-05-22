@@ -4,17 +4,17 @@ use rustyline::DefaultEditor;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::cli::session::{SessionStore, Todo, TodoStatus};
 use crate::cli::executor::{self, ActionTurn, Shell, TurnKind};
-use crate::providers::{ToolDefinition};
-use crate::router::Router;
-use crate::types::{Message, Task};
-use crate::types::message::Role;
-use crate::usage_tracking::UsageTracker;
+use crate::cli::session::{SessionStore, Todo, TodoStatus};
 use crate::model_filter::ModelFilter;
+use crate::providers::ToolDefinition;
+use crate::router::Router;
+use crate::types::message::Role;
+use crate::types::{Message, Task};
+use crate::usage_tracking::UsageTracker;
 
 /// Find the byte offset of a plain ` ```bash ` block — not bash-long or bash-sub.
 fn find_sync_bash(s: &str) -> Option<usize> {
@@ -58,10 +58,20 @@ struct PlannedAction {
 
 #[derive(Debug)]
 enum PlannedKind {
-    Bash { cmd: String, timeout: Option<std::time::Duration>, parallel: bool },
-    Todo { dispatch_json: String },
-    Think { query: String },
-    Unknown { name: String },
+    Bash {
+        cmd: String,
+        timeout: Option<std::time::Duration>,
+        parallel: bool,
+    },
+    Todo {
+        dispatch_json: String,
+    },
+    Think {
+        query: String,
+    },
+    Unknown {
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +85,10 @@ enum FeedbackMode {
 /// Plan-phase outcome: either we have actions to execute or we're done.
 enum PlanPhase {
     Done,
-    Actions { planned: Vec<PlannedAction>, mode: FeedbackMode },
+    Actions {
+        planned: Vec<PlannedAction>,
+        mode: FeedbackMode,
+    },
 }
 
 #[derive(Debug)]
@@ -95,7 +108,9 @@ struct ExecOutcome {
 
 /// Strip `**`, `*`, `` ` ``, `_` marker characters (used for heading text).
 fn strip_md_markers(s: &str) -> String {
-    s.chars().filter(|&c| c != '*' && c != '`' && c != '_').collect()
+    s.chars()
+        .filter(|&c| c != '*' && c != '`' && c != '_')
+        .collect()
 }
 
 /// Render inline markdown spans in a string to ANSI terminal sequences.
@@ -141,7 +156,13 @@ fn render_inline(s: &str) -> String {
 /// Strip raw action fence blocks from a stored assistant message for display.
 /// Removes ```bash, ```bash-long, ```bash-sub, ```tool, ```rubberduck blocks entirely.
 fn strip_action_fences(text: &str) -> String {
-    let fences = ["```bash-long", "```bash-sub", "```bash", "```tool", "```rubberduck"];
+    let fences = [
+        "```bash-long",
+        "```bash-sub",
+        "```bash",
+        "```tool",
+        "```rubberduck",
+    ];
     let mut out = String::with_capacity(text.len());
     let mut chars = text;
     'outer: while !chars.is_empty() {
@@ -150,7 +171,7 @@ fn strip_action_fences(text: &str) -> String {
                 // Skip to closing ```
                 if let Some(end) = chars[fence.len()..].find("\n```") {
                     chars = &chars[fence.len() + end + 4..]; // skip past closing ```
-                    // eat leading newline if present
+                                                             // eat leading newline if present
                     chars = chars.strip_prefix('\n').unwrap_or(chars);
                 } else {
                     // No closing fence — drop the rest
@@ -215,17 +236,23 @@ fn render_markdown_line(line: &str) -> String {
 
 /// Which fenced region the streaming parser is currently inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FenceKind { Bash, BashLong, BashSub, Tool, Rubberduck }
+enum FenceKind {
+    Bash,
+    BashLong,
+    BashSub,
+    Tool,
+    Rubberduck,
+}
 
 impl FenceKind {
     /// Opening marker (without trailing newline). Order matters in the parser:
     /// `bash-sub` and `bash-long` must be tried before `bash`.
     fn marker(self) -> &'static str {
         match self {
-            FenceKind::BashSub    => "```bash-sub",
-            FenceKind::BashLong   => "```bash-long",
-            FenceKind::Bash       => "```bash",
-            FenceKind::Tool       => "```tool",
+            FenceKind::BashSub => "```bash-sub",
+            FenceKind::BashLong => "```bash-long",
+            FenceKind::Bash => "```bash",
+            FenceKind::Tool => "```tool",
             FenceKind::Rubberduck => "```rubberduck",
         }
     }
@@ -243,9 +270,11 @@ enum StreamMode {
     #[default]
     Normal,
     Think,
-    InFence { kind: FenceKind, buf: String },
+    InFence {
+        kind: FenceKind,
+        buf: String,
+    },
 }
-
 
 /// State machine for streaming model responses.
 ///
@@ -278,7 +307,10 @@ struct ReplyStreamState {
 
 impl ReplyStreamState {
     fn char_safe_len(s: &str, raw_len: usize) -> usize {
-        (0..=raw_len).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
+        (0..=raw_len)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0)
     }
 
     /// Print any deferred blank lines before new content.
@@ -353,13 +385,30 @@ impl ReplyStreamState {
             }
         };
         consider(MarkerHit::Think, self.pending.find("<think>"));
-        consider(MarkerHit::Fence(FenceKind::BashSub),  self.pending.find(FenceKind::BashSub.marker()));
-        consider(MarkerHit::Fence(FenceKind::BashLong), self.pending.find(FenceKind::BashLong.marker()));
-        consider(MarkerHit::Fence(FenceKind::Bash),     find_sync_bash(&self.pending));
-        consider(MarkerHit::Fence(FenceKind::Tool), self.pending.find(FenceKind::Tool.marker())
-            .filter(|&p| !self.pending[p..].starts_with("```tool-")));
-        consider(MarkerHit::Fence(FenceKind::Rubberduck), self.pending.find(FenceKind::Rubberduck.marker())
-            .filter(|&p| !self.pending[p..].starts_with("```rubberduck-")));
+        consider(
+            MarkerHit::Fence(FenceKind::BashSub),
+            self.pending.find(FenceKind::BashSub.marker()),
+        );
+        consider(
+            MarkerHit::Fence(FenceKind::BashLong),
+            self.pending.find(FenceKind::BashLong.marker()),
+        );
+        consider(
+            MarkerHit::Fence(FenceKind::Bash),
+            find_sync_bash(&self.pending),
+        );
+        consider(
+            MarkerHit::Fence(FenceKind::Tool),
+            self.pending
+                .find(FenceKind::Tool.marker())
+                .filter(|&p| !self.pending[p..].starts_with("```tool-")),
+        );
+        consider(
+            MarkerHit::Fence(FenceKind::Rubberduck),
+            self.pending
+                .find(FenceKind::Rubberduck.marker())
+                .filter(|&p| !self.pending[p..].starts_with("```rubberduck-")),
+        );
         best
     }
 
@@ -367,11 +416,13 @@ impl ReplyStreamState {
     /// register the resulting Action. Returns the parsed Action, if any.
     fn dispatch_fence(&mut self, kind: FenceKind, buf: String) {
         let body = buf.trim().to_string();
-        if body.is_empty() { return; }
+        if body.is_empty() {
+            return;
+        }
         match kind {
-            FenceKind::Bash     => self.actions.push(Action::Bash(body)),
+            FenceKind::Bash => self.actions.push(Action::Bash(body)),
             FenceKind::BashLong => self.actions.push(Action::BashLong(body)),
-            FenceKind::BashSub  => {
+            FenceKind::BashSub => {
                 let preview: String = body.lines().next().unwrap_or("").chars().take(40).collect();
                 self.flush_deferred();
                 let ph = format!("[⚡ {}]", preview);
@@ -429,7 +480,10 @@ impl ReplyStreamState {
                         self.dispatch_fence(kind, buf);
                         // mode left as Normal; loop continues
                     } else {
-                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(3));
+                        let safe = Self::char_safe_len(
+                            &self.pending,
+                            self.pending.len().saturating_sub(3),
+                        );
                         if safe > 0 {
                             buf.push_str(&self.pending[..safe]);
                             self.pending = self.pending[safe..].to_string();
@@ -448,7 +502,10 @@ impl ReplyStreamState {
                         self.pending = self.pending[pos + "</think>".len()..].to_string();
                         // mode resets to Normal
                     } else {
-                        let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(8));
+                        let safe = Self::char_safe_len(
+                            &self.pending,
+                            self.pending.len().saturating_sub(8),
+                        );
                         if safe > 0 {
                             print!("{}", self.pending[..safe].dimmed());
                             std::io::stdout().flush().unwrap();
@@ -481,8 +538,14 @@ impl ReplyStreamState {
                             // `bash-long` or `bash-sub`.
                             let after_start = pos + "```bash".len();
                             let remaining_owned = self.pending[after_start..].to_string();
-                            if remaining_owned.is_empty() || (remaining_owned.starts_with('-') && remaining_owned.len() < "-sub".len()) {
-                                let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(MAX_FENCE_MARKER_LEN));
+                            if remaining_owned.is_empty()
+                                || (remaining_owned.starts_with('-')
+                                    && remaining_owned.len() < "-sub".len())
+                            {
+                                let safe = Self::char_safe_len(
+                                    &self.pending,
+                                    self.pending.len().saturating_sub(MAX_FENCE_MARKER_LEN),
+                                );
                                 if safe > 0 {
                                     let to_print = self.pending[..safe].to_string();
                                     self.print_normal(&to_print);
@@ -492,19 +555,31 @@ impl ReplyStreamState {
                             }
                             let before = self.pending[..pos].to_string();
                             self.flush_before_fence(&before);
-                            self.pending = remaining_owned.strip_prefix('\n').unwrap_or(&remaining_owned).to_string();
-                            self.mode = StreamMode::InFence { kind: FenceKind::Bash, buf: String::new() };
+                            self.pending = remaining_owned
+                                .strip_prefix('\n')
+                                .unwrap_or(&remaining_owned)
+                                .to_string();
+                            self.mode = StreamMode::InFence {
+                                kind: FenceKind::Bash,
+                                buf: String::new(),
+                            };
                         }
                         Some((MarkerHit::Fence(kind), pos)) => {
                             let before = self.pending[..pos].to_string();
                             self.flush_before_fence(&before);
                             let rest = &self.pending[pos + kind.marker().len()..];
                             self.pending = rest.strip_prefix('\n').unwrap_or(rest).to_string();
-                            self.mode = StreamMode::InFence { kind, buf: String::new() };
+                            self.mode = StreamMode::InFence {
+                                kind,
+                                buf: String::new(),
+                            };
                         }
                         None => {
                             // No marker — print everything except the lookahead window.
-                            let safe = Self::char_safe_len(&self.pending, self.pending.len().saturating_sub(MAX_FENCE_MARKER_LEN));
+                            let safe = Self::char_safe_len(
+                                &self.pending,
+                                self.pending.len().saturating_sub(MAX_FENCE_MARKER_LEN),
+                            );
                             if safe > 0 {
                                 let to_print = self.pending[..safe].to_string();
                                 self.print_normal(&to_print);
@@ -652,7 +727,12 @@ fn serialize_for_compaction(messages: &[Message]) -> String {
 fn print_message_replay(msg: &Message) {
     match msg.role {
         Role::User => {
-            if msg.source.as_deref().map(|s| s.starts_with("conductor/")).unwrap_or(false) {
+            if msg
+                .source
+                .as_deref()
+                .map(|s| s.starts_with("conductor/"))
+                .unwrap_or(false)
+            {
                 return;
             }
             print!("{} ", "❯".bright_blue().bold());
@@ -704,7 +784,7 @@ impl Repl {
         let session_store = SessionStore::new(&config_dir)?;
         let shell = Shell::new().await?;
         let rl = DefaultEditor::new()?;
-        
+
         Ok(Self {
             router,
             history: Vec::new(),
@@ -724,7 +804,12 @@ impl Repl {
     }
 
     /// Build a capability-aware system prompt.
-    fn build_system_prompt(supports_tool_calling: bool, todos: &[Todo], compacted_summary: Option<&str>, cwd: &str) -> Message {
+    fn build_system_prompt(
+        supports_tool_calling: bool,
+        todos: &[Todo],
+        compacted_summary: Option<&str>,
+        cwd: &str,
+    ) -> Message {
         let summary_section = match compacted_summary {
             Some(s) if !s.is_empty() => format!("\n\n## Earlier Conversation Summary\n{}", s),
             _ => String::new(),
@@ -733,15 +818,15 @@ impl Repl {
         let todo_section = if todos.is_empty() {
             String::new()
         } else {
-            let active: Vec<_> = todos.iter().enumerate()
+            let active: Vec<_> = todos
+                .iter()
+                .enumerate()
                 .filter(|(_, t)| t.status != TodoStatus::Done)
                 .collect();
             if active.is_empty() {
                 String::new()
             } else {
-                let lines: Vec<String> = active.iter()
-                    .map(|(i, t)| t.summary(i + 1))
-                    .collect();
+                let lines: Vec<String> = active.iter().map(|(i, t)| t.summary(i + 1)).collect();
                 format!("\n\n## Active Tasks\n{}", lines.join("\n"))
             }
         };
@@ -845,8 +930,16 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
 
     /// Show prompt and read one line via rustyline. No auto-accept check.
     fn readline_command_decision(cmd: &str, rl: &mut DefaultEditor) -> Result<CommandDecision> {
-        println!("{} {} {}", "⚡".yellow(), "Run:".bright_white(), cmd.bright_yellow());
-        let prompt = format!("  {} ", "[y] accept · [Y] session accept · [text] correct:".dimmed());
+        println!(
+            "{} {} {}",
+            "⚡".yellow(),
+            "Run:".bright_white(),
+            cmd.bright_yellow()
+        );
+        let prompt = format!(
+            "  {} ",
+            "[y] accept · [Y] session accept · [text] correct:".dimmed()
+        );
         match rl.readline(&prompt) {
             Ok(ans) => {
                 let ans = ans.trim().to_string();
@@ -894,7 +987,8 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         } else {
             format!(", {} todo(s)", self.todos.len())
         };
-        println!("{} Resumed session with {} messages{}",
+        println!(
+            "{} Resumed session with {} messages{}",
             "✓".bright_green(),
             self.history.len(),
             todo_note,
@@ -902,19 +996,32 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         println!();
 
         // Print the last 3 User+Assistant turns fully, styled like live output
-        let display_msgs: Vec<&Message> = self.history.iter()
+        let display_msgs: Vec<&Message> = self
+            .history
+            .iter()
             .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-            .filter(|m| m.source.as_deref().map(|s| !s.starts_with("conductor/")).unwrap_or(true))
+            .filter(|m| {
+                m.source
+                    .as_deref()
+                    .map(|s| !s.starts_with("conductor/"))
+                    .unwrap_or(true)
+            })
             .collect();
         let start = display_msgs.len().saturating_sub(6); // up to 3 turns (user+assistant each)
         let recent = &display_msgs[start..];
         if !recent.is_empty() {
-            println!("{}", "── Resuming conversation ────────────────────".dimmed());
+            println!(
+                "{}",
+                "── Resuming conversation ────────────────────".dimmed()
+            );
             println!();
             for msg in recent {
                 print_message_replay(msg);
             }
-            println!("{}", "─────────────────────────────────────────────".dimmed());
+            println!(
+                "{}",
+                "─────────────────────────────────────────────".dimmed()
+            );
             println!();
         }
         Ok(())
@@ -922,8 +1029,15 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
 
     /// Save current session state (history + todos).
     fn save_session(&mut self) {
-        match self.session_store.save(self.session_id.as_deref(), &self.history, &self.todos, self.compacted_summary.as_deref()) {
-            Ok(id) => { self.session_id = Some(id); }
+        match self.session_store.save(
+            self.session_id.as_deref(),
+            &self.history,
+            &self.todos,
+            self.compacted_summary.as_deref(),
+        ) {
+            Ok(id) => {
+                self.session_id = Some(id);
+            }
             Err(e) => eprintln!("{} Failed to save session: {}", "⚠".yellow(), e),
         }
     }
@@ -963,7 +1077,11 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                     Some(s) => s,
                     None => return format!("[todo_update error] unknown status '{}'", status_str),
                 };
-                match self.todos.iter_mut().find(|t| t.id.starts_with(id_arg) || t.id == id_arg) {
+                match self
+                    .todos
+                    .iter_mut()
+                    .find(|t| t.id.starts_with(id_arg) || t.id == id_arg)
+                {
                     Some(t) => {
                         t.status = new_status;
                         format!("[todo_update] '{}' → {}", t.title, t.status)
@@ -975,7 +1093,10 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                 if self.todos.is_empty() {
                     "[todo_list] No todos.".to_string()
                 } else {
-                    let lines: Vec<String> = self.todos.iter().enumerate()
+                    let lines: Vec<String> = self
+                        .todos
+                        .iter()
+                        .enumerate()
                         .map(|(i, t)| t.summary(i + 1))
                         .collect();
                     format!("[todo_list]\n{}", lines.join("\n"))
@@ -984,43 +1105,47 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
             other => format!("[todo error] Unknown function '{}'", other),
         }
     }
-    
+
     pub async fn run(&mut self) -> Result<()> {
         println!("{}", "llm-conductor v0.1.0".bright_cyan().bold());
         println!("{}", "Type your message or /help for commands".dimmed());
         println!();
-        
+
         // Initialize models
         self.router.refresh_models().await?;
-        
+
         let models = self.router.available_models();
         if models.is_empty() {
             eprintln!("{}", "No models available!".bright_red().bold());
             eprintln!("{}", "Make sure Ollama is running: ollama serve".yellow());
             return Ok(());
         }
-        
+
         println!("{} {} models available", "✓".bright_green(), models.len());
         for model in models {
-            println!("  • {} ({})", model.name.bright_white(), model.provider.to_string().dimmed());
+            println!(
+                "  • {} ({})",
+                model.name.bright_white(),
+                model.provider.to_string().dimmed()
+            );
         }
         println!();
-        
+
         // REPL loop — uses self.rl (shared editor) so all input goes through one tty reader
         let mut consecutive_eof = 0u8;
-        
+
         loop {
             let readline = self.rl.readline(&format!("{} ", "❯".bright_blue().bold()));
-            
+
             match readline {
                 Ok(line) => {
                     consecutive_eof = 0;
                     let line = line.trim();
-                    
+
                     if line.is_empty() {
                         continue;
                     }
-                    
+
                     // Handle commands
                     if line.starts_with('/') {
                         match self.handle_command(line).await {
@@ -1035,7 +1160,7 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                         }
                         continue;
                     }
-                    
+
                     // Handle user message
                     if let Err(e) = self.handle_message(line).await {
                         eprintln!("{} {}", "Error:".bright_red(), e);
@@ -1065,7 +1190,7 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -1081,8 +1206,12 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
         let filter = &self.model_filter;
         let mut best: Option<&crate::types::ModelInfo> = None;
         for m in self.router.available_models() {
-            if !filter.matches(m) { continue; }
-            if m.capability_tier == CapabilityTier::Frontier { continue; }
+            if !filter.matches(m) {
+                continue;
+            }
+            if m.capability_tier == CapabilityTier::Frontier {
+                continue;
+            }
             best = Some(match best {
                 None => m,
                 Some(prev) if m.capability_tier < prev.capability_tier => m,
@@ -1090,7 +1219,11 @@ Todos persist with the session across saves and loads.{summary_section}{todo_sec
             });
         }
         if let Some(m) = best {
-            tracing::debug!("compaction picked {} (tier={:?})", m.name, m.capability_tier);
+            tracing::debug!(
+                "compaction picked {} (tier={:?})",
+                m.name,
+                m.capability_tier
+            );
         }
         best
     }
@@ -1139,18 +1272,18 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         // don't burn frontier-quota on low-stakes work. Falls back to the
         // existing filter-based selection when no smaller model is available.
         let task = Task::new("Compact history", &prompt);
-        let model_opt = self
-            .pick_compaction_model(&task)
-            .cloned()
-            .or_else(|| {
-                self.router
-                    .select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
-                    .cloned()
-            });
+        let model_opt = self.pick_compaction_model(&task).cloned().or_else(|| {
+            self.router
+                .select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+                .cloned()
+        });
 
         let m = match model_opt {
             None => {
-                eprintln!("{} No model available for compaction; skipping.", "⚠".yellow());
+                eprintln!(
+                    "{} No model available for compaction; skipping.",
+                    "⚠".yellow()
+                );
                 return Ok(false);
             }
             Some(m) => m,
@@ -1162,7 +1295,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         let provider = self.router.find_provider_for_model(&m);
         let stream_result = match provider {
             None => {
-                eprintln!("{} Provider not found for compaction; skipping.", "⚠".yellow());
+                eprintln!(
+                    "{} Provider not found for compaction; skipping.",
+                    "⚠".yellow()
+                );
                 return Ok(false);
             }
             Some(p) => p.chat(&m, &[system_msg, summary_msg]).await,
@@ -1170,19 +1306,27 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
 
         let summary_buf = match stream_result {
             Err(e) => {
-                eprintln!("{} Compaction summary failed: {}; keeping full history.", "⚠".yellow(), e);
+                eprintln!(
+                    "{} Compaction summary failed: {}; keeping full history.",
+                    "⚠".yellow(),
+                    e
+                );
                 return Ok(false);
             }
             Ok(text) => text,
         };
 
         if summary_buf.is_empty() {
-            eprintln!("{} Compaction produced empty summary; keeping full history.", "⚠".yellow());
+            eprintln!(
+                "{} Compaction produced empty summary; keeping full history.",
+                "⚠".yellow()
+            );
             return Ok(false);
         }
 
         let compact_tokens = (summary_buf.len() / 4) as u64;
-        self.usage_tracker.record_usage(m.provider.clone(), 1, compact_tokens, 0.0);
+        self.usage_tracker
+            .record_usage(m.provider.clone(), 1, compact_tokens, 0.0);
 
         // Replace previous summary with the new re-summarized version (bounded growth).
         self.compacted_summary = Some(summary_buf);
@@ -1197,9 +1341,13 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         let mut dropped_orphans = 0usize;
         while let Some(first) = self.history.first() {
             match first.role {
-                crate::types::Role::Tool => { self.history.remove(0); dropped_orphans += 1; }
+                crate::types::Role::Tool => {
+                    self.history.remove(0);
+                    dropped_orphans += 1;
+                }
                 crate::types::Role::Assistant if first.tool_calls.is_some() => {
-                    self.history.remove(0); dropped_orphans += 1;
+                    self.history.remove(0);
+                    dropped_orphans += 1;
                 }
                 _ => break,
             }
@@ -1211,14 +1359,18 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             );
         }
 
-        println!("{} Compacted {} messages into summary ({} kept).",
-            "✓".bright_green(), boundary + dropped_orphans, self.history.len());
+        println!(
+            "{} Compacted {} messages into summary ({} kept).",
+            "✓".bright_green(),
+            boundary + dropped_orphans,
+            self.history.len()
+        );
         Ok(true)
     }
 
     async fn handle_command(&mut self, command: &str) -> Result<bool> {
         let parts: Vec<&str> = command.split_whitespace().collect();
-        
+
         match parts.first().copied() {
             Some("/help") => {
                 self.print_help();
@@ -1235,26 +1387,33 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     // Parse filter arguments
                     let args = &parts[1..];
                     self.model_filter = ModelFilter::from_args(args);
-                    
+
                     // Show what models match the filter
-                    let filtered: Vec<_> = self.router.available_models()
+                    let filtered: Vec<_> = self
+                        .router
+                        .available_models()
                         .iter()
                         .filter(|m| self.model_filter.matches(m))
                         .collect();
-                    
+
                     if filtered.is_empty() {
-                        eprintln!("{} No models match filter: {}", 
-                            "Error:".bright_red(), 
-                            self.model_filter.description());
+                        eprintln!(
+                            "{} No models match filter: {}",
+                            "Error:".bright_red(),
+                            self.model_filter.description()
+                        );
                         println!("\nAvailable models:");
                         self.list_models();
                     } else {
-                        println!("{} Applied filter: {}", 
-                            "✓".bright_green(), 
-                            self.model_filter.description());
+                        println!(
+                            "{} Applied filter: {}",
+                            "✓".bright_green(),
+                            self.model_filter.description()
+                        );
                         println!("\nMatching models:");
                         for model in filtered {
-                            println!("  • {} ({}, {:?}, {}k ctx)", 
+                            println!(
+                                "  • {} ({}, {:?}, {}k ctx)",
                                 model.name.bright_white(),
                                 model.provider.to_string().dimmed(),
                                 model.capability_tier,
@@ -1277,13 +1436,22 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         if self.session_auto_accepts.is_empty() {
                             println!("{}", "No session auto-accepts.".dimmed());
                         } else {
-                            println!("{}", "Auto-accepted commands (this session):".bright_cyan().bold());
-                            let mut sorted: Vec<&String> = self.session_auto_accepts.iter().collect();
+                            println!(
+                                "{}",
+                                "Auto-accepted commands (this session):"
+                                    .bright_cyan()
+                                    .bold()
+                            );
+                            let mut sorted: Vec<&String> =
+                                self.session_auto_accepts.iter().collect();
                             sorted.sort();
                             for entry in sorted {
                                 println!("  {}", entry);
                             }
-                            println!("{}", "  (suffix * matches as a prefix; e.g. 'cargo *')".dimmed());
+                            println!(
+                                "{}",
+                                "  (suffix * matches as a prefix; e.g. 'cargo *')".dimmed()
+                            );
                         }
                     }
                     Some("add") => {
@@ -1309,7 +1477,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         println!("{} Cleared {} entries.", "✓".bright_green(), n);
                     }
                     _ => {
-                        eprintln!("{}", "Usage: /allow [list|add <cmd>|rm <cmd>|clear]".yellow());
+                        eprintln!(
+                            "{}",
+                            "Usage: /allow [list|add <cmd>|rm <cmd>|clear]".yellow()
+                        );
                     }
                 }
                 Ok(true)
@@ -1343,14 +1514,19 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         self.load_session(&meta.id).await?;
                     }
                     None => {
-                        eprintln!("{}", "Usage: /load N  (use /sessions to see numbers)".yellow());
+                        eprintln!(
+                            "{}",
+                            "Usage: /load N  (use /sessions to see numbers)".yellow()
+                        );
                     }
                 }
                 Ok(true)
             }
             Some("/compact") => {
                 match self.compact_history(true).await {
-                    Ok(_) => { self.save_session(); }
+                    Ok(_) => {
+                        self.save_session();
+                    }
                     Err(e) => eprintln!("{} Compaction error: {}", "⚠".yellow(), e),
                 }
                 Ok(true)
@@ -1360,7 +1536,9 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     Some(n) if n >= 1 && n <= self.action_turns.len() => {
                         let turn = &self.action_turns[n - 1];
                         let exit_suffix = match turn.exit_code {
-                            Some(c) if c != 0 => format!(" {}", format!("[exit {}]", c).bright_red()),
+                            Some(c) if c != 0 => {
+                                format!(" {}", format!("[exit {}]", c).bright_red())
+                            }
                             _ => String::new(),
                         };
                         let kind_tag = match turn.kind {
@@ -1370,7 +1548,13 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                             TurnKind::Todo => "todo",
                             TurnKind::Think => "think",
                         };
-                        println!("{} {}{} {}", "●".bright_cyan(), turn.label.bright_white(), exit_suffix, format!("({} #{})", kind_tag, n).dimmed());
+                        println!(
+                            "{} {}{} {}",
+                            "●".bright_cyan(),
+                            turn.label.bright_white(),
+                            exit_suffix,
+                            format!("({} #{})", kind_tag, n).dimmed()
+                        );
                         for line in turn.output.lines() {
                             println!("  {} {}", "│".dimmed(), line);
                         }
@@ -1380,7 +1564,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         if self.action_turns.is_empty() {
                             eprintln!("{}", "No action turns in this session.".yellow());
                         } else {
-                            eprintln!("{}", format!("Usage: /show N  (1–{})", self.action_turns.len()).yellow());
+                            eprintln!(
+                                "{}",
+                                format!("Usage: /show N  (1–{})", self.action_turns.len()).yellow()
+                            );
                         }
                     }
                 }
@@ -1417,30 +1604,33 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     Some("done") | Some("start") | Some("block") | Some("pending") => {
                         let subcmd = parts[1];
                         let status = match subcmd {
-                            "done"    => TodoStatus::Done,
-                            "start"   => TodoStatus::InProgress,
-                            "block"   => TodoStatus::Blocked,
-                            _         => TodoStatus::Pending,
+                            "done" => TodoStatus::Done,
+                            "start" => TodoStatus::InProgress,
+                            "block" => TodoStatus::Blocked,
+                            _ => TodoStatus::Pending,
                         };
                         match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
                             Some(n) if n >= 1 && n <= self.todos.len() => {
                                 self.todos[n - 1].status = status;
-                                println!("{} #{} → {}", "✓".bright_green(), n, self.todos[n - 1].status);
+                                println!(
+                                    "{} #{} → {}",
+                                    "✓".bright_green(),
+                                    n,
+                                    self.todos[n - 1].status
+                                );
                                 self.save_session();
                             }
                             _ => eprintln!("{}", format!("Usage: /todo {} <N>", subcmd).yellow()),
                         }
                     }
-                    Some("rm") => {
-                        match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
-                            Some(n) if n >= 1 && n <= self.todos.len() => {
-                                let removed = self.todos.remove(n - 1);
-                                println!("{} Removed: {}", "✓".bright_green(), removed.title);
-                                self.save_session();
-                            }
-                            _ => eprintln!("{}", "Usage: /todo rm <N>".yellow()),
+                    Some("rm") => match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
+                        Some(n) if n >= 1 && n <= self.todos.len() => {
+                            let removed = self.todos.remove(n - 1);
+                            println!("{} Removed: {}", "✓".bright_green(), removed.title);
+                            self.save_session();
                         }
-                    }
+                        _ => eprintln!("{}", "Usage: /todo rm <N>".yellow()),
+                    },
                     Some("reset") => {
                         self.todos.clear();
                         println!("{}", "✓ Todos cleared".green());
@@ -1466,12 +1656,21 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 }
                 // Find a model to use for the critic call
                 let task = crate::types::Task::new("think", &query);
-                let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+                let model = self
+                    .router
+                    .select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
                     .cloned();
                 match model {
                     None => eprintln!("{}", "No model available for think call".yellow()),
                     Some(m) => {
-                        let result = Self::do_think_call(&mut self.is_thinking, &self.router, &m, &query, &mut self.usage_tracker).await;
+                        let result = Self::do_think_call(
+                            &mut self.is_thinking,
+                            &self.router,
+                            &m,
+                            &query,
+                            &mut self.usage_tracker,
+                        )
+                        .await;
                         println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
                         for line in result.lines() {
                             println!("  {}", render_markdown_line(line));
@@ -1486,12 +1685,15 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 Ok(false)
             }
             _ => {
-                eprintln!("{}", "Unknown command. Type /help for available commands.".yellow());
+                eprintln!(
+                    "{}",
+                    "Unknown command. Type /help for available commands.".yellow()
+                );
                 Ok(true)
             }
         }
     }
-    
+
     /// Run a planned batch of actions. Handles confirmation, parallel
     /// scheduling for stateless `bash-sub`, error capture, and indexed
     /// turn recording. Returns per-action feedback in source order.
@@ -1510,27 +1712,38 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             while batch_end < planned.len() {
                 let p = &planned[batch_end];
                 let (cmd, parallel) = match &p.kind {
-                    PlannedKind::Bash { cmd, parallel: true, .. } => (cmd.as_str(), true),
+                    PlannedKind::Bash {
+                        cmd,
+                        parallel: true,
+                        ..
+                    } => (cmd.as_str(), true),
                     _ => ("", false),
                 };
-                if !parallel { break; }
+                if !parallel {
+                    break;
+                }
                 let kind = executor::classify(cmd);
                 let auto = kind == executor::CommandKind::ReadOnly
                     || self.session_auto_accepts.iter().any(|p| cmd == p);
-                if !auto { break; }
+                if !auto {
+                    break;
+                }
                 batch_end += 1;
             }
 
             if batch_end - i >= 2 {
                 // Run the batch in parallel.
                 let cwd = self.shell.cwd.clone();
-                let batch: Vec<(Option<String>, String)> = planned[i..batch_end].iter().map(|p| {
-                    let cmd = match &p.kind {
-                        PlannedKind::Bash { cmd, .. } => cmd.clone(),
-                        _ => unreachable!(),
-                    };
-                    (p.feedback_id.clone(), cmd)
-                }).collect();
+                let batch: Vec<(Option<String>, String)> = planned[i..batch_end]
+                    .iter()
+                    .map(|p| {
+                        let cmd = match &p.kind {
+                            PlannedKind::Bash { cmd, .. } => cmd.clone(),
+                            _ => unreachable!(),
+                        };
+                        (p.feedback_id.clone(), cmd)
+                    })
+                    .collect();
 
                 let futures = batch.iter().map(|(_, cmd)| {
                     let c = cmd.clone();
@@ -1541,11 +1754,29 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
 
                 for ((id, cmd), (output, exit_code)) in batch.into_iter().zip(results) {
                     let turn_num = self.action_turns.len() + 1;
-                    print!("\n{}", executor::format_shell_display(turn_num, &cmd, &output, exit_code));
-                    self.action_turns.push(ActionTurn::shell(&cmd, output.clone(), exit_code, TurnKind::ShellSub));
-                    let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-                    let feedback_text = format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output);
-                    outcome.results.push(ActionResult { feedback_id: id, feedback_text });
+                    print!(
+                        "\n{}",
+                        executor::format_shell_display(turn_num, &cmd, &output, exit_code)
+                    );
+                    self.action_turns.push(ActionTurn::shell(
+                        &cmd,
+                        output.clone(),
+                        exit_code,
+                        TurnKind::ShellSub,
+                    ));
+                    let exit_note = if exit_code != 0 {
+                        format!(" [exit {}]", exit_code)
+                    } else {
+                        String::new()
+                    };
+                    let feedback_text = format!(
+                        "[Shell output]\n$ {}{}\n{}\n[End of shell output]",
+                        cmd, exit_note, output
+                    );
+                    outcome.results.push(ActionResult {
+                        feedback_id: id,
+                        feedback_text,
+                    });
                     outcome.any_executed = true;
                 }
                 i = batch_end;
@@ -1557,14 +1788,21 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             i += 1;
 
             match &p.kind {
-                PlannedKind::Bash { cmd, timeout, parallel } => {
+                PlannedKind::Bash {
+                    cmd,
+                    timeout,
+                    parallel,
+                } => {
                     let cmd = cmd.clone();
                     let timeout = *timeout;
                     let parallel = *parallel;
 
                     let kind = executor::classify(&cmd);
                     let auto_allowed = self.session_auto_accepts.iter().any(|p| cmd == *p)
-                        || self.session_auto_accepts.iter().any(|p| p.ends_with('*') && cmd.starts_with(p.trim_end_matches('*')));
+                        || self
+                            .session_auto_accepts
+                            .iter()
+                            .any(|p| p.ends_with('*') && cmd.starts_with(p.trim_end_matches('*')));
                     let decision = if kind == executor::CommandKind::ReadOnly || auto_allowed {
                         CommandDecision::Accept
                     } else {
@@ -1578,16 +1816,33 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                             // tool_call_ids aren't left dangling.
                             outcome.results.push(ActionResult {
                                 feedback_id: p.feedback_id.clone(),
-                                feedback_text: format!("[Cancelled by user before execution: {}]", cmd),
+                                feedback_text: format!(
+                                    "[Cancelled by user before execution: {}]",
+                                    cmd
+                                ),
                             });
                             break;
                         }
                         CommandDecision::AcceptForSession => {
                             self.session_auto_accepts.insert(cmd.clone());
-                            self.run_one_shell(&cmd, timeout, parallel, p.feedback_id.clone(), &mut outcome).await;
+                            self.run_one_shell(
+                                &cmd,
+                                timeout,
+                                parallel,
+                                p.feedback_id.clone(),
+                                &mut outcome,
+                            )
+                            .await;
                         }
                         CommandDecision::Accept => {
-                            self.run_one_shell(&cmd, timeout, parallel, p.feedback_id.clone(), &mut outcome).await;
+                            self.run_one_shell(
+                                &cmd,
+                                timeout,
+                                parallel,
+                                p.feedback_id.clone(),
+                                &mut outcome,
+                            )
+                            .await;
                         }
                         CommandDecision::Deny(reason) => {
                             let entry = if reason.is_empty() {
@@ -1598,7 +1853,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                             println!("{}", "  (denied)".dimmed());
                             outcome.results.push(ActionResult {
                                 feedback_id: p.feedback_id.clone(),
-                                feedback_text: format!("[Shell output]\n{}\n[End of shell output]", entry),
+                                feedback_text: format!(
+                                    "[Shell output]\n{}\n[End of shell output]",
+                                    entry
+                                ),
                             });
                         }
                     }
@@ -1606,20 +1864,34 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 PlannedKind::Todo { dispatch_json } => {
                     let result_text = self.apply_todo_action(dispatch_json);
                     println!("{}", result_text.dimmed());
-                    let summary: String = result_text.lines().next().unwrap_or("").chars().take(80).collect();
-                    self.action_turns.push(ActionTurn::todo(summary, result_text.clone()));
+                    let summary: String = result_text
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect();
+                    self.action_turns
+                        .push(ActionTurn::todo(summary, result_text.clone()));
                     outcome.results.push(ActionResult {
                         feedback_id: p.feedback_id.clone(),
-                        feedback_text: format!("[Tool output]\n{}\n[End of tool output]", result_text),
+                        feedback_text: format!(
+                            "[Tool output]\n{}\n[End of tool output]",
+                            result_text
+                        ),
                     });
                     outcome.any_executed = true;
                 }
                 PlannedKind::Think { query } => {
                     let q = query.clone();
                     let result = Self::do_think_call(
-                        &mut self.is_thinking, &self.router, model, &q,
+                        &mut self.is_thinking,
+                        &self.router,
+                        model,
+                        &q,
                         &mut self.usage_tracker,
-                    ).await;
+                    )
+                    .await;
                     if !result.starts_with("[Rubberduck") {
                         println!("\n{}", "🦆 Rubberduck result:".cyan().bold());
                         for line in result.lines() {
@@ -1627,10 +1899,14 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         }
                         println!();
                     }
-                    self.action_turns.push(ActionTurn::think(q.clone(), result.clone()));
+                    self.action_turns
+                        .push(ActionTurn::think(q.clone(), result.clone()));
                     outcome.results.push(ActionResult {
                         feedback_id: p.feedback_id.clone(),
-                        feedback_text: format!("[Rubberduck result]\n{}\n[End of rubberduck result]", result),
+                        feedback_text: format!(
+                            "[Rubberduck result]\n{}\n[End of rubberduck result]",
+                            result
+                        ),
                     });
                     outcome.any_executed = true;
                 }
@@ -1664,24 +1940,43 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
         } else {
             match self.shell.run(cmd, timeout).await {
                 Ok((o, ec)) => {
-                    let k = if timeout == Some(executor::LONG_TIMEOUT) { TurnKind::ShellLong } else { TurnKind::Shell };
+                    let k = if timeout == Some(executor::LONG_TIMEOUT) {
+                        TurnKind::ShellLong
+                    } else {
+                        TurnKind::Shell
+                    };
                     (o, ec, k)
                 }
                 Err(e) => (format!("[shell crashed: {}]", e), -1, TurnKind::Shell),
             }
         };
         let turn_num = self.action_turns.len() + 1;
-        print!("\n{}", executor::format_shell_display(turn_num, cmd, &output, exit_code));
-        self.action_turns.push(ActionTurn::shell(cmd, output.clone(), exit_code, kind));
-        let exit_note = if exit_code != 0 { format!(" [exit {}]", exit_code) } else { String::new() };
-        let feedback_text = format!("[Shell output]\n$ {}{}\n{}\n[End of shell output]", cmd, exit_note, output);
-        outcome.results.push(ActionResult { feedback_id, feedback_text });
+        print!(
+            "\n{}",
+            executor::format_shell_display(turn_num, cmd, &output, exit_code)
+        );
+        self.action_turns
+            .push(ActionTurn::shell(cmd, output.clone(), exit_code, kind));
+        let exit_note = if exit_code != 0 {
+            format!(" [exit {}]", exit_code)
+        } else {
+            String::new()
+        };
+        let feedback_text = format!(
+            "[Shell output]\n$ {}{}\n{}\n[End of shell output]",
+            cmd, exit_note, output
+        );
+        outcome.results.push(ActionResult {
+            feedback_id,
+            feedback_text,
+        });
         outcome.any_executed = true;
     }
 
     async fn handle_message(&mut self, content: &str) -> Result<()> {
         // Add user message to history
-        self.history.push(Message::user(content).with_source("user"));
+        self.history
+            .push(Message::user(content).with_source("user"));
 
         // Auto-compact if history has grown large
         if let Err(e) = self.compact_history(false).await {
@@ -1693,7 +1988,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
 
         loop {
             // Create task from last user message
-            let last_user = self.history.iter().rev()
+            let last_user = self
+                .history
+                .iter()
+                .rev()
                 .find(|m| matches!(m.role, crate::types::Role::User))
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
@@ -1701,7 +1999,9 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             let task = Task::new("User query", &last_user);
 
             // Select model (clone to release borrow)
-            let model = self.router.select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
+            let model = self
+                .router
+                .select_model_filtered(&task, &self.model_filter, &mut self.usage_tracker)
                 .ok_or_else(|| anyhow::anyhow!("No suitable model available with current filters"))?
                 .clone();
 
@@ -1713,7 +2013,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             // Show "Using X from Y" with current usage (only on first round)
             if tool_rounds == 0 {
                 let usage_suffix = self.format_usage_suffix(&provider_id);
-                println!("{} {} {} {}{}",
+                println!(
+                    "{} {} {} {}{}",
                     "Using".dimmed(),
                     model_name.bright_white(),
                     "from".dimmed(),
@@ -1726,14 +2027,20 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             // Build messages: dynamic system prompt + history.
             // Pre-allocate to avoid the double-realloc that
             // `vec![system].extend(history.clone())` would do.
-            let system_msg = Self::build_system_prompt(supports_tool_calling, &self.todos, self.compacted_summary.as_deref(), &self.shell.cwd);
+            let system_msg = Self::build_system_prompt(
+                supports_tool_calling,
+                &self.todos,
+                self.compacted_summary.as_deref(),
+                &self.shell.cwd,
+            );
             let mut messages: Vec<Message> = Vec::with_capacity(self.history.len() + 1);
             messages.push(system_msg);
             messages.extend(self.history.iter().cloned());
 
             // Find provider
-            let provider = self.router.find_provider_for_model(&model)
-                .ok_or_else(|| anyhow::anyhow!("Could not find provider for model {}", model_name))?;
+            let provider = self.router.find_provider_for_model(&model).ok_or_else(|| {
+                anyhow::anyhow!("Could not find provider for model {}", model_name)
+            })?;
 
             // ── Plan & response phase: produce (planned_actions, mode) ────────────
             let plan_result: PlanPhase = if supports_tool_calling {
@@ -1756,19 +2063,27 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 }
 
                 let tokens = result.tokens.unwrap_or_else(|| {
-                    result.text.as_deref().map(|t| (t.len() / 4) as u64).unwrap_or(1)
+                    result
+                        .text
+                        .as_deref()
+                        .map(|t| (t.len() / 4) as u64)
+                        .unwrap_or(1)
                 });
-                self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
+                self.usage_tracker
+                    .record_usage(provider_id.clone(), 1, tokens, 0.0);
 
                 let model_source = format!("{}/{}", model.provider, model.name);
 
                 if let Some(tool_calls) = result.tool_calls {
                     // Record the assistant tool-call message immediately so
                     // the per-call tool_results we push later stay paired.
-                    self.history.push(Message::assistant_tool_calls(
-                        result.text.clone().unwrap_or_default(),
-                        tool_calls.clone(),
-                    ).with_source(model_source));
+                    self.history.push(
+                        Message::assistant_tool_calls(
+                            result.text.clone().unwrap_or_default(),
+                            tool_calls.clone(),
+                        )
+                        .with_source(model_source),
+                    );
 
                     let planned = tool_calls.into_iter().map(|tc| {
                         let kind = match tc.name.as_str() {
@@ -1798,10 +2113,14 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         PlannedAction { feedback_id: Some(tc.id.clone()), kind }
                     }).collect::<Vec<_>>();
 
-                    PlanPhase::Actions { planned, mode: FeedbackMode::ToolResults }
+                    PlanPhase::Actions {
+                        planned,
+                        mode: FeedbackMode::ToolResults,
+                    }
                 } else {
                     let text = result.text.unwrap_or_default();
-                    self.history.push(Message::assistant(&text).with_source(model_source));
+                    self.history
+                        .push(Message::assistant(&text).with_source(model_source));
                     PlanPhase::Done
                 }
             } else {
@@ -1815,7 +2134,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 };
 
                 let stop_watcher = Arc::new(AtomicBool::new(false));
-                let (cancel_rx, watcher_done_rx) = crate::cli::tty::spawn_esc_watcher(stop_watcher.clone());
+                let (cancel_rx, watcher_done_rx) =
+                    crate::cli::tty::spawn_esc_watcher(stop_watcher.clone());
 
                 enum StreamOutcome {
                     Completed(String, Option<u64>),
@@ -1832,12 +2152,15 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         stop_watcher.store(true, Ordering::Relaxed);
                         StreamOutcome::Cancelled
                     }
+                    _ = tokio::signal::ctrl_c() => {
+                        stop_watcher.store(true, Ordering::Relaxed);
+                        StreamOutcome::Cancelled
+                    }
                 };
 
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    watcher_done_rx,
-                ).await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), watcher_done_rx)
+                        .await;
 
                 {
                     let mut s = state.lock().unwrap();
@@ -1849,7 +2172,10 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                     StreamOutcome::Cancelled => {
                         println!("{}", "(interrupted)".dimmed().italic());
                         println!();
-                        if matches!(self.history.last().map(|m| &m.role), Some(crate::types::Role::User)) {
+                        if matches!(
+                            self.history.last().map(|m| &m.role),
+                            Some(crate::types::Role::User)
+                        ) {
                             self.history.pop();
                         }
                         break;
@@ -1863,25 +2189,50 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 };
 
                 let tokens = token_count.unwrap_or((clean_response.len() / 4) as u64);
-                self.usage_tracker.record_usage(provider_id.clone(), 1, tokens, 0.0);
+                self.usage_tracker
+                    .record_usage(provider_id.clone(), 1, tokens, 0.0);
 
                 let model_source = format!("{}/{}", model.provider, model.name);
-                self.history.push(Message::assistant(raw_response.clone()).with_source(model_source));
+                self.history
+                    .push(Message::assistant(raw_response.clone()).with_source(model_source));
 
                 if actions.is_empty() {
                     PlanPhase::Done
                 } else {
-                    let planned = actions.into_iter().map(|a| {
-                        let kind = match a {
-                            Action::Bash(c)     => PlannedKind::Bash { cmd: c, timeout: None, parallel: false },
-                            Action::BashLong(c) => PlannedKind::Bash { cmd: c, timeout: Some(executor::LONG_TIMEOUT), parallel: false },
-                            Action::BashSub(c)  => PlannedKind::Bash { cmd: c, timeout: None, parallel: true },
-                            Action::Tool(json)  => PlannedKind::Todo { dispatch_json: json },
-                            Action::Think(q)    => PlannedKind::Think { query: q },
-                        };
-                        PlannedAction { feedback_id: None, kind }
-                    }).collect::<Vec<_>>();
-                    PlanPhase::Actions { planned, mode: FeedbackMode::ConductorUser }
+                    let planned = actions
+                        .into_iter()
+                        .map(|a| {
+                            let kind = match a {
+                                Action::Bash(c) => PlannedKind::Bash {
+                                    cmd: c,
+                                    timeout: None,
+                                    parallel: false,
+                                },
+                                Action::BashLong(c) => PlannedKind::Bash {
+                                    cmd: c,
+                                    timeout: Some(executor::LONG_TIMEOUT),
+                                    parallel: false,
+                                },
+                                Action::BashSub(c) => PlannedKind::Bash {
+                                    cmd: c,
+                                    timeout: None,
+                                    parallel: true,
+                                },
+                                Action::Tool(json) => PlannedKind::Todo {
+                                    dispatch_json: json,
+                                },
+                                Action::Think(q) => PlannedKind::Think { query: q },
+                            };
+                            PlannedAction {
+                                feedback_id: None,
+                                kind,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    PlanPhase::Actions {
+                        planned,
+                        mode: FeedbackMode::ConductorUser,
+                    }
                 }
             };
 
@@ -1892,7 +2243,11 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
             };
 
             if tool_rounds >= MAX_TOOL_ROUNDS {
-                eprintln!("{} Tool round limit reached after {} rounds", "⚠".yellow(), tool_rounds);
+                eprintln!(
+                    "{} Tool round limit reached after {} rounds",
+                    "⚠".yellow(),
+                    tool_rounds
+                );
                 // Inject a synthetic conductor message so the model gets explicit
                 // feedback rather than an opaque silent termination next turn.
                 let note = format!(
@@ -1910,7 +2265,8 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                         }
                     }
                     FeedbackMode::ConductorUser => {
-                        self.history.push(Message::user(note).with_source("conductor/round-limit"));
+                        self.history
+                            .push(Message::user(note).with_source("conductor/round-limit"));
                     }
                 }
                 break;
@@ -1926,16 +2282,23 @@ decisions, findings, and context needed to continue. Omit pleasantries and fille
                 FeedbackMode::ToolResults => {
                     for r in outcome.results {
                         if let Some(id) = r.feedback_id {
-                            self.history.push(Message::tool_result(&id, r.feedback_text));
+                            self.history
+                                .push(Message::tool_result(&id, r.feedback_text));
                         }
                     }
                 }
                 FeedbackMode::ConductorUser => {
-                    let combined: Vec<String> = outcome.results.into_iter().map(|r| r.feedback_text).collect();
+                    let combined: Vec<String> = outcome
+                        .results
+                        .into_iter()
+                        .map(|r| r.feedback_text)
+                        .collect();
                     if combined.is_empty() {
                         break;
                     }
-                    self.history.push(Message::user(combined.join("\n\n")).with_source("conductor/feedback"));
+                    self.history.push(
+                        Message::user(combined.join("\n\n")).with_source("conductor/feedback"),
+                    );
                 }
             }
 
@@ -2005,54 +2368,78 @@ Be concise — short paragraphs or bullet points. No preamble. No \"I\" statemen
         if let Some(usage) = self.usage_tracker.get_usage(provider_id) {
             match &usage.limit_type {
                 LimitType::Unlimited => String::new(),
-                LimitType::RequestBased { max_requests, current_requests, .. } => {
+                LimitType::RequestBased {
+                    max_requests,
+                    current_requests,
+                    ..
+                } => {
                     let remaining = max_requests.saturating_sub(*current_requests);
-                    format!(" {} {} requests remaining", "·".dimmed(), remaining.to_string().bright_yellow())
+                    format!(
+                        " {} {} requests remaining",
+                        "·".dimmed(),
+                        remaining.to_string().bright_yellow()
+                    )
                 }
-                LimitType::TokenBased { max_tokens, current_tokens, .. } => {
-                    let remaining_pct = ((*max_tokens).saturating_sub(*current_tokens) as f64 / *max_tokens as f64) * 100.0;
-                    format!(" {} {}% tokens remaining", "·".dimmed(), format!("{:.1}", remaining_pct).bright_yellow())
+                LimitType::TokenBased {
+                    max_tokens,
+                    current_tokens,
+                    ..
+                } => {
+                    let remaining_pct = ((*max_tokens).saturating_sub(*current_tokens) as f64
+                        / *max_tokens as f64)
+                        * 100.0;
+                    format!(
+                        " {} {}% tokens remaining",
+                        "·".dimmed(),
+                        format!("{:.1}", remaining_pct).bright_yellow()
+                    )
                 }
-                LimitType::CostBased { max_cost, current_cost, .. } => {
+                LimitType::CostBased {
+                    max_cost,
+                    current_cost,
+                    ..
+                } => {
                     let remaining = max_cost - current_cost;
-                    format!(" {} ${:.2} remaining", "·".dimmed(), remaining.to_string().bright_yellow())
+                    format!(
+                        " {} ${:.2} remaining",
+                        "·".dimmed(),
+                        remaining.to_string().bright_yellow()
+                    )
                 }
             }
         } else {
             String::new()
         }
     }
-    
+
     async fn list_providers(&self) -> Result<()> {
         println!("{}", "Available Providers:".bright_cyan().bold());
-        
+
         for model in self.router.available_models() {
-            println!("  {} {}", 
-                "•".bright_blue(),
-                model.name.bright_white()
-            );
+            println!("  {} {}", "•".bright_blue(), model.name.bright_white());
             println!("    Provider: {}", model.provider.to_string().dimmed());
             println!("    Tier: {:?}", model.capability_tier);
             println!("    Context: {} tokens", model.context_window);
         }
-        
+
         Ok(())
     }
-    
+
     fn list_models(&mut self) {
         println!("Active filter: {}", self.model_filter.description());
         println!();
-        
+
         let models = self.router.available_models();
         let mut shown = 0;
-        
+
         for model in models {
             // Show all models if no filter, or only matching models
             if !self.model_filter.is_empty() && !self.model_filter.matches(model) {
                 continue;
             }
-            
-            println!("  • {} ({}, {:?}, {}k ctx)", 
+
+            println!(
+                "  • {} ({}, {:?}, {}k ctx)",
                 model.name.bright_white(),
                 model.provider.to_string().dimmed(),
                 model.capability_tier,
@@ -2060,7 +2447,7 @@ Be concise — short paragraphs or bullet points. No preamble. No \"I\" statemen
             );
             shown += 1;
         }
-        
+
         if shown == 0 {
             println!("  {}", "No models match current filter".yellow());
         }
@@ -2076,17 +2463,43 @@ Be concise — short paragraphs or bullet points. No preamble. No \"I\" statemen
             if let Some(usage) = self.usage_tracker.get_usage(&provider_id) {
                 let line = match &usage.limit_type {
                     LimitType::Unlimited => continue,
-                    LimitType::RequestBased { max_requests, current_requests, .. } => {
+                    LimitType::RequestBased {
+                        max_requests,
+                        current_requests,
+                        ..
+                    } => {
                         let remaining = max_requests.saturating_sub(*current_requests);
-                        format!("{}: {} requests remaining", provider_id.to_string().bright_cyan(), remaining.to_string().bright_yellow())
+                        format!(
+                            "{}: {} requests remaining",
+                            provider_id.to_string().bright_cyan(),
+                            remaining.to_string().bright_yellow()
+                        )
                     }
-                    LimitType::TokenBased { max_tokens, current_tokens, .. } => {
-                        let remaining_pct = ((*max_tokens).saturating_sub(*current_tokens) as f64 / *max_tokens as f64) * 100.0;
-                        format!("{}: {}% tokens remaining", provider_id.to_string().bright_cyan(), format!("{:.1}", remaining_pct).bright_yellow())
+                    LimitType::TokenBased {
+                        max_tokens,
+                        current_tokens,
+                        ..
+                    } => {
+                        let remaining_pct = ((*max_tokens).saturating_sub(*current_tokens) as f64
+                            / *max_tokens as f64)
+                            * 100.0;
+                        format!(
+                            "{}: {}% tokens remaining",
+                            provider_id.to_string().bright_cyan(),
+                            format!("{:.1}", remaining_pct).bright_yellow()
+                        )
                     }
-                    LimitType::CostBased { max_cost, current_cost, .. } => {
+                    LimitType::CostBased {
+                        max_cost,
+                        current_cost,
+                        ..
+                    } => {
                         let remaining = max_cost - current_cost;
-                        format!("{}: ${:.2} remaining", provider_id.to_string().bright_cyan(), remaining)
+                        format!(
+                            "{}: ${:.2} remaining",
+                            provider_id.to_string().bright_cyan(),
+                            remaining
+                        )
                     }
                 };
                 if !printed_header {
@@ -2098,31 +2511,64 @@ Be concise — short paragraphs or bullet points. No preamble. No \"I\" statemen
             }
         }
     }
-    
+
     fn print_help(&self) {
         println!("{}", "Available Commands:".bright_cyan().bold());
         println!("  {} - Show this help message", "/help".bright_white());
         println!("  {} - List available models", "/model".bright_white());
-        println!("  {} - Filter by model/provider/tier", "/model <filters...>".bright_white());
+        println!(
+            "  {} - Filter by model/provider/tier",
+            "/model <filters...>".bright_white()
+        );
         println!("    Examples:");
         println!("      /model claude-opus-4.6        - Use specific model");
         println!("      /model tamu                   - Use TAMU models only");
         println!("      /model frontier               - Use frontier-tier models");
         println!("      /model claude-opus tamu       - Use Opus from TAMU");
         println!("      /model outlier frontier       - Use Outlier frontier models");
-        println!("  {} - Reset to automatic model selection", "/model reset".bright_white());
-        println!("  {} - Show full shell output for turn N", "/show N".bright_white());
-        println!("  {} - Resume a saved session by number", "/load N".bright_white());
-        println!("  {} - List saved sessions (> / < to page)", "/sessions".bright_white());
-        println!("  {} - Start a new conversation", "/new or /session new".bright_white());
+        println!(
+            "  {} - Reset to automatic model selection",
+            "/model reset".bright_white()
+        );
+        println!(
+            "  {} - Show full shell output for turn N",
+            "/show N".bright_white()
+        );
+        println!(
+            "  {} - Resume a saved session by number",
+            "/load N".bright_white()
+        );
+        println!(
+            "  {} - List saved sessions (> / < to page)",
+            "/sessions".bright_white()
+        );
+        println!(
+            "  {} - Start a new conversation",
+            "/new or /session new".bright_white()
+        );
         println!("  {} - Clear conversation history", "/clear".bright_white());
-        println!("  {} - Summarize and compact old history", "/compact".bright_white());
-        println!("  {} - Adversarial review of a plan or decision", "/think <question>".bright_white());
-        println!("  {} - Show/add/update todos", "/todo [add|done|start|block|rm]".bright_white());
-        println!("  {} - Manage session auto-accept allow-list", "/allow [list|add|rm|clear]".bright_white());
+        println!(
+            "  {} - Summarize and compact old history",
+            "/compact".bright_white()
+        );
+        println!(
+            "  {} - Adversarial review of a plan or decision",
+            "/think <question>".bright_white()
+        );
+        println!(
+            "  {} - Show/add/update todos",
+            "/todo [add|done|start|block|rm]".bright_white()
+        );
+        println!(
+            "  {} - Manage session auto-accept allow-list",
+            "/allow [list|add|rm|clear]".bright_white()
+        );
         println!("  {} - Exit the REPL", "/exit or /quit".bright_white());
         println!();
-        println!("{}", "Tip: start with --resume to pick a previous session".dimmed());
+        println!(
+            "{}",
+            "Tip: start with --resume to pick a previous session".dimmed()
+        );
         println!("{}", "Just type a message to chat!".dimmed());
     }
 }
@@ -2141,8 +2587,21 @@ mod tests {
     #[test]
     fn tool_block_captured_with_inline_placeholder() {
         let mut s = ReplyStreamState::default();
-        feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nAfter");
-        let tool_actions: Vec<_> = s.actions.iter().filter_map(|a| if let Action::Tool(j) = a { Some(j) } else { None }).collect();
+        feed(
+            &mut s,
+            "Before\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nAfter",
+        );
+        let tool_actions: Vec<_> = s
+            .actions
+            .iter()
+            .filter_map(|a| {
+                if let Action::Tool(j) = a {
+                    Some(j)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(tool_actions.len(), 1);
         assert!(tool_actions[0].contains("todo_list"));
         assert!(!s.clean_text.contains("\"function\""));
@@ -2157,16 +2616,37 @@ mod tests {
         s.process_chunk("```to");
         s.process_chunk("ol\n{\"function\":\"todo_add\",\"args\":{\"title\":\"x\"}}\n```");
         s.flush();
-        let tool_count = s.actions.iter().filter(|a| matches!(a, Action::Tool(_))).count();
+        let tool_count = s
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Tool(_)))
+            .count();
         assert_eq!(tool_count, 1);
     }
 
     #[test]
     fn bash_and_tool_blocks_coexist() {
         let mut s = ReplyStreamState::default();
-        feed(&mut s, "Text\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nMore\n```bash\nls\n```");
-        let tool_count = s.actions.iter().filter(|a| matches!(a, Action::Tool(_))).count();
-        let bash_cmds: Vec<_> = s.actions.iter().filter_map(|a| if let Action::Bash(c) = a { Some(c) } else { None }).collect();
+        feed(
+            &mut s,
+            "Text\n```tool\n{\"function\":\"todo_list\",\"args\":{}}\n```\nMore\n```bash\nls\n```",
+        );
+        let tool_count = s
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Tool(_)))
+            .count();
+        let bash_cmds: Vec<_> = s
+            .actions
+            .iter()
+            .filter_map(|a| {
+                if let Action::Bash(c) = a {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(tool_count, 1);
         assert_eq!(bash_cmds.len(), 1);
         assert_eq!(bash_cmds[0], "ls");
@@ -2176,7 +2656,11 @@ mod tests {
     fn unclosed_tool_block_discarded() {
         let mut s = ReplyStreamState::default();
         feed(&mut s, "Before\n```tool\n{\"function\":\"todo_list\"");
-        let tool_count = s.actions.iter().filter(|a| matches!(a, Action::Tool(_))).count();
+        let tool_count = s
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Tool(_)))
+            .count();
         assert_eq!(tool_count, 0);
         assert!(s.clean_text.contains("Before"));
     }

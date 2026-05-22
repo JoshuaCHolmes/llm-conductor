@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
+use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::time::{timeout, Duration};
-use std::process::Stdio;
 
 const MAX_PREVIEW_LINES: usize = 5;
 const MAX_OUTPUT_BYTES: usize = 8_000;
@@ -11,13 +11,41 @@ pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Programs known to take a long time — upgraded to LONG_TIMEOUT automatically.
 const LONG_RUNNING_PROGRAMS: &[&str] = &[
-    "cargo", "rustc", "npm", "yarn", "pnpm", "bun",
-    "pip", "pip3", "pip3.11", "poetry", "uv",
-    "make", "cmake", "ninja", "gradle", "mvn", "ant", "bazel", "buck", "meson",
-    "docker", "podman",
-    "nix", "nix-build", "nix-shell", "nixos-rebuild",
-    "go", "tsc", "webpack", "vite", "esbuild", "rollup",
-    "pytest", "jest", "cargo-test",
+    "cargo",
+    "rustc",
+    "npm",
+    "yarn",
+    "pnpm",
+    "bun",
+    "pip",
+    "pip3",
+    "pip3.11",
+    "poetry",
+    "uv",
+    "make",
+    "cmake",
+    "ninja",
+    "gradle",
+    "mvn",
+    "ant",
+    "bazel",
+    "buck",
+    "meson",
+    "docker",
+    "podman",
+    "nix",
+    "nix-build",
+    "nix-shell",
+    "nixos-rebuild",
+    "go",
+    "tsc",
+    "webpack",
+    "vite",
+    "esbuild",
+    "rollup",
+    "pytest",
+    "jest",
+    "cargo-test",
 ];
 
 /// Sentinel strings used to delimit shell output from tracking lines.
@@ -69,11 +97,21 @@ impl ActionTurn {
     }
 
     pub fn todo(summary: String, body: String) -> Self {
-        Self { label: format!("todo: {}", summary), output: body, exit_code: None, kind: TurnKind::Todo }
+        Self {
+            label: format!("todo: {}", summary),
+            output: body,
+            exit_code: None,
+            kind: TurnKind::Todo,
+        }
     }
 
     pub fn think(query: String, body: String) -> Self {
-        Self { label: format!("🦆 think: {}", query), output: body, exit_code: None, kind: TurnKind::Think }
+        Self {
+            label: format!("🦆 think: {}", query),
+            output: body,
+            exit_code: None,
+            kind: TurnKind::Think,
+        }
     }
 }
 
@@ -117,9 +155,13 @@ impl Shell {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| anyhow!("bash child process did not expose a piped stdin"))?;
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| anyhow!("bash child process did not expose a piped stdout"))?;
 
         let mut proc = ShellProcess {
@@ -188,7 +230,10 @@ impl Shell {
                 let _ = proc._child.kill().await;
                 let _ = self.start().await;
                 Ok((
-                    format!("[command timed out after {}s — use bash-long for extended tasks]", t.as_secs()),
+                    format!(
+                        "[command timed out after {}s — use bash-long for extended tasks]",
+                        t.as_secs()
+                    ),
                     124,
                 ))
             }
@@ -306,24 +351,91 @@ async fn collect_output(
 /// Interactive/hanging commands (top, htop, less, ping …) and env/printenv
 /// (which could expose secrets) are intentionally excluded.
 const SAFE_PROGRAMS: &[&str] = &[
-    "ls", "cat", "head", "tail", "grep", "rg", "find", "echo",
-    "pwd", "which", "whereis", "wc", "stat", "file", "type",
-    "date", "uname", "id", "whoami",
-    "df", "du", "free", "uptime", "ps", "lsof", "ss", "ip",
-    "ifconfig", "hostname",
-    "md5sum", "sha256sum", "sha1sum", "xxd", "strings",
-    "diff", "sort", "uniq", "tr", "cut",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "find",
+    "echo",
+    "pwd",
+    "which",
+    "whereis",
+    "wc",
+    "stat",
+    "file",
+    "type",
+    "date",
+    "uname",
+    "id",
+    "whoami",
+    "df",
+    "du",
+    "free",
+    "uptime",
+    "ps",
+    "lsof",
+    "ss",
+    "ip",
+    "ifconfig",
+    "hostname",
+    "md5sum",
+    "sha256sum",
+    "sha1sum",
+    "xxd",
+    "strings",
+    "diff",
+    "sort",
+    "uniq",
+    "tr",
+    "cut",
 ];
 
 /// Programs that always require confirmation regardless of arguments.
 const DENY_PROGRAMS: &[&str] = &[
-    "rm", "rmdir", "mv", "cp", "sudo", "su", "chmod", "chown",
-    "dd", "mkfs", "fdisk", "parted", "shred", "truncate",
-    "curl", "wget", "ssh", "scp", "rsync", "git", "npm", "pip",
-    "cargo", "make", "sh", "bash", "zsh", "fish", "python",
-    "python3", "node", "ruby", "perl", "tee", "xargs", "kill",
-    "pkill", "killall", "systemctl", "service",
-    "env", "printenv", // may expose credentials in shell environment
+    "rm",
+    "rmdir",
+    "mv",
+    "cp",
+    "sudo",
+    "su",
+    "chmod",
+    "chown",
+    "dd",
+    "mkfs",
+    "fdisk",
+    "parted",
+    "shred",
+    "truncate",
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "rsync",
+    "git",
+    "npm",
+    "pip",
+    "cargo",
+    "make",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "tee",
+    "xargs",
+    "kill",
+    "pkill",
+    "killall",
+    "systemctl",
+    "service",
+    "env",
+    "printenv", // may expose credentials in shell environment
 ];
 
 /// Read-only `git` subcommands: safe to run without confirmation.
@@ -331,21 +443,39 @@ const DENY_PROGRAMS: &[&str] = &[
 /// `is_readonly_git_invocation` and intentionally NOT listed here so the
 /// fall-through doesn't accidentally permit a write form.
 const GIT_READONLY_SUBCOMMANDS: &[&str] = &[
-    "status", "log", "diff", "show", "rev-parse", "ls-files",
-    "blame", "describe", "rev-list", "shortlog",
-    "reflog", "ls-remote", "for-each-ref", "cat-file", "name-rev",
-    "show-ref", "ls-tree", "grep",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "rev-parse",
+    "ls-files",
+    "blame",
+    "describe",
+    "rev-list",
+    "shortlog",
+    "reflog",
+    "ls-remote",
+    "for-each-ref",
+    "cat-file",
+    "name-rev",
+    "show-ref",
+    "ls-tree",
+    "grep",
 ];
 
 fn is_readonly_git_invocation(segment: &str) -> bool {
     let mut parts = segment.split_whitespace();
-    if parts.next() != Some("git") { return false; }
+    if parts.next() != Some("git") {
+        return false;
+    }
     // Skip leading git-level flags like `-c key=val` or `--no-pager`.
     let sub = loop {
         match parts.next() {
             None => return false,
             Some(tok) if tok.starts_with('-') => {
-                if tok == "-c" || tok == "-C" { let _ = parts.next(); }
+                if tok == "-c" || tok == "-C" {
+                    let _ = parts.next();
+                }
                 continue;
             }
             Some(tok) => break tok,
@@ -355,9 +485,12 @@ fn is_readonly_git_invocation(segment: &str) -> bool {
     match sub {
         "config" => {
             // `git config --get …` etc. is read-only; bare `git config k v` writes.
-            return parts.any(|t| matches!(t,
-                "--get" | "-l" | "--list" | "--show-origin" | "--get-all" | "--get-regexp"
-            ));
+            return parts.any(|t| {
+                matches!(
+                    t,
+                    "--get" | "-l" | "--list" | "--show-origin" | "--get-all" | "--get-regexp"
+                )
+            });
         }
         "stash" => {
             // `git stash` (no subcommand) defaults to `stash push` which writes.
@@ -365,27 +498,74 @@ fn is_readonly_git_invocation(segment: &str) -> bool {
         }
         "remote" => {
             // `git remote add foo …` writes; `git remote -v` / `git remote show` are safe.
-            let writes = ["add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune", "update"];
+            let writes = [
+                "add",
+                "remove",
+                "rm",
+                "rename",
+                "set-url",
+                "set-head",
+                "set-branches",
+                "prune",
+                "update",
+            ];
             return !parts.any(|t| writes.contains(&t));
         }
         "branch" => {
             // `git branch` (no args) lists; `git branch -a/-r/-v/--list/--show-current` lists.
             // `git branch <name>` creates; `-d/-D/-m/-M/-c/-C` mutate.
-            let mutates = ["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--edit-description", "--set-upstream-to", "-u", "--unset-upstream"];
+            let mutates = [
+                "-d",
+                "-D",
+                "-m",
+                "-M",
+                "-c",
+                "-C",
+                "--delete",
+                "--move",
+                "--copy",
+                "--edit-description",
+                "--set-upstream-to",
+                "-u",
+                "--unset-upstream",
+            ];
             let rest: Vec<&str> = parts.collect();
-            if rest.iter().any(|t| mutates.contains(t)) { return false; }
+            if rest.iter().any(|t| mutates.contains(t)) {
+                return false;
+            }
             // Any non-flag positional after `branch` is a new branch name.
             return !rest.iter().any(|t| !t.starts_with('-'));
         }
         "tag" => {
             // `git tag` lists; `git tag -l <pat>` lists; `git tag <name>` creates.
-            let mutates = ["-d", "-D", "--delete", "-a", "-s", "-u", "-f", "--force", "-m", "--message"];
+            let mutates = [
+                "-d",
+                "-D",
+                "--delete",
+                "-a",
+                "-s",
+                "-u",
+                "-f",
+                "--force",
+                "-m",
+                "--message",
+            ];
             let rest: Vec<&str> = parts.collect();
-            if rest.iter().any(|t| mutates.contains(t)) { return false; }
+            if rest.iter().any(|t| mutates.contains(t)) {
+                return false;
+            }
             // After consuming `-l`/`--list`/`--contains`/`-n`, any positional is a tag name to create.
             let mut allowed_positional_after = false;
             for t in &rest {
-                if matches!(*t, "-l" | "--list" | "--contains" | "--no-contains" | "--points-at" | "--merged" | "--no-merged") {
+                if matches!(
+                    *t,
+                    "-l" | "--list"
+                        | "--contains"
+                        | "--no-contains"
+                        | "--points-at"
+                        | "--merged"
+                        | "--no-merged"
+                ) {
                     allowed_positional_after = true;
                 } else if !t.starts_with('-') && !allowed_positional_after {
                     return false;
@@ -553,20 +733,32 @@ mod tests {
         assert_eq!(classify("git rev-parse HEAD"), CommandKind::ReadOnly);
         assert_eq!(classify("git ls-files"), CommandKind::ReadOnly);
         assert_eq!(classify("git --no-pager log"), CommandKind::ReadOnly);
-        assert_eq!(classify("git -c color.ui=never status"), CommandKind::ReadOnly);
+        assert_eq!(
+            classify("git -c color.ui=never status"),
+            CommandKind::ReadOnly
+        );
         assert_eq!(classify("git stash list"), CommandKind::ReadOnly);
-        assert_eq!(classify("git config --get user.email"), CommandKind::ReadOnly);
+        assert_eq!(
+            classify("git config --get user.email"),
+            CommandKind::ReadOnly
+        );
         // ... but writes still need confirm.
         assert_eq!(classify("git push"), CommandKind::NeedsConfirm);
         assert_eq!(classify("git commit -am foo"), CommandKind::NeedsConfirm);
         assert_eq!(classify("git stash"), CommandKind::NeedsConfirm); // stash with no sub = push
         assert_eq!(classify("git stash pop"), CommandKind::NeedsConfirm);
-        assert_eq!(classify("git config user.email foo@bar"), CommandKind::NeedsConfirm);
+        assert_eq!(
+            classify("git config user.email foo@bar"),
+            CommandKind::NeedsConfirm
+        );
         // branch / tag write-form gating
         assert_eq!(classify("git branch"), CommandKind::ReadOnly);
         assert_eq!(classify("git branch -a"), CommandKind::ReadOnly);
         assert_eq!(classify("git branch --show-current"), CommandKind::ReadOnly);
-        assert_eq!(classify("git branch new-feature"), CommandKind::NeedsConfirm);
+        assert_eq!(
+            classify("git branch new-feature"),
+            CommandKind::NeedsConfirm
+        );
         assert_eq!(classify("git branch -d old"), CommandKind::NeedsConfirm);
         assert_eq!(classify("git branch -D old"), CommandKind::NeedsConfirm);
         assert_eq!(classify("git branch -m old new"), CommandKind::NeedsConfirm);
@@ -574,12 +766,21 @@ mod tests {
         assert_eq!(classify("git tag -l v*"), CommandKind::ReadOnly);
         assert_eq!(classify("git tag --list"), CommandKind::ReadOnly);
         assert_eq!(classify("git tag v1.0"), CommandKind::NeedsConfirm);
-        assert_eq!(classify("git tag -a v1.0 -m foo"), CommandKind::NeedsConfirm);
+        assert_eq!(
+            classify("git tag -a v1.0 -m foo"),
+            CommandKind::NeedsConfirm
+        );
         assert_eq!(classify("git tag -d v1.0"), CommandKind::NeedsConfirm);
         // remote write-form gating
         assert_eq!(classify("git remote -v"), CommandKind::ReadOnly);
-        assert_eq!(classify("git remote add origin git@github.com:foo/bar"), CommandKind::NeedsConfirm);
-        assert_eq!(classify("git remote remove origin"), CommandKind::NeedsConfirm);
+        assert_eq!(
+            classify("git remote add origin git@github.com:foo/bar"),
+            CommandKind::NeedsConfirm
+        );
+        assert_eq!(
+            classify("git remote remove origin"),
+            CommandKind::NeedsConfirm
+        );
     }
 
     #[test]
@@ -602,7 +803,10 @@ mod tests {
     #[test]
     fn classify_multiline_mixed_requires_confirm() {
         // Second line is dangerous — whole block needs confirm
-        assert_eq!(classify("echo hello\nrm -rf target"), CommandKind::NeedsConfirm);
+        assert_eq!(
+            classify("echo hello\nrm -rf target"),
+            CommandKind::NeedsConfirm
+        );
         assert_eq!(classify("ls\ngit push"), CommandKind::NeedsConfirm);
     }
 

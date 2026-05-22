@@ -68,7 +68,10 @@ where
                     };
                     tracing::warn!(
                         "HTTP {} on attempt {}/{}; retrying after {:?}",
-                        s, attempt + 1, max_retries + 1, wait
+                        s,
+                        attempt + 1,
+                        max_retries + 1,
+                        wait
                     );
                     drop(resp);
                     tokio::time::sleep(wait).await;
@@ -81,7 +84,10 @@ where
                 let wait = backoff(attempt);
                 tracing::warn!(
                     "transport error on attempt {}/{}: {}; retrying after {:?}",
-                    attempt + 1, max_retries + 1, e, wait
+                    attempt + 1,
+                    max_retries + 1,
+                    e,
+                    wait
                 );
                 tokio::time::sleep(wait).await;
                 attempt += 1;
@@ -129,11 +135,24 @@ pub fn sanitize_error_body(body: &str) -> String {
 /// with `"<sensitive_key>": "[REDACTED]"`. Operates on `&str`, returns owned `String`.
 fn redact_sensitive_fields(input: &str) -> String {
     const KEYS: &[&str] = &[
-        "cookie", "csrf", "csrftoken", "csrf_token", "x-csrf-token",
-        "session", "sessionid", "session_id",
-        "authorization", "bearer",
-        "apikey", "api_key", "api-key",
-        "password", "secret", "token", "accesstoken", "access_token",
+        "cookie",
+        "csrf",
+        "csrftoken",
+        "csrf_token",
+        "x-csrf-token",
+        "session",
+        "sessionid",
+        "session_id",
+        "authorization",
+        "bearer",
+        "apikey",
+        "api_key",
+        "api-key",
+        "password",
+        "secret",
+        "token",
+        "accesstoken",
+        "access_token",
     ];
 
     let mut out = String::with_capacity(input.len());
@@ -168,10 +187,7 @@ fn redact_sensitive_fields(input: &str) -> String {
         let trimmed = rest.trim_start();
         let is_sensitive = KEYS.iter().any(|k| k.eq_ignore_ascii_case(key));
 
-        if is_sensitive
-            && trimmed.starts_with(':')
-            && trimmed[1..].trim_start().starts_with('"')
-        {
+        if is_sensitive && trimmed.starts_with(':') && trimmed[1..].trim_start().starts_with('"') {
             // Locate the value's opening and closing quotes (with simple `\"` escape support).
             let value_open_offset_in_rest = {
                 let colon_idx = rest.find(':').unwrap();
@@ -210,7 +226,14 @@ fn mask_long_tokens(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut buf = String::new();
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '=' || c == '+' || c == '/' {
+        if c.is_ascii_alphanumeric()
+            || c == '-'
+            || c == '_'
+            || c == '.'
+            || c == '='
+            || c == '+'
+            || c == '/'
+        {
             buf.push(c);
         } else {
             if buf.len() >= 64 {
@@ -259,7 +282,8 @@ mod tests {
 
     #[test]
     fn masks_long_opaque_tokens() {
-        let body = "set-cookie: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=value";
+        let body =
+            "set-cookie: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=value";
         let s = sanitize_error_body(body);
         assert!(s.contains("[REDACTED]"));
     }
@@ -285,7 +309,8 @@ mod tests {
     #[tokio::test]
     async fn retry_happy_path_no_retries() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/x"))
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
             .expect(1)
             .mount(&server)
@@ -300,13 +325,17 @@ mod tests {
     async fn retry_on_5xx_then_succeeds() {
         let server = MockServer::start().await;
         // First call: 503; subsequent: 200.
-        Mock::given(method("POST")).and(path("/x"))
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(ResponseTemplate::new(503))
             .up_to_n_times(1)
-            .mount(&server).await;
-        Mock::given(method("POST")).and(path("/x"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let url = format!("{}/x", server.uri());
         let client = mk_client();
         let resp = send_with_retry(|| client.post(&url), 3).await.unwrap();
@@ -316,13 +345,17 @@ mod tests {
     #[tokio::test]
     async fn retry_on_429_with_retry_after() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/x"))
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
             .up_to_n_times(1)
-            .mount(&server).await;
-        Mock::given(method("POST")).and(path("/x"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(ResponseTemplate::new(200))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let url = format!("{}/x", server.uri());
         let client = mk_client();
         let started = std::time::Instant::now();
@@ -337,12 +370,14 @@ mod tests {
         let server = MockServer::start().await;
         let counter = Arc::new(AtomicU32::new(0));
         let c2 = counter.clone();
-        Mock::given(method("POST")).and(path("/x"))
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(move |_: &wiremock::Request| {
                 c2.fetch_add(1, Ordering::SeqCst);
                 ResponseTemplate::new(500)
             })
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let url = format!("{}/x", server.uri());
         let client = mk_client();
         let resp = send_with_retry(|| client.post(&url), 2).await.unwrap();
@@ -356,12 +391,14 @@ mod tests {
         let server = MockServer::start().await;
         let counter = Arc::new(AtomicU32::new(0));
         let c2 = counter.clone();
-        Mock::given(method("POST")).and(path("/x"))
+        Mock::given(method("POST"))
+            .and(path("/x"))
             .respond_with(move |_: &wiremock::Request| {
                 c2.fetch_add(1, Ordering::SeqCst);
                 ResponseTemplate::new(404)
             })
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let url = format!("{}/x", server.uri());
         let client = mk_client();
         let resp = send_with_retry(|| client.post(&url), 5).await.unwrap();

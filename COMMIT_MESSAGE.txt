@@ -1,0 +1,21 @@
+fix(outlier): implement TTL-based model caching and dynamic discovery
+
+Replaces OnceCell with 15-minute TTL cache for Outlier model discovery.
+Enables automatic model list updates and detects temporarily disabled models.
+
+Changes:
+- Replace Arc<OnceCell> with Arc<Mutex<Option<ModelCache>>>
+- Add ModelCache struct with Instant-based expiration
+- Implement fetch_models_from_api() with detailed error handling
+- Add comprehensive logging (info/debug/warn levels)
+- Support hybrid discovery (catalog + API-discovered models)
+- Graceful fallback to static catalog on API failures
+
+Fixes:
+- Models now refresh every 15 minutes instead of never
+- Temporarily disabled models automatically excluded
+- Clear visibility into discovery process via logs
+- Unknown/new models automatically supported
+
+Before: Only 8 static Outlier models, never updated
+After: Dynamic model list from API, auto-refresh, visible logging
